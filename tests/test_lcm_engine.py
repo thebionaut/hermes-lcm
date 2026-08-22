@@ -10468,7 +10468,15 @@ class TestEngineCompress:
         finally:
             instance.shutdown()
 
-        assert result == messages
+        expected = [
+            {
+                **messages[0],
+                "display_kind": "context_projection",
+                "display_metadata": {"engine": "lcm"},
+            },
+            *messages[1:],
+        ]
+        assert result == expected
         assert len(nodes) == 1
         assert nodes[0].node_id == node_id
         assert instance._ingest_cursor == len(result)
