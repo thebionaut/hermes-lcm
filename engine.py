@@ -4179,6 +4179,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
+        if content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX):
+            return True
+        if content.lstrip().startswith("<relevant-memories>"):
+            return True
         if "[Expand for details:" not in content:
             return False
         return bool(
@@ -4552,6 +4556,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 absolute_idx = cursor + offset
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+                # Active context projections are generated from rows already in
+                # the lossless store/DAG. They are model-facing replay scaffold,
+                # not new source history. A restart/rebind can make cursor
+                # reconciliation ambiguous; persisting the scaffold in that case
+                # feeds summaries back as raw sources and multiplies generations
+                # under fresh ingestion timestamps. The existing classifier is
+                # deliberately narrow (LCM note, node-backed summary, preserved
+                # objective/TODO, bounded proactive-memory wrapper).
+                if self._is_replayed_context_scaffold_message(replay_msg):
+                    logger.debug(
+                        "LCM skipped generated context projection during ingest: session=%s index=%d",
+                        self._session_id,
+                        absolute_idx,
+                    )
+                    continue
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
                     replay_msg,
                     replay_text,
@@ -5999,7 +6018,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
-                result.append({"role": summary_role, "content": combined})
+                result.append(
+                    {
+                        "role": summary_role,
+                        "content": combined,
+                        # Host persistence may use this explicit provenance to
+                        # exclude/supersede intermediate model projections while
+                        # retaining raw source turns and the current active view.
+                        "display_kind": "context_projection",
+                        "display_metadata": {"engine": "lcm"},
+                    }
+                )
 
         # Proactive memory injection (SPEC F, default-off). One bounded block is
         # placed adjacent to the summary prefix — a stable position below the
