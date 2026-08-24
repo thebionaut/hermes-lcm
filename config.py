@@ -311,6 +311,11 @@ class _EnvFieldSpec:
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
+    _EnvFieldSpec(
+        "reconcile_budget_seconds",
+        "LCM_RECONCILE_BUDGET_SECONDS",
+        float,
+    ),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
     _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
@@ -449,6 +454,10 @@ class LCMConfig:
     fresh_tail_count: int = 32
     # Optional token cap for the protected suffix (0 = disabled)
     fresh_tail_max_tokens: int = 0
+    # Wall-clock budget for ingest-cursor reconciliation (0 = disabled).
+    # Reconcile runs inside the synchronous post-LLM ingest hook; without a
+    # budget a pathological session can wedge turn finalization indefinitely.
+    reconcile_budget_seconds: float = 45.0
 
     # -- Compaction thresholds ---
     # Max source tokens in a leaf chunk before summarization triggers

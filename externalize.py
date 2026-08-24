@@ -16,6 +16,7 @@ import math
 import os
 import re
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
@@ -976,6 +977,101 @@ def find_externalized_payload_for_message(
     return fallback_match
 
 
+class ExternalizedPayloadLookupBudgetExceeded(Exception):
+    """Raised when an externalized-payload lookup outlives its deadline."""
+
+
+# Process-wide index over the externalized-payload storage directory.
+# Rebuilding is one linear pass (~1s for a 2.4k-file / 190MB dir, warm cache);
+# without it every replay-identity recovery linearly re-read and re-parsed the
+# ENTIRE directory per lookup, which wedged turn finalization on large
+# sessions (observed: 58+ min inside the post_llm_call ingest hook).
+_payload_index_lock = threading.Lock()
+# {str(storage_dir): (generation_mtime_ns, {tool_call_id: [(session_id, filename), ...]})}
+_payload_index_cache: Dict[str, tuple[int, Dict[str, list[tuple[str, str]]]]] = {}
+
+
+def _check_lookup_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise ExternalizedPayloadLookupBudgetExceeded(
+            "externalized payload lookup exceeded deadline"
+        )
+
+
+def _build_payload_lookup_index(
+    storage_dir: Path, *, deadline: float | None = None
+) -> Dict[str, list[tuple[str, str]]]:
+    index: Dict[str, list[tuple[str, str]]] = {}
+    try:
+        paths = sorted(storage_dir.glob("*.json"))
+    except OSError:
+        return index
+    for path in paths:
+        _check_lookup_deadline(deadline)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("kind", "tool_result") != "tool_result":
+            continue
+        tool_call_id = str(payload.get("tool_call_id") or "")
+        if not tool_call_id:
+            continue
+        index.setdefault(tool_call_id, []).append(
+            (str(payload.get("session_id") or ""), path.name)
+        )
+    return index
+
+
+def _payload_index_generation(storage_dir: Path) -> int:
+    try:
+        return storage_dir.stat().st_mtime_ns
+    except OSError:
+        return -1
+
+
+def _externalized_payload_candidates(
+    storage_dir: Path, *, tool_call_id: str, session_id: str, deadline: float | None = None
+) -> list[Path]:
+    """Candidate payload paths for a tool-call id, from the process-wide index.
+
+    The index rebuilds only when the storage directory generation (mtime)
+    changes, so steady-state lookups read at most the few payloads that can
+    actually match instead of scanning the whole directory per call.
+    """
+    _check_lookup_deadline(deadline)
+    key = str(storage_dir)
+    if deadline is None:
+        acquired = _payload_index_lock.acquire()
+    else:
+        acquired = _payload_index_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
+    if not acquired:
+        raise ExternalizedPayloadLookupBudgetExceeded(
+            "externalized payload index lock exceeded deadline"
+        )
+    try:
+        cached = _payload_index_cache.get(key)
+        generation = _payload_index_generation(storage_dir)
+        if cached is None or cached[0] != generation:
+            _check_lookup_deadline(deadline)
+            _payload_index_cache[key] = (
+                generation,
+                _build_payload_lookup_index(storage_dir, deadline=deadline),
+            )
+            cached = _payload_index_cache[key]
+    finally:
+        _payload_index_lock.release()
+    entries = cached[1].get(str(tool_call_id or ""), [])
+    if session_id:
+        # Payloads with no recorded session are session-agnostic and still match.
+        names = [name for sess, name in entries if sess in ("", str(session_id))]
+    else:
+        names = [name for _, name in entries]
+    return [storage_dir / name for name in names]
+
+
 def find_externalized_tool_result_content_for_call(
     *,
     tool_call_id: str,
@@ -991,6 +1087,7 @@ def find_externalized_tool_result_content_for_call(
     persisted_output_file_ctime_ns: int | None = None,
     config,
     hermes_home: str = "",
+    deadline: float | None = None,
 ) -> str | None:
     """Return durable externalized tool-result content for a matching marker.
 
@@ -1007,7 +1104,9 @@ def find_externalized_tool_result_content_for_call(
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     if not storage_dir.exists() or not storage_dir.is_dir():
         return None
-    for path in sorted(storage_dir.glob("*.json")):
+    for path in _externalized_payload_candidates(
+        storage_dir, tool_call_id=tool_call_id, session_id=session_id, deadline=deadline
+    ):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

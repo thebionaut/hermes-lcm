@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .externalize import (
+    ExternalizedPayloadLookupBudgetExceeded,
     extract_externalized_ref,
     externalized_tool_result_has_persisted_output_marker,
     find_externalized_tool_result_content_for_call,
@@ -50,6 +52,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+
+
+class ReconcileBudgetExceeded(Exception):
+    """Ingest-cursor reconciliation outlived its budget; abort the batch."""
 
 
 class ReconcileMixin:
@@ -115,6 +121,7 @@ class ReconcileMixin:
             allow_redacted_preview_match=allow_redacted_preview_match,
             config=self._config,
             hermes_home=self._hermes_home,
+            deadline=getattr(self, "_reconcile_deadline", None),
         )
         if durable_content is None:
             return False
@@ -124,7 +131,25 @@ class ReconcileMixin:
                 return False
         return True
 
+    _IDENTITY_MEMO_MISS = object()
+
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+        # Per-ingest-call memo: reconciliation recomputes identities for every
+        # candidate prefix (O(N^2) call sites); within one ingest call the
+        # message dicts are held alive by the caller, so id(msg) keys are
+        # stable and the memo collapses the quadratic recompute to O(N).
+        memo = getattr(self, "_identity_memo", None)
+        if memo is None:
+            return self._compute_message_replay_identity(msg, stored_row=stored_row)
+        key = (id(msg), bool(stored_row))
+        hit = memo.get(key, ReconcileMixin._IDENTITY_MEMO_MISS)
+        if hit is not ReconcileMixin._IDENTITY_MEMO_MISS:
+            return hit
+        value = self._compute_message_replay_identity(msg, stored_row=stored_row)
+        memo[key] = value
+        return value
+
+    def _compute_message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if (
@@ -182,6 +207,7 @@ class ReconcileMixin:
                     allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
+                    deadline=getattr(self, "_reconcile_deadline", None),
                 )
             if durable_content is not None and (
                 recovered_content is None or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
@@ -197,6 +223,7 @@ class ReconcileMixin:
                     allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
+                    deadline=getattr(self, "_reconcile_deadline", None),
                 )
                 if (
                     stale_durable_content is not None
@@ -447,6 +474,11 @@ class ReconcileMixin:
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
+            deadline = getattr(self, "_reconcile_deadline", None)
+            if deadline is not None and time.monotonic() > deadline:
+                raise ReconcileBudgetExceeded(
+                    f"reconcile budget exceeded at cursor {cursor} of {len(messages)}"
+                )
             candidate_messages = messages[:cursor]
             candidate_visible_messages = [
                 msg
@@ -802,6 +834,25 @@ class ReconcileMixin:
         return stored_head[: len(incoming_identities)] == incoming_identities
 
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
+        # Budget wrapper: reconciliation runs synchronously inside the
+        # post-LLM ingest hook, so it must never run unbounded. On budget
+        # exhaustion the caller aborts the ingest batch (no duplicate rows)
+        # and retries next turn with a warm payload index.
+        budget = float(getattr(self._config, "reconcile_budget_seconds", 45.0) or 0.0)
+        self._reconcile_deadline = (time.monotonic() + budget) if budget > 0 else None
+        self._identity_memo = {}
+        try:
+            try:
+                return self._reconcile_ingest_cursor_from_store_impl(messages)
+            except ExternalizedPayloadLookupBudgetExceeded as exc:
+                raise ReconcileBudgetExceeded(
+                    "reconcile payload lookup exceeded its budget"
+                ) from exc
+        finally:
+            self._identity_memo = None
+            self._reconcile_deadline = None
+
+    def _reconcile_ingest_cursor_from_store_impl(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         if not self._session_id or not messages:
             return 0

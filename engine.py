@@ -123,7 +123,7 @@ from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
-from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
+from .reconcile import ReconcileBudgetExceeded, ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
@@ -4442,8 +4442,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 else replay_msg
                 for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
             ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
-            self._ingest_cursor_needs_reconcile = False
+            try:
+                self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+                self._ingest_cursor_needs_reconcile = False
+            except ReconcileBudgetExceeded:
+                # Reconciliation outlived its budget: abort this ingest batch
+                # entirely (never ingest duplicates past an unreconciled
+                # cursor), keep the needs-reconcile flag so the next turn
+                # retries with a warm payload index, and unblock turn
+                # finalization — the post-LLM hook must never wedge a turn.
+                logger.warning(
+                    "LCM ingest reconcile budget exceeded: session=%s incoming=%d — "
+                    "deferring ingest to next turn",
+                    self._session_id,
+                    len(reconcile_messages),
+                )
+                raise
         cursor = min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
