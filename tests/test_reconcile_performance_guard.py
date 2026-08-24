@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_lcm.externalize as externalize_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.externalize import (
@@ -16,6 +17,7 @@ from hermes_lcm.externalize import (
     _unlink_partial_payload,
     _write_externalized_payload,
     find_externalized_tool_result_content_for_call,
+    reassign_externalized_payloads,
 )
 from hermes_lcm.reconcile import ReconcileBudgetExceeded, ReconcileMixin
 
@@ -140,6 +142,41 @@ def test_payload_index_invalidates_after_create_and_delete(tmp_path):
     ) is None
 
 
+def test_reassign_invalidates_index_after_final_replace(tmp_path, monkeypatch):
+    storage = tmp_path / "payloads"
+    storage.mkdir()
+    config = LCMConfig(large_output_externalization_path=str(storage))
+    payload = storage / "reassign.json"
+    _write_externalized_payload(
+        payload,
+        {
+            "kind": "tool_result",
+            "tool_call_id": "move-me",
+            "session_id": "old",
+            "role": "tool",
+            "content": "payload",
+        },
+    )
+    _payload_index_cache.clear()
+    original_write = externalize_module._write_externalized_payload
+
+    def write_then_rebuild_index(path, value):
+        original_write(path, value)
+        assert find_externalized_tool_result_content_for_call(
+            tool_call_id="move-me", session_id="old", config=config
+        ) == "payload"
+
+    monkeypatch.setattr(externalize_module, "_write_externalized_payload", write_then_rebuild_index)
+    assert reassign_externalized_payloads("old", "new", config=config) == 1
+    assert storage.resolve() not in _payload_index_cache
+    assert find_externalized_tool_result_content_for_call(
+        tool_call_id="move-me", session_id="old", config=config
+    ) is None
+    assert find_externalized_tool_result_content_for_call(
+        tool_call_id="move-me", session_id="new", config=config
+    ) == "payload"
+
+
 def test_same_id_candidate_rereads_respect_deadline(tmp_path, monkeypatch):
     storage = tmp_path / "payloads"
     storage.mkdir()
@@ -211,6 +248,48 @@ def test_concurrent_reconciliations_on_one_engine_are_serialized():
         thread.join()
     assert results == [1, 1]
     assert harness.max_active == 1
+
+
+def test_reconcile_does_not_enter_after_lock_consumes_budget():
+    class SlowSuccessfulLock:
+        def __init__(self):
+            self.released = False
+
+        def acquire(self, *, timeout=None):
+            time.sleep(0.02)
+            return True
+
+        def release(self):
+            self.released = True
+
+    class Harness(ReconcileMixin):
+        _config = LCMConfig(reconcile_budget_seconds=0.005)
+
+        def __init__(self):
+            self._reconcile_lock = SlowSuccessfulLock()
+            self.entered = False
+
+        def _reconcile_ingest_cursor_from_store_impl(self, messages):
+            self.entered = True
+            return len(messages)
+
+    harness = Harness()
+    with pytest.raises(ReconcileBudgetExceeded, match="consumed"):
+        harness._reconcile_ingest_cursor_from_store([{"role": "user", "content": "x"}])
+    assert harness.entered is False
+    assert harness._reconcile_lock.released is True
+
+
+def test_reconcile_rejects_result_completed_after_deadline():
+    class Harness(ReconcileMixin):
+        _config = LCMConfig(reconcile_budget_seconds=0.005)
+
+        def _reconcile_ingest_cursor_from_store_impl(self, messages):
+            time.sleep(0.02)
+            return len(messages)
+
+    with pytest.raises(ReconcileBudgetExceeded, match="reconcile exceeded"):
+        Harness()._reconcile_ingest_cursor_from_store([{"role": "user", "content": "x"}])
 
 
 def test_budget_abort_preserves_cursor_flag_and_store(tmp_path, monkeypatch):

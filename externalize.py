@@ -920,17 +920,10 @@ def reassign_externalized_payloads(
         if (payload.get("session_id") or "") != old_session_id:
             continue
         payload["session_id"] = new_session_id
-        tmp_path = path.with_name(f"{path.name}.tmp")
         try:
-            _write_externalized_payload(tmp_path, payload)
-            tmp_path.replace(path)
-            _fsync_directory(path.parent)
+            _replace_externalized_payload(path, payload)
         except OSError as exc:
             logger.warning("Externalized payload session reassignment skipped for %s: %s", path.name, exc)
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
             continue
         moved += 1
     return moved

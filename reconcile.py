@@ -853,11 +853,17 @@ class ReconcileMixin:
             )
         if not acquired:
             raise ReconcileBudgetExceeded("reconcile lock wait exceeded its budget")
+        if deadline is not None and time.monotonic() >= deadline:
+            self._reconcile_lock.release()
+            raise ReconcileBudgetExceeded("reconcile lock wait consumed its budget")
         self._reconcile_deadline = deadline
         self._identity_memo = {}
         try:
             try:
-                return self._reconcile_ingest_cursor_from_store_impl(messages)
+                result = self._reconcile_ingest_cursor_from_store_impl(messages)
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise ReconcileBudgetExceeded("reconcile exceeded its budget")
+                return result
             except ExternalizedPayloadLookupBudgetExceeded as exc:
                 raise ReconcileBudgetExceeded(
                     "reconcile payload lookup exceeded its budget"
