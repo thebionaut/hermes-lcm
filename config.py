@@ -1,5 +1,6 @@
 """LCM configuration with defaults and env var overrides."""
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -785,6 +786,23 @@ class LCMConfig:
     config_source_warnings: list[str] = field(default_factory=list)
     ignored_config_yaml_lcm_keys: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self._normalize_reconcile_budget()
+
+    def _normalize_reconcile_budget(self) -> None:
+        """Restore the bounded default for invalid reconcile budgets.
+
+        Zero explicitly disables the guard. Negative and non-finite values
+        would disable it accidentally, so they fail safe to the default.
+        """
+        try:
+            budget = float(self.reconcile_budget_seconds)
+        except (TypeError, ValueError):
+            budget = 45.0
+        if not math.isfinite(budget) or budget < 0:
+            budget = 45.0
+        self.reconcile_budget_seconds = budget
+
     @classmethod
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
@@ -856,6 +874,7 @@ class LCMConfig:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+        c._normalize_reconcile_budget()
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")

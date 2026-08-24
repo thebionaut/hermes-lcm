@@ -1,16 +1,20 @@
 """Regression tests for bounded restart-replay reconciliation."""
 
 import json
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
 from hermes_lcm.externalize import (
     ExternalizedPayloadLookupBudgetExceeded,
     _payload_index_cache,
     _payload_index_lock,
+    _unlink_partial_payload,
+    _write_externalized_payload,
     find_externalized_tool_result_content_for_call,
 )
 from hermes_lcm.reconcile import ReconcileBudgetExceeded, ReconcileMixin
@@ -90,6 +94,142 @@ def test_payload_index_lock_wait_respects_deadline(tmp_path):
 def test_reconcile_budget_is_configurable_from_environment(monkeypatch):
     monkeypatch.setenv("LCM_RECONCILE_BUDGET_SECONDS", "2.5")
     assert LCMConfig.from_env().reconcile_budget_seconds == 2.5
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "-inf"])
+def test_invalid_reconcile_budget_environment_values_fail_safe(monkeypatch, value):
+    monkeypatch.setenv("LCM_RECONCILE_BUDGET_SECONDS", value)
+    assert LCMConfig.from_env().reconcile_budget_seconds == 45.0
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), float("-inf")])
+def test_invalid_reconcile_budgets_fail_safe_to_default(value):
+    assert LCMConfig(reconcile_budget_seconds=value).reconcile_budget_seconds == 45.0
+
+
+def test_zero_reconcile_budget_explicitly_disables_guard():
+    assert LCMConfig(reconcile_budget_seconds=0).reconcile_budget_seconds == 0
+
+
+def test_payload_index_invalidates_after_create_and_delete(tmp_path):
+    storage = tmp_path / "payloads"
+    storage.mkdir()
+    config = LCMConfig(large_output_externalization_path=str(storage))
+    _payload_index_cache.clear()
+
+    assert find_externalized_tool_result_content_for_call(
+        tool_call_id="late", session_id="s1", config=config
+    ) is None
+    payload = storage / "late.json"
+    _write_externalized_payload(
+        payload,
+        {
+            "kind": "tool_result",
+            "tool_call_id": "late",
+            "session_id": "s1",
+            "role": "tool",
+            "content": "arrived",
+        },
+    )
+    assert find_externalized_tool_result_content_for_call(
+        tool_call_id="late", session_id="s1", config=config
+    ) == "arrived"
+    _unlink_partial_payload(payload)
+    assert find_externalized_tool_result_content_for_call(
+        tool_call_id="late", session_id="s1", config=config
+    ) is None
+
+
+def test_same_id_candidate_rereads_respect_deadline(tmp_path, monkeypatch):
+    storage = tmp_path / "payloads"
+    storage.mkdir()
+    for index in range(12):
+        _write_payload(
+            storage / f"candidate-{index}.json",
+            tool_call_id="reused",
+            session_id="s1",
+            content=f"wrong-{index}",
+        )
+    config = LCMConfig(large_output_externalization_path=str(storage))
+    _payload_index_cache.clear()
+    # Warm the directory index before making candidate file reads slow.
+    assert find_externalized_tool_result_content_for_call(
+        tool_call_id="reused", session_id="s1", config=config
+    ) == "wrong-0"
+    original_read_text = Path.read_text
+
+    def slow_read_text(path, *args, **kwargs):
+        time.sleep(0.01)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", slow_read_text)
+    with pytest.raises(ExternalizedPayloadLookupBudgetExceeded):
+        find_externalized_tool_result_content_for_call(
+            tool_call_id="reused",
+            session_id="s1",
+            expected_chars=999,
+            persisted_output_preview_sha256="not-a-match",
+            config=config,
+            deadline=time.monotonic() + 0.025,
+        )
+
+
+def test_concurrent_reconciliations_on_one_engine_are_serialized():
+    class Harness(ReconcileMixin):
+        _config = LCMConfig(reconcile_budget_seconds=1.0)
+
+        def __init__(self):
+            self._reconcile_lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+            self.state_lock = threading.Lock()
+
+        def _reconcile_ingest_cursor_from_store_impl(self, messages):
+            with self.state_lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.03)
+            with self.state_lock:
+                self.active -= 1
+            return len(messages)
+
+    harness = Harness()
+    results = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(
+                harness._reconcile_ingest_cursor_from_store(
+                    [{"role": "user", "content": "x"}]
+                )
+            )
+        )
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results == [1, 1]
+    assert harness.max_active == 1
+
+
+def test_budget_abort_preserves_cursor_flag_and_store(tmp_path, monkeypatch):
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "lcm.db")),
+        hermes_home=str(tmp_path),
+    )
+    engine.on_session_start("session-budget-abort", platform="test")
+    engine._ingest_cursor_needs_reconcile = True
+
+    def expire(_messages):
+        raise ReconcileBudgetExceeded("expired")
+
+    monkeypatch.setattr(engine, "_reconcile_ingest_cursor_from_store", expire)
+    with pytest.raises(ReconcileBudgetExceeded):
+        engine._ingest_messages([{"role": "user", "content": "not persisted"}])
+    assert engine._ingest_cursor == 0
+    assert engine._ingest_cursor_needs_reconcile is True
+    assert engine._store.get_session_count("session-budget-abort") == 0
 
 
 def test_reconcile_translates_payload_lookup_deadline_to_engine_budget_error():

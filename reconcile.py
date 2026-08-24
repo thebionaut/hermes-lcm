@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -59,6 +60,10 @@ class ReconcileBudgetExceeded(Exception):
 
 
 class ReconcileMixin:
+    # Real engines install an instance lock. This class lock is a safe fallback
+    # for lightweight mixin harnesses and external consumers.
+    _reconcile_lock = threading.Lock()
+
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
@@ -839,7 +844,16 @@ class ReconcileMixin:
         # exhaustion the caller aborts the ingest batch (no duplicate rows)
         # and retries next turn with a warm payload index.
         budget = float(getattr(self._config, "reconcile_budget_seconds", 45.0) or 0.0)
-        self._reconcile_deadline = (time.monotonic() + budget) if budget > 0 else None
+        deadline = (time.monotonic() + budget) if budget > 0 else None
+        if deadline is None:
+            acquired = self._reconcile_lock.acquire()
+        else:
+            acquired = self._reconcile_lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        if not acquired:
+            raise ReconcileBudgetExceeded("reconcile lock wait exceeded its budget")
+        self._reconcile_deadline = deadline
         self._identity_memo = {}
         try:
             try:
@@ -851,6 +865,7 @@ class ReconcileMixin:
         finally:
             self._identity_memo = None
             self._reconcile_deadline = None
+            self._reconcile_lock.release()
 
     def _reconcile_ingest_cursor_from_store_impl(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""

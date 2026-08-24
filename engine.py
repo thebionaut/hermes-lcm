@@ -383,6 +383,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
         self._assertion_extraction_metrics_lock = threading.RLock()
+        # Restart reconciliation temporarily installs per-call memo/deadline
+        # state on the engine. Serialize it so concurrent post-LLM hooks cannot
+        # overwrite or clear another call's guardrails.
+        self._reconcile_lock = threading.Lock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
         self._assertion_extraction_batches_scheduled = 0

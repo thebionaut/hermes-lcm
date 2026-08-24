@@ -145,6 +145,7 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
 def _unlink_partial_payload(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
+        _invalidate_payload_lookup_index(path.parent)
     except OSError as exc:
         logger.warning("Could not remove partial LCM externalized payload %s: %s", path, exc)
 
@@ -159,6 +160,7 @@ def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         _fsync_directory(path.parent)
+        _invalidate_payload_lookup_index(path.parent)
     except OSError:
         _unlink_partial_payload(path)
         raise
@@ -173,6 +175,7 @@ def _replace_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
         _write_externalized_payload(tmp_path, payload)
         tmp_path.replace(path)
         _fsync_directory(path.parent)
+        _invalidate_payload_lookup_index(path.parent)
     except OSError:
         _unlink_partial_payload(tmp_path)
         raise
@@ -991,6 +994,12 @@ _payload_index_lock = threading.Lock()
 _payload_index_cache: Dict[str, tuple[int, Dict[str, list[tuple[str, str]]]]] = {}
 
 
+def _invalidate_payload_lookup_index(storage_dir: Path) -> None:
+    """Invalidate a payload-directory index after a process-local mutation."""
+    with _payload_index_lock:
+        _payload_index_cache.pop(str(storage_dir), None)
+
+
 def _check_lookup_deadline(deadline: float | None) -> None:
     if deadline is not None and time.monotonic() > deadline:
         raise ExternalizedPayloadLookupBudgetExceeded(
@@ -1056,10 +1065,24 @@ def _externalized_payload_candidates(
         generation = _payload_index_generation(storage_dir)
         if cached is None or cached[0] != generation:
             _check_lookup_deadline(deadline)
-            _payload_index_cache[key] = (
-                generation,
-                _build_payload_lookup_index(storage_dir, deadline=deadline),
-            )
+            # Writers can mutate the directory during an index build. Retry
+            # boundedly until its generation is stable. If it never settles,
+            # publish under the build's starting generation so the next lookup
+            # is forced to rebuild instead of trusting a known-stale snapshot.
+            built_index: Dict[str, list[tuple[str, str]]] = {}
+            stable_generation = generation
+            for _ in range(3):
+                build_generation = _payload_index_generation(storage_dir)
+                built_index = _build_payload_lookup_index(
+                    storage_dir, deadline=deadline
+                )
+                after_generation = _payload_index_generation(storage_dir)
+                stable_generation = build_generation
+                if after_generation == build_generation:
+                    stable_generation = after_generation
+                    break
+                _check_lookup_deadline(deadline)
+            _payload_index_cache[key] = (stable_generation, built_index)
             cached = _payload_index_cache[key]
     finally:
         _payload_index_lock.release()
@@ -1107,10 +1130,12 @@ def find_externalized_tool_result_content_for_call(
     for path in _externalized_payload_candidates(
         storage_dir, tool_call_id=tool_call_id, session_id=session_id, deadline=deadline
     ):
+        _check_lookup_deadline(deadline)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        _check_lookup_deadline(deadline)
         if payload.get("kind", "tool_result") != "tool_result":
             continue
         if (payload.get("tool_call_id") or "") != tool_call_id:
