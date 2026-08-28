@@ -26,8 +26,10 @@ from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
 
-_THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
-_THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
+_AUTOMATIC_FOREGROUND_MAX_PASSES = 2
+_AUTOMATIC_FOREGROUND_MAX_SECONDS = 45.0
+_MANUAL_FULL_SWEEP_MAX_PASSES = 12
+_MANUAL_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
@@ -472,7 +474,18 @@ class CompactionMixin:
             and self.threshold_tokens > 0
             and estimated_active_tokens >= self.threshold_tokens
         )
-        sweep_deadline = time.monotonic() + _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        automatic_foreground = not force
+        sweep_pass_budget = (
+            _AUTOMATIC_FOREGROUND_MAX_PASSES
+            if automatic_foreground
+            else _MANUAL_FULL_SWEEP_MAX_PASSES
+        )
+        sweep_seconds_budget = (
+            _AUTOMATIC_FOREGROUND_MAX_SECONDS
+            if automatic_foreground
+            else _MANUAL_FULL_SWEEP_MAX_SECONDS
+        )
+        sweep_deadline = time.monotonic() + sweep_seconds_budget
         configured_sweep_target = int(self._config.summary_prefix_target_tokens)
         sweep_target_tokens = max(
             1,
@@ -512,12 +525,21 @@ class CompactionMixin:
         )
         if deferred_maintenance_active:
             self._lifecycle.record_maintenance_attempt(self._conversation_id)
-        base_max_leaf_passes = 4 if self._config.dynamic_leaf_chunk_enabled else 1
+        base_max_leaf_passes = (
+            (2 if automatic_foreground else 4)
+            if self._config.dynamic_leaf_chunk_enabled
+            else 1
+        )
         max_leaf_passes = base_max_leaf_passes
         if threshold_full_sweep_active:
-            max_leaf_passes = _THRESHOLD_FULL_SWEEP_MAX_PASSES
+            max_leaf_passes = sweep_pass_budget
         if deferred_maintenance_active:
             max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
+            if automatic_foreground:
+                max_leaf_passes = min(
+                    max_leaf_passes,
+                    _AUTOMATIC_FOREGROUND_MAX_PASSES,
+                )
 
         explicit_focus_topic = focus_topic is not None
 
@@ -931,7 +953,7 @@ class CompactionMixin:
             if sweep_raw_drained:
                 remaining_passes = max(
                     0,
-                    _THRESHOLD_FULL_SWEEP_MAX_PASSES - leaf_passes,
+                    sweep_pass_budget - leaf_passes,
                 )
                 condensation_passes, sweep_stop_reason = (
                     self._run_threshold_sweep_condensation(

@@ -11274,12 +11274,56 @@ class TestEngineCompress:
         compressed = engine.compress(messages, current_tokens=count_messages_tokens(messages))
 
         nodes = engine._dag.get_session_nodes("test-session")
-        assert len(nodes) >= 2
+        assert len(nodes) == 2
         # Verify compaction reduced token count (assembly adds an LCM note to
         # the system message, so compare against starting tokens, not threshold)
         assert count_messages_tokens(compressed) < count_messages_tokens(messages)
         compressed_contents = [msg.get("content") for msg in compressed]
         assert messages[-1]["content"] in compressed_contents
+
+    def test_manual_full_sweep_can_run_deeper_than_automatic_limit(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=80,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=160,
+            threshold_full_sweep_enabled=True,
+            database_path=str(tmp_path / "lcm_manual_full_sweep.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "test-session"
+        engine.context_length = 1_000_000
+        engine.threshold_tokens = 1
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(24):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append(
+                {
+                    "role": role,
+                    "content": f"Message {i}: " + ("dense " * 50),
+                }
+            )
+
+        import hermes_lcm.engine as engine_module
+
+        monkeypatch.setattr(
+            engine_module,
+            "summarize_with_escalation",
+            lambda **kwargs: (
+                "Manual summary.\nExpand for details about: oldest raw chunk",
+                1,
+            ),
+        )
+
+        engine.compress(
+            messages,
+            current_tokens=count_messages_tokens(messages),
+            force=True,
+        )
+
+        nodes = engine._dag.get_session_nodes("test-session")
+        assert len([node for node in nodes if node.depth == 0]) > 2
 
     def test_dynamic_leaf_chunk_pressure_uses_current_working_window_after_each_pass(self, tmp_path, monkeypatch):
         config = LCMConfig(
@@ -11441,7 +11485,11 @@ class TestEngineCompress:
         monkeypatch.setattr(instance, "_assemble_context", count_publication)
         try:
             tokens_before = count_messages_tokens(messages)
-            compressed = instance.compress(messages, current_tokens=tokens_before)
+            compressed = instance.compress(
+                messages,
+                current_tokens=tokens_before,
+                force=True,
+            )
             telemetry = instance.get_status()["threshold_full_sweep"]
 
             assert len(calls) > 1
@@ -11483,7 +11531,7 @@ class TestEngineCompress:
         finally:
             instance.shutdown()
 
-    def test_threshold_full_sweep_total_pass_budget_is_shared_and_reported(self, tmp_path, monkeypatch):
+    def test_automatic_threshold_sweep_uses_two_pass_budget_and_reports_it(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
             leaf_chunk_tokens=1,
@@ -11509,9 +11557,9 @@ class TestEngineCompress:
             instance.compress(messages, current_tokens=count_messages_tokens(messages))
             telemetry = instance.get_status()["threshold_full_sweep"]
 
-            assert telemetry["leaf_passes"] == 12
+            assert telemetry["leaf_passes"] == 2
             assert telemetry["condensation_passes"] == 0
-            assert telemetry["total_passes"] == 12
+            assert telemetry["total_passes"] == 2
             assert telemetry["status"] == "partial"
             assert telemetry["stop_reason"] == "pass_budget_exhausted"
             assert telemetry["budget_exhausted"] is True
@@ -20336,7 +20384,7 @@ class TestDeferredMaintenanceDebt:
         assert refreshed is not None
         assert refreshed.debt_kind == "raw_backlog"
 
-    def test_bounded_catchup_reduces_then_clears_debt_only_after_backlog_shrinks(self, engine, monkeypatch):
+    def test_bounded_catchup_reduces_and_carries_remaining_debt_after_two_pass_cap(self, engine, monkeypatch):
         engine._config.dynamic_leaf_chunk_enabled = True
         engine._config.dynamic_leaf_chunk_max = 100
         engine._config.leaf_chunk_tokens = 100
@@ -20367,8 +20415,8 @@ class TestDeferredMaintenanceDebt:
         third = engine.compress(second)
         debt3 = engine._lifecycle.get_by_conversation(engine._conversation_id)
         assert debt3 is not None
-        assert debt3.debt_kind is None
-        assert debt3.debt_size_estimate == 0
+        assert debt3.debt_kind == "raw_backlog"
+        assert 0 < debt3.debt_size_estimate < debt2.debt_size_estimate
         assert third[0]["role"] == "system"
 
     def test_status_and_lcm_status_surface_debt_state(self, engine, monkeypatch):
@@ -20428,7 +20476,7 @@ class TestDeferredMaintenanceDebt:
         assert len(engine._dag.get_session_nodes("critical-debt-session", depth=0)) == 1
         assert compressed == [messages[0], messages[-1]]
 
-    def test_critical_budget_pressure_continues_dynamic_catchup_after_first_pass(self, engine, monkeypatch):
+    def test_critical_budget_pressure_carries_debt_after_automatic_two_pass_cap(self, engine, monkeypatch):
         engine._config.leaf_chunk_tokens = 50
         engine._config.dynamic_leaf_chunk_enabled = True
         engine._config.dynamic_leaf_chunk_max = 50
@@ -20457,10 +20505,10 @@ class TestDeferredMaintenanceDebt:
         engine.compress(messages, current_tokens=90)
         state = engine._lifecycle.get_by_conversation(engine._conversation_id)
 
-        assert len(engine._dag.get_session_nodes("critical-dynamic-debt-session", depth=0)) >= 2
+        assert len(engine._dag.get_session_nodes("critical-dynamic-debt-session", depth=0)) == 2
         assert state is not None
-        assert state.debt_kind is None
-        assert state.debt_size_estimate == 0
+        assert state.debt_kind == "raw_backlog"
+        assert state.debt_size_estimate > 0
 
     def test_critical_budget_pressure_needs_context_telemetry_for_under_threshold_debt(self, engine):
         engine._config.leaf_chunk_tokens = 10_000
