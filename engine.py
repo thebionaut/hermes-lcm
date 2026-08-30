@@ -953,9 +953,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._runtime_context_threshold(model=model, provider=provider)
         )
         self.threshold_percent = self.context_threshold
-        context_threshold_tokens = int(
-            effective_context_length * self.context_threshold
-        )
+        reserve_tokens = max(0, int(self._config.context_reserve_tokens or 0))
+        if reserve_tokens > 0:
+            context_threshold_tokens = max(
+                1,
+                effective_context_length - reserve_tokens,
+            )
+        else:
+            context_threshold_tokens = int(
+                effective_context_length * self.context_threshold
+            )
         self.threshold_tokens = self._effective_threshold_tokens(
             context_threshold_tokens
         )
@@ -3783,6 +3790,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context_length_source": self._context_length_source,
             "configured_context_threshold": self._config.context_threshold,
             "context_threshold": self.context_threshold,
+            "context_reserve_tokens": self._config.context_reserve_tokens,
+            "threshold_policy": (
+                "fixed_reserve"
+                if self._config.context_reserve_tokens > 0
+                else "ratio"
+            ),
             "context_threshold_source": self._context_threshold_source,
             "context_threshold_autoraised": self._context_threshold_autoraised,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),

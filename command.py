@@ -533,6 +533,8 @@ def _status_text(engine) -> str:
         f"context_length_source: {context_length_source}",
         f"configured_context_threshold: {status.get('configured_context_threshold', engine._config.context_threshold)}",
         f"context_threshold: {status.get('context_threshold', engine._config.context_threshold)}",
+        f"threshold_policy: {status.get('threshold_policy', 'ratio')}",
+        f"context_reserve_tokens: {status.get('context_reserve_tokens', engine._config.context_reserve_tokens)}",
         f"context_threshold_source: {status.get('context_threshold_source', config_sources.get('context_threshold', 'manual_or_default'))}",
         f"context_threshold_autoraised: {status.get('context_threshold_autoraised') or '(none)'}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",

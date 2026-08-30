@@ -235,6 +235,7 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     monkeypatch.setenv("LCM_SUMMARY_SPEND_WINDOW_SECONDS", "123.5")
     monkeypatch.setenv("LCM_SUMMARY_SPEND_BACKOFF_SECONDS", "456.5")
     monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "17")
+    monkeypatch.setenv("LCM_CONTEXT_RESERVE_TOKENS", "100000")
 
     config = LCMConfig.from_env()
     config.database_path = str(tmp_path / "lcm_sources.db")
@@ -251,6 +252,7 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     assert payload["config"]["summary_spend_backoff_seconds"] == 456.5
     assert payload["config"]["automatic_foreground_max_passes"] == 1
     assert payload["config"]["automatic_foreground_max_seconds"] == 15
+    assert payload["config"]["context_reserve_tokens"] == 100000
     assert payload["config_sources"]["fresh_tail_count"] == "env:LCM_FRESH_TAIL_COUNT"
     assert payload["config_sources"]["context_threshold"] == "config_yaml:lcm.context_threshold"
     assert payload["config_sources"]["summary_timeout_ms"] == "config_yaml:auxiliary.compression.timeout"
@@ -519,6 +521,26 @@ def test_lcm_doctor_context_pressure_uses_runtime_threshold(tmp_path):
 
         assert pressure["status"] == "pass"
         assert pressure["detail"] == "82.7% used, compaction triggers at 85.0%"
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_doctor_context_pressure_reports_fixed_reserve_trigger(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.75,
+        context_reserve_tokens=100_000,
+        database_path=str(tmp_path / "doctor-fixed-reserve.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model("large-context-model", 372_000, provider="custom")
+        engine.last_prompt_tokens = 270_000
+
+        doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+        pressure = next(check for check in doctor["checks"] if check["check"] == "context_pressure")
+
+        assert pressure["status"] == "pass"
+        assert pressure["detail"] == "72.6% used, compaction triggers at 73.1%"
     finally:
         engine.shutdown()
 

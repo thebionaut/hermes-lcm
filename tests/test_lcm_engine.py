@@ -408,6 +408,39 @@ def test_update_model_updates_runtime_metadata_and_context_window(engine):
     assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
 
 
+@pytest.mark.parametrize(
+    ("context_length", "expected_trigger"),
+    [
+        (1_000_000, 900_000),
+        (372_000, 272_000),
+    ],
+)
+def test_fixed_context_reserve_sets_compaction_trigger_from_effective_window(
+    tmp_path,
+    context_length,
+    expected_trigger,
+):
+    config = LCMConfig(
+        context_threshold=0.75,
+        context_reserve_tokens=100_000,
+        database_path=str(tmp_path / f"fixed-reserve-{context_length}.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="large-context-model",
+            provider="custom",
+            context_length=context_length,
+        )
+
+        assert engine.threshold_tokens == expected_trigger
+        status = engine.get_status()
+        assert status["threshold_policy"] == "fixed_reserve"
+        assert status["context_reserve_tokens"] == 100_000
+    finally:
+        engine.shutdown()
+
+
 def test_codex_gpt55_uses_route_cap_and_hermes_autoraise_threshold(tmp_path):
     config = LCMConfig(
         context_threshold=0.68,

@@ -6453,6 +6453,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "context_length_source": full_status.get("context_length_source", ""),
         "configured_context_threshold": full_status.get("configured_context_threshold", engine._config.context_threshold),
         "context_threshold": full_status.get("context_threshold", engine._config.context_threshold),
+        "context_reserve_tokens": full_status.get("context_reserve_tokens", engine._config.context_reserve_tokens),
+        "threshold_policy": full_status.get("threshold_policy", "ratio"),
         "context_threshold_source": full_status.get("context_threshold_source", ""),
         "context_threshold_autoraised": full_status.get("context_threshold_autoraised"),
         "threshold_tokens": engine.threshold_tokens,
@@ -6494,6 +6496,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "manual_full_sweep_max_passes": 12,
             "manual_full_sweep_max_seconds": 120,
             "context_threshold": engine._config.context_threshold,
+            "context_reserve_tokens": engine._config.context_reserve_tokens,
             "max_depth": engine._config.incremental_max_depth,
             "condensation_fanin": engine._config.condensation_fanin,
             "summary_model": engine._config.summary_model or "(auxiliary)",
@@ -6866,11 +6869,11 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 7. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
-        runtime_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
-        threshold_pct = round(runtime_threshold * 100, 1)
+        trigger_tokens = max(0, int(engine.threshold_tokens or 0))
+        threshold_pct = round(trigger_tokens / engine.context_length * 100, 1)
         checks.append({
             "check": "context_pressure",
-            "status": "pass" if usage_pct < threshold_pct else "warn",
+            "status": "pass" if engine.last_prompt_tokens < trigger_tokens else "warn",
             "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
         })
 
