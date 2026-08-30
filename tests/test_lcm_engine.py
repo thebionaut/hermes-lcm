@@ -11531,7 +11531,7 @@ class TestEngineCompress:
         finally:
             instance.shutdown()
 
-    def test_automatic_threshold_sweep_uses_two_pass_budget_and_reports_it(self, tmp_path, monkeypatch):
+    def test_automatic_threshold_sweep_uses_one_pass_budget_and_reports_it(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
             leaf_chunk_tokens=1,
@@ -11557,9 +11557,9 @@ class TestEngineCompress:
             instance.compress(messages, current_tokens=count_messages_tokens(messages))
             telemetry = instance.get_status()["threshold_full_sweep"]
 
-            assert telemetry["leaf_passes"] == 2
+            assert telemetry["leaf_passes"] == 1
             assert telemetry["condensation_passes"] == 0
-            assert telemetry["total_passes"] == 2
+            assert telemetry["total_passes"] == 1
             assert telemetry["status"] == "partial"
             assert telemetry["stop_reason"] == "pass_budget_exhausted"
             assert telemetry["budget_exhausted"] is True
@@ -11602,7 +11602,9 @@ class TestEngineCompress:
             return chunk, count_messages_tokens(chunk), "raw retained fact", 1, 0
 
         import hermes_lcm.engine as engine_module
+        import hermes_lcm.compaction as compaction_module
 
+        monkeypatch.setattr(compaction_module, "_AUTOMATIC_FOREGROUND_MAX_PASSES", 2)
         monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
         monkeypatch.setattr(
             engine_module,
@@ -11651,6 +11653,7 @@ class TestEngineCompress:
 
         import hermes_lcm.compaction as compaction_module
 
+        monkeypatch.setattr(compaction_module, "_AUTOMATIC_FOREGROUND_MAX_PASSES", 2)
         monkeypatch.setattr(compaction_module.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
         try:
@@ -11691,6 +11694,9 @@ class TestEngineCompress:
                 raise RuntimeError("later summary failed")
             return chunk, count_messages_tokens(chunk), "persisted first pass", 1, 0
 
+        import hermes_lcm.compaction as compaction_module
+
+        monkeypatch.setattr(compaction_module, "_AUTOMATIC_FOREGROUND_MAX_PASSES", 2)
         monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", flaky_leaf)
         try:
             compressed = instance.compress(messages, current_tokens=count_messages_tokens(messages))
@@ -11787,8 +11793,8 @@ class TestEngineCompress:
         try:
             instance.compress(messages, current_tokens=count_messages_tokens(messages))
             assert leaf_deadlines
-            assert set(leaf_deadlines) == {145.0}
-            assert condensation_deadlines == [145.0]
+            assert set(leaf_deadlines) == {115.0}
+            assert condensation_deadlines == [115.0]
         finally:
             instance.shutdown()
 
@@ -20536,7 +20542,7 @@ class TestDeferredMaintenanceDebt:
         assert len(engine._dag.get_session_nodes("critical-debt-session", depth=0)) == 1
         assert compressed == [messages[0], messages[-1]]
 
-    def test_critical_budget_pressure_carries_debt_after_automatic_two_pass_cap(self, engine, monkeypatch):
+    def test_critical_budget_pressure_carries_debt_after_automatic_one_pass_cap(self, engine, monkeypatch):
         engine._config.leaf_chunk_tokens = 50
         engine._config.dynamic_leaf_chunk_enabled = True
         engine._config.dynamic_leaf_chunk_max = 50
@@ -20565,7 +20571,7 @@ class TestDeferredMaintenanceDebt:
         engine.compress(messages, current_tokens=90)
         state = engine._lifecycle.get_by_conversation(engine._conversation_id)
 
-        assert len(engine._dag.get_session_nodes("critical-dynamic-debt-session", depth=0)) == 2
+        assert len(engine._dag.get_session_nodes("critical-dynamic-debt-session", depth=0)) == 1
         assert state is not None
         assert state.debt_kind == "raw_backlog"
         assert state.debt_size_estimate > 0

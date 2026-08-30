@@ -26,8 +26,8 @@ from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
 
-_AUTOMATIC_FOREGROUND_MAX_PASSES = 2
-_AUTOMATIC_FOREGROUND_MAX_SECONDS = 45.0
+_AUTOMATIC_FOREGROUND_MAX_PASSES = 1
+_AUTOMATIC_FOREGROUND_MAX_SECONDS = 15.0
 _MANUAL_FULL_SWEEP_MAX_PASSES = 12
 _MANUAL_FULL_SWEEP_MAX_SECONDS = 120.0
 

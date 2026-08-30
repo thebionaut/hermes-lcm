@@ -249,6 +249,8 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     assert payload["config"]["summary_spend_max_calls"] == 0
     assert payload["config"]["summary_spend_window_seconds"] == 123.5
     assert payload["config"]["summary_spend_backoff_seconds"] == 456.5
+    assert payload["config"]["automatic_foreground_max_passes"] == 1
+    assert payload["config"]["automatic_foreground_max_seconds"] == 15
     assert payload["config_sources"]["fresh_tail_count"] == "env:LCM_FRESH_TAIL_COUNT"
     assert payload["config_sources"]["context_threshold"] == "config_yaml:lcm.context_threshold"
     assert payload["config_sources"]["summary_timeout_ms"] == "config_yaml:auxiliary.compression.timeout"
