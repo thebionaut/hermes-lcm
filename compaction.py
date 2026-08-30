@@ -550,7 +550,7 @@ class CompactionMixin:
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
-            if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
+            if time.monotonic() >= sweep_deadline:
                 sweep_stop_reason = "time_budget_exhausted"
                 break
             fresh_tail_start = self._fresh_tail_start(pressure_messages)
@@ -736,9 +736,7 @@ class CompactionMixin:
                 # Use the same dependency-filtered view as summarization so ignored
                 # turns cannot leak through derived assistant/tool replies.
                 if self._config.extraction_enabled:
-                    extraction_timeout = None
-                    if threshold_full_sweep_active:
-                        extraction_timeout = max(0.001, sweep_deadline - time.monotonic())
+                    extraction_timeout = max(0.001, sweep_deadline - time.monotonic())
                     self._run_pre_compaction_extraction(
                         summary_input_chunk,
                         timeout_seconds=extraction_timeout,
@@ -753,9 +751,10 @@ class CompactionMixin:
                     self._schedule_pre_compaction_assertions(summary_input_chunk)
 
                 try:
-                    summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
-                    if threshold_full_sweep_active:
-                        summary_kwargs["deadline"] = sweep_deadline
+                    summary_kwargs: dict[str, Any] = {
+                        "focus_topic": focus_topic,
+                        "deadline": sweep_deadline,
+                    }
                     (
                         compacted_chunk,
                         source_tokens,
@@ -969,6 +968,7 @@ class CompactionMixin:
                 leaf_compacted_this_turn=True,
                 force_overflow=force_overflow,
                 critical_budget_pressure=critical_budget_pressure,
+                deadline=sweep_deadline,
             )
 
         # Step 7: Assemble new active context

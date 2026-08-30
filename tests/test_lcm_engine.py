@@ -11358,7 +11358,7 @@ class TestEngineCompress:
             token_pairs.append((last_pressure_tokens, count_messages_tokens(candidate_raw)))
             return candidate_raw[:1]
 
-        def fake_summary(chunk, focus_topic=None):
+        def fake_summary(chunk, focus_topic=None, deadline=None):
             return chunk, count_messages_tokens(chunk), "Window summary.\nExpand for details about: current window", 1, 0
 
         monkeypatch.setattr(engine, "_working_leaf_chunk_tokens", record_working_leaf_chunk_tokens)
@@ -11729,6 +11729,66 @@ class TestEngineCompress:
                 deadline=110.0,
             )
             assert observed_timeout == 100.0
+        finally:
+            instance.shutdown()
+
+    def test_automatic_compaction_shares_wall_deadline_with_leaf_and_condensation(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            dynamic_leaf_chunk_enabled=True,
+            threshold_full_sweep_enabled=False,
+            condensation_fanin=2,
+            database_path=str(tmp_path / "lcm_automatic_wall_deadline.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        instance._dag.add_node(SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary="Earlier leaf",
+            token_count=10,
+            source_token_count=20,
+            source_ids=[1],
+            source_type="messages",
+            created_at=1.0,
+        ))
+        messages = [{"role": "system", "content": "system"}] + [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"historical-{index} " + ("token " * 20),
+            }
+            for index in range(4)
+        ] + [
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": "fresh answer"},
+        ]
+        leaf_deadlines: list[float] = []
+        condensation_deadlines: list[float] = []
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic
+            leaf_deadlines.append(deadline)
+            return chunk, count_messages_tokens(chunk), "bounded leaf", 1, 0
+
+        def fake_condense(nodes, focus_topic=None, deadline=None):
+            del nodes, focus_topic
+            condensation_deadlines.append(deadline)
+            return 20, 10, 1
+
+        import hermes_lcm.compaction as compaction_module
+
+        monkeypatch.setattr(compaction_module.time, "monotonic", lambda: 100.0)
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        monkeypatch.setattr(instance, "_condense_summary_nodes", fake_condense)
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            assert leaf_deadlines
+            assert set(leaf_deadlines) == {145.0}
+            assert condensation_deadlines == [145.0]
         finally:
             instance.shutdown()
 
