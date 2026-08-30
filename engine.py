@@ -1010,6 +1010,76 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status == "noop"
 
+    def _background_publication_trigger_tokens(self) -> int:
+        """Return the active-token boundary for publishing prepared summaries.
+
+        Background preparation deliberately does not replace the host's fixed
+        reserve policy.  Keeping this calculation next to the runtime context
+        metadata makes diagnostics and the foreground publication gate use the
+        same effective (route-capped) window as normal LCM compaction.
+        """
+        effective_window = max(0, int(self.context_length or 0))
+        reserve = max(0, int(self._config.context_reserve_tokens or 0))
+        if effective_window <= 0:
+            return max(0, int(self.threshold_tokens or 0))
+        if reserve > 0:
+            return max(1, effective_window - reserve)
+        return max(0, int(self.threshold_tokens or 0))
+
+    def _background_emergency_trigger_tokens(self) -> int:
+        """Return the bounded foreground-emergency boundary.
+
+        Emergency work is intentionally later than background publication:
+        effective_window - max(32k, five percent of the effective window).
+        """
+        effective_window = max(0, int(self.context_length or 0))
+        if effective_window <= 0:
+            return 0
+        emergency_reserve = max(32_000, int(effective_window * 0.05))
+        return max(1, effective_window - emergency_reserve)
+
+    def get_background_compaction_status(self) -> Dict[str, Any]:
+        """Return durable worker/job status, or an inert disabled view."""
+        helper = getattr(self, "_background_compaction", None)
+        if helper is not None:
+            status = helper.status(
+                conversation_id=str(self.current_conversation_id or ""),
+                publication_trigger_tokens=self._background_publication_trigger_tokens(),
+                emergency_trigger_tokens=self._background_emergency_trigger_tokens(),
+            )
+        else:
+            status = {
+                "enabled": bool(
+                    getattr(self._config, "background_compaction_enabled", False)
+                ),
+                "worker_count": int(
+                    getattr(self._config, "background_compaction_workers", 1)
+                ),
+                "global_limit": int(
+                    getattr(self._config, "background_compaction_global_limit", 2)
+                ),
+                "queued_jobs": 0,
+                "running_jobs": 0,
+                "prepared_jobs": 0,
+                "retry_jobs": 0,
+                "published_jobs": 0,
+                "superseded_jobs": 0,
+                "failed_jobs": 0,
+                "oldest_queued_job_age_seconds": None,
+                "current_job": None,
+                "current_debt_tokens": 0,
+                "last_preparation_result": None,
+                "last_publication_result": None,
+                "active_coverage": "raw",
+            }
+        status["publication_trigger_tokens"] = (
+            self._background_publication_trigger_tokens()
+        )
+        status["emergency_trigger_tokens"] = (
+            self._background_emergency_trigger_tokens()
+        )
+        return status
+
     def _mark_preflight_compression_requested(self) -> bool:
         """Record that preflight found work and clear any stale no-op reason."""
         self._last_compression_status = "pending"
@@ -3802,6 +3872,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
         })
+        status["background_compaction"] = self.get_background_compaction_status()
         with self._assertion_extraction_metrics_lock:
             status["assertion_extraction"] = {
                 "store_enabled": self._assertions is not None,

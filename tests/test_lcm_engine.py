@@ -412,6 +412,7 @@ def test_update_model_updates_runtime_metadata_and_context_window(engine):
     ("context_length", "expected_trigger"),
     [
         (1_000_000, 900_000),
+        (900_000, 800_000),
         (372_000, 272_000),
     ],
 )
@@ -437,6 +438,53 @@ def test_fixed_context_reserve_sets_compaction_trigger_from_effective_window(
         status = engine.get_status()
         assert status["threshold_policy"] == "fixed_reserve"
         assert status["context_reserve_tokens"] == 100_000
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    (
+        "effective_context_window",
+        "expected_publication_trigger",
+        "expected_emergency_trigger",
+    ),
+    [
+        (372_000, 272_000, 340_000),
+        (900_000, 800_000, 855_000),
+        (1_000_000, 900_000, 950_000),
+    ],
+)
+def test_background_publication_and_emergency_thresholds_use_effective_window(
+    tmp_path,
+    effective_context_window,
+    expected_publication_trigger,
+    expected_emergency_trigger,
+):
+    config = LCMConfig(
+        context_reserve_tokens=100_000,
+        database_path=str(
+            tmp_path / f"background-thresholds-{effective_context_window}.db"
+        ),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="large-context-model",
+            provider="custom",
+            context_length=effective_context_window,
+        )
+
+        assert (
+            engine._background_publication_trigger_tokens()
+            == expected_publication_trigger
+        )
+        assert (
+            engine._background_emergency_trigger_tokens()
+            == expected_emergency_trigger
+        )
+        status = engine.get_status()["background_compaction"]
+        assert status["publication_trigger_tokens"] == expected_publication_trigger
+        assert status["emergency_trigger_tokens"] == expected_emergency_trigger
     finally:
         engine.shutdown()
 

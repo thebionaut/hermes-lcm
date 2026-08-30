@@ -100,6 +100,23 @@ def _parse_bool_env(key: str, default: bool) -> bool:
     return default
 
 
+def _parse_bool_env_with_source(
+    key: str,
+    default: bool,
+    *,
+    default_source: str = "default",
+) -> tuple[bool, str, str | None]:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default, default_source, None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True, f"env:{key}", None
+    if normalized in {"0", "false", "no", "off"}:
+        return False, f"env:{key}", None
+    return default, default_source, f"invalid env {key}={raw!r} ignored"
+
+
 def _parse_str_env(key: str, default):
     return os.environ.get(key, default)
 
@@ -331,6 +348,46 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
+    _EnvFieldSpec(
+        "background_compaction_enabled",
+        "LCM_BACKGROUND_COMPACTION_ENABLED",
+        bool,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_workers",
+        "LCM_BACKGROUND_COMPACTION_WORKERS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_global_limit",
+        "LCM_BACKGROUND_COMPACTION_GLOBAL_LIMIT",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_max_passes",
+        "LCM_BACKGROUND_COMPACTION_MAX_PASSES",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_job_timeout_seconds",
+        "LCM_BACKGROUND_COMPACTION_JOB_TIMEOUT_SECONDS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_lease_seconds",
+        "LCM_BACKGROUND_COMPACTION_LEASE_SECONDS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_backlog_tokens",
+        "LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_prepare_ratio",
+        "LCM_BACKGROUND_COMPACTION_PREPARE_RATIO",
+        float,
+    ),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
@@ -425,6 +482,23 @@ _PARSER_BY_TYPE = {
     str: _parse_str_env,
 }
 
+_PARSER_WITH_SOURCE_BY_TYPE = {
+    int: _parse_int_env_with_source,
+    float: _parse_float_env_with_source,
+    bool: _parse_bool_env_with_source,
+}
+
+_BACKGROUND_COMPACTION_ENV_FIELDS = frozenset({
+    "background_compaction_enabled",
+    "background_compaction_workers",
+    "background_compaction_global_limit",
+    "background_compaction_max_passes",
+    "background_compaction_job_timeout_seconds",
+    "background_compaction_lease_seconds",
+    "background_compaction_backlog_tokens",
+    "background_compaction_prepare_ratio",
+})
+
 # Fields whose env reading needs provenance tracking or a computed default;
 # ``from_env`` handles these explicitly, so the uniform loop skips them.
 _SOURCE_TRACKED_ENV_FIELDS = frozenset({
@@ -436,7 +510,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
     "summary_timeout_ms",
-})
+}) | _BACKGROUND_COMPACTION_ENV_FIELDS
 
 # Fields exposed as runtime preset overrides (consumed by presets.py).
 _PRESET_ENV_FIELDS = frozenset({
@@ -500,6 +574,19 @@ class LCMConfig:
     threshold_full_sweep_enabled: bool = False
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
+
+    # -- Durable background compaction ---
+    # Explicit opt-in keeps disabled deployments byte-for-byte foreground-only.
+    background_compaction_enabled: bool = False
+    # Worker count is process-local; the durable global limit coordinates all
+    # enabled Hermes processes sharing the same SQLite database.
+    background_compaction_workers: int = 1
+    background_compaction_global_limit: int = 2
+    background_compaction_max_passes: int = 4
+    background_compaction_job_timeout_seconds: int = 120
+    background_compaction_lease_seconds: int = 300
+    background_compaction_backlog_tokens: int = 32_000
+    background_compaction_prepare_ratio: float = 0.55
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1
@@ -792,6 +879,7 @@ class LCMConfig:
 
     def __post_init__(self) -> None:
         self._normalize_reconcile_budget()
+        self._normalize_background_compaction()
 
     def _normalize_reconcile_budget(self) -> None:
         """Restore the bounded default for invalid reconcile budgets.
@@ -806,6 +894,32 @@ class LCMConfig:
         if not math.isfinite(budget) or budget < 0:
             budget = 45.0
         self.reconcile_budget_seconds = budget
+
+    def _normalize_background_compaction(self) -> None:
+        """Keep worker and trigger settings within safe operational bounds."""
+
+        defaults = {
+            "background_compaction_workers": 1,
+            "background_compaction_global_limit": 2,
+            "background_compaction_max_passes": 4,
+            "background_compaction_job_timeout_seconds": 120,
+            "background_compaction_lease_seconds": 300,
+            "background_compaction_backlog_tokens": 32_000,
+        }
+        for field_name, default in defaults.items():
+            try:
+                value = int(getattr(self, field_name))
+            except (TypeError, ValueError):
+                value = default
+            setattr(self, field_name, max(1, value))
+
+        try:
+            ratio = float(self.background_compaction_prepare_ratio)
+        except (TypeError, ValueError):
+            ratio = 0.55
+        if not math.isfinite(ratio):
+            ratio = 0.55
+        self.background_compaction_prepare_ratio = min(1.0, max(0.0, ratio))
 
     @classmethod
     def from_env(cls) -> "LCMConfig":
@@ -872,6 +986,14 @@ class LCMConfig:
         )
         _record("summary_timeout_ms", source, warning)
 
+        for spec in ENV_FIELD_SPECS:
+            if spec.name not in _BACKGROUND_COMPACTION_ENV_FIELDS:
+                continue
+            parser = _PARSER_WITH_SOURCE_BY_TYPE[spec.py_type]
+            value, source, warning = parser(spec.env_key, getattr(c, spec.name))
+            setattr(c, spec.name, value)
+            _record(spec.name, source, warning)
+
         # Every other scalar LCM_* override is applied uniformly from the spec.
         for spec in ENV_FIELD_SPECS:
             if spec.name in _SOURCE_TRACKED_ENV_FIELDS:
@@ -879,6 +1001,7 @@ class LCMConfig:
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
         c._normalize_reconcile_budget()
+        c._normalize_background_compaction()
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")

@@ -605,6 +605,59 @@ class TestConfig:
         assert c.expansion_context_tokens == 32_000
         assert c.summary_timeout_ms == 60_000
         assert c.expansion_timeout_ms == 120_000
+        assert c.background_compaction_enabled is False
+        assert c.background_compaction_workers == 1
+        assert c.background_compaction_global_limit == 2
+        assert c.background_compaction_max_passes == 4
+        assert c.background_compaction_job_timeout_seconds == 120
+        assert c.background_compaction_lease_seconds == 300
+        assert c.background_compaction_backlog_tokens == 32_000
+        assert c.background_compaction_prepare_ratio == 0.55
+
+    def test_background_compaction_from_exact_env_names(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
+        expected = {
+            "background_compaction_enabled": ("LCM_BACKGROUND_COMPACTION_ENABLED", "true", True),
+            "background_compaction_workers": ("LCM_BACKGROUND_COMPACTION_WORKERS", "1", 1),
+            "background_compaction_global_limit": (
+                "LCM_BACKGROUND_COMPACTION_GLOBAL_LIMIT",
+                "2",
+                2,
+            ),
+            "background_compaction_max_passes": (
+                "LCM_BACKGROUND_COMPACTION_MAX_PASSES",
+                "4",
+                4,
+            ),
+            "background_compaction_job_timeout_seconds": (
+                "LCM_BACKGROUND_COMPACTION_JOB_TIMEOUT_SECONDS",
+                "120",
+                120,
+            ),
+            "background_compaction_lease_seconds": (
+                "LCM_BACKGROUND_COMPACTION_LEASE_SECONDS",
+                "300",
+                300,
+            ),
+            "background_compaction_backlog_tokens": (
+                "LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS",
+                "32000",
+                32_000,
+            ),
+            "background_compaction_prepare_ratio": (
+                "LCM_BACKGROUND_COMPACTION_PREPARE_RATIO",
+                "0.55",
+                0.55,
+            ),
+        }
+        for _field, (env_name, raw_value, _parsed_value) in expected.items():
+            monkeypatch.setenv(env_name, raw_value)
+
+        config = LCMConfig.from_env()
+
+        for field, (env_name, _raw_value, parsed_value) in expected.items():
+            assert getattr(config, field) == parsed_value
+            assert config.config_sources[field] == f"env:{env_name}"
 
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
