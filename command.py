@@ -424,6 +424,143 @@ def _fmt_bool(value: Any) -> str:
     return "yes" if bool(value) else "no"
 
 
+def _compact_background_value(value: Any, limit: int = 320) -> str:
+    if value in (None, "", [], {}):
+        return "(none)"
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        rendered = str(value)
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[: max(0, limit - 3)] + "..."
+
+
+def _background_compaction_status_lines(engine) -> list[str]:
+    """Render the identifier-safe status view shared with JSON diagnostics."""
+    try:
+        from .tools import _background_compaction_status_payload
+
+        status = _background_compaction_status_payload(engine)
+    except Exception as exc:  # pragma: no cover - defensive status rendering
+        # Exception messages may contain provider or connection details.  The
+        # shared JSON helper redacts ordinary failures; keep this last-resort
+        # import/render path opaque as well.
+        return [f"background_compaction_status_error: {type(exc).__name__}"]
+
+    current_job = status.get("current_job")
+    worker_available = status.get("worker_available")
+    worker_available_text = (
+        "(unknown)" if worker_available is None else _fmt_bool(worker_available)
+    )
+    blocker = status.get("compatibility_blocked_reason") or "(none)"
+    lines = [
+        (
+            "background_compaction_enabled: "
+            f"configured={_fmt_bool(status.get('configured_enabled'))} "
+            f"effective={_fmt_bool(status.get('enabled'))} "
+            f"blocker={blocker}"
+        ),
+        (
+            "background_compaction_limits: "
+            f"workers={status.get('worker_count', 0)} "
+            f"global={status.get('global_limit', 0)} "
+            f"available={worker_available_text}"
+        ),
+        (
+            "background_compaction_jobs: "
+            f"queued={status.get('queued_jobs', 0)} "
+            f"running={status.get('running_jobs', 0)} "
+            f"prepared={status.get('prepared_jobs', 0)} "
+            f"retry={status.get('retry_jobs', 0)} "
+            f"published={status.get('published_jobs', 0)} "
+            f"superseded={status.get('superseded_jobs', 0)} "
+            f"failed={status.get('failed_jobs', 0)}"
+        ),
+        (
+            "background_compaction_provider_permits: "
+            f"active={status.get('active_provider_permits', 0)} "
+            f"non_timed_out={status.get('active_non_timed_out_provider_permits', 0)} "
+            f"timed_out={status.get('timed_out_provider_permits', 0)} "
+            "oldest_age_seconds="
+            f"{status.get('provider_permit_oldest_age_seconds') if status.get('provider_permit_oldest_age_seconds') is not None else '(none)'} "
+            "min_lease_remaining_seconds="
+            f"{status.get('provider_permit_min_lease_remaining_seconds') if status.get('provider_permit_min_lease_remaining_seconds') is not None else '(none)'}"
+        ),
+        (
+            "background_compaction_oldest_queued_age_seconds: "
+            f"{status.get('oldest_queued_job_age_seconds') if status.get('oldest_queued_job_age_seconds') is not None else '(none)'}"
+        ),
+        (
+            "background_compaction_policy: "
+            f"backlog={status.get('backlog_trigger_tokens', 0)} "
+            f"prepare_ratio={status.get('prepare_ratio', 0)}"
+        ),
+        (
+            "background_compaction_triggers: "
+            f"publication={status.get('publication_trigger_tokens', 0)} "
+            f"emergency={status.get('emergency_trigger_tokens', 0)}"
+        ),
+        (
+            "background_compaction_frontier: "
+            f"durable={status.get('durable_frontier_store_id', 0)} "
+            f"debt={status.get('current_debt_tokens', 0)} "
+            f"coverage={status.get('active_coverage', 'raw')}"
+        ),
+    ]
+    publication_fence = status.get("publication_fence")
+    if isinstance(publication_fence, dict):
+        lines.append(
+            "background_compaction_publication_fence: "
+            f"generation={publication_fence.get('generation', 0)} "
+            f"publishable={_fmt_bool(publication_fence.get('publishable'))} "
+            "updated_at="
+            f"{publication_fence.get('updated_at') if publication_fence.get('updated_at') is not None else '(none)'}"
+        )
+    if isinstance(current_job, dict):
+        lines.append(
+            "background_compaction_current_job: "
+            f"hint={current_job.get('job_hint') or '(none)'} "
+            f"state={current_job.get('state') or '(unknown)'} "
+            f"frontier={current_job.get('expected_frontier_store_id', 0)} "
+            f"watermark={current_job.get('captured_watermark_store_id', 0)} "
+            f"debt={current_job.get('debt_tokens', 0)} "
+            f"attempt={current_job.get('attempt_count', 0)}"
+        )
+        lines.append(
+            "background_compaction_lease: "
+            f"owner_hint={current_job.get('lease_owner_hint') or '(none)'} "
+            f"remaining_seconds={current_job.get('lease_remaining_seconds') if current_job.get('lease_remaining_seconds') is not None else '(none)'}"
+        )
+        lines.append(
+            "background_compaction_retry: "
+            f"next_at={current_job.get('next_retry_at') if current_job.get('next_retry_at') is not None else '(none)'} "
+            f"error={_compact_background_value(current_job.get('last_error'), 240)}"
+        )
+    else:
+        lines.append("background_compaction_current_job: (none)")
+    lines.extend([
+        "background_compaction_last_preparation: "
+        + _compact_background_value(status.get("last_preparation_result")),
+        "background_compaction_last_publication: "
+        + _compact_background_value(status.get("last_publication_result")),
+        "background_compaction_durable_event_counts: "
+        # The stable reason set is finite and identifier-safe.  Preserve every
+        # exact counter instead of applying the shorter free-form-result cap.
+        + _compact_background_value(status.get("durable_event_counts"), 2_048),
+        "background_compaction_durable_event_reasons: "
+        + (", ".join(status.get("durable_event_reasons") or []) or "(none)"),
+        "background_compaction_diagnostic_reasons: "
+        + (", ".join(status.get("diagnostic_reasons") or []) or "(none)"),
+    ])
+    if status.get("status_error"):
+        lines.append(
+            "background_compaction_status_error: "
+            + _compact_background_value(status.get("status_error"), 240)
+        )
+    return lines
+
+
 def _fmt_size(num_bytes: int) -> str:
     if num_bytes < 1024:
         return f"{num_bytes} B"
@@ -564,6 +701,7 @@ def _status_text(engine) -> str:
         f"source_legacy_blank_messages: {source_stats['legacy_blank_source_messages']}",
         f"source_effective_unknown_messages: {source_stats['effective_unknown_messages']}",
     ]
+    lines.extend(_background_compaction_status_lines(engine))
 
     last_rotate_at = status.get("last_rotate_at")
     if last_rotate_at:

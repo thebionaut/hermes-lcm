@@ -659,6 +659,10 @@ class TestConfig:
             assert getattr(config, field) == parsed_value
             assert config.config_sources[field] == f"env:{env_name}"
 
+    def test_background_compaction_has_at_most_one_worker_per_process(self):
+        assert LCMConfig(background_compaction_workers=99).background_compaction_workers == 1
+        assert LCMConfig(background_compaction_workers=0).background_compaction_workers == 0
+
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
         monkeypatch.setenv("LCM_FRESH_TAIL_MAX_TOKENS", "12000")

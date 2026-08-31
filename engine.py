@@ -25,6 +25,14 @@ from .codex_routing import (
     _is_codex_gpt55_route,
 )
 from .config import LCMConfig
+from .background_compaction import (
+    BackgroundCompactionStore,
+    ForegroundProviderPermitUnavailable,
+    PromotionResult,
+    ProviderPermit,
+    acquire_background_runtime,
+    background_policy_fingerprint,
+)
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
@@ -51,7 +59,6 @@ from .externalize import (
 from .extraction import (
     extract_before_compaction,
     sanitize_pre_compaction_content,
-    sanitize_pre_compaction_tool_arguments,
     strip_injected_context_blocks,
 )
 from .ingest_protection import (
@@ -115,8 +122,6 @@ from .session_patterns import (
     matches_session_pattern,
 )
 from .message_analysis import (
-    _is_synthetic_assistant_noise,
-    _matched_tool_call_ids,
     _tool_call_id,
 )
 from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
@@ -138,6 +143,10 @@ from .sqlite_util import (
     _temporary_sqlite_busy_timeout,
 )
 from .store import MessageStore
+from .summary_serialization import (
+    project_active_replay_messages,
+    serialize_summary_messages,
+)
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -382,6 +391,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._background_compaction: BackgroundCompactionStore | None = None
+        self._background_runtime_handle: Any = None
         self._assertion_extraction_metrics_lock = threading.RLock()
         # Restart reconciliation temporarily installs per-call memo/deadline
         # state on the engine. Serialize it so concurrent post-LLM hooks cannot
@@ -698,6 +709,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 # this engine can publish or delete a DAG node.
                 initialize_rollup_invalidation_outbox(self._dag)
             self._lifecycle = LifecycleStateStore(db_path)
+            if (
+                self._config.background_compaction_enabled
+                and not self._background_compaction_compatibility_blocker()
+            ):
+                self._background_compaction = BackgroundCompactionStore(
+                    db_path,
+                    config=self._config,
+                )
+                self._background_runtime_handle = acquire_background_runtime(
+                    db_path,
+                    config=self._config,
+                )
             self._assertions = (
                 AssertionStore(db_path)
                 if bool(getattr(self._config, "assertions_enabled", False))
@@ -731,7 +754,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
+        runtime_handle = getattr(self, "_background_runtime_handle", None)
+        self._background_runtime_handle = None
+        release = getattr(runtime_handle, "release", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                logger.debug(
+                    "LCM failed releasing background compaction runtime",
+                    exc_info=True,
+                )
         for attr in (
+            "_background_compaction",
             "_adaptive_retrieval",
             "_store",
             "_dag",
@@ -746,6 +781,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     close()
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+            if attr == "_background_compaction":
+                self._background_compaction = None
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -1038,8 +1075,589 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         emergency_reserve = max(32_000, int(effective_window * 0.05))
         return max(1, effective_window - emergency_reserve)
 
+    def _background_compaction_enabled(self) -> bool:
+        return bool(
+            self._config.background_compaction_enabled
+            and self._background_compaction is not None
+            and not self._background_compaction_compatibility_blocker()
+        )
+
+    def _background_compaction_compatibility_blocker(self) -> str:
+        """Return why this configuration must retain foreground derivation.
+
+        File/assertion extraction are separate model-data egress paths.  Until
+        an operator explicitly adopts an asynchronous policy for those paths,
+        keep their existing foreground semantics rather than silently skipping
+        them or sending captured content from a new background worker.
+        """
+        if bool(getattr(self._config, "extraction_enabled", False)):
+            return "file_extraction_requires_foreground_compaction"
+        if bool(getattr(self._config, "assertions_enabled", False)) and bool(
+            getattr(self._config, "assertion_extraction_enabled", False)
+        ):
+            return "assertion_extraction_requires_foreground_compaction"
+        return ""
+
+    def _background_policy_fingerprint(self) -> str:
+        return background_policy_fingerprint(self._config)
+
+    def _reconcile_background_publication_fence(
+        self,
+        lifecycle_state: Any | None = None,
+        *,
+        log_contention: bool = False,
+    ) -> int | None:
+        """Activate the currently bound lifecycle epoch with a bounded CAS.
+
+        This is intentionally safe to call again on a later foreground turn.
+        The store will not reopen an intentional reset fence for the same
+        lifecycle binding, but it can recover from a transient activation lock
+        after a newer durable bind.
+        """
+        if (
+            not self._background_compaction_enabled()
+            or not self._conversation_id
+            or not self._session_id
+        ):
+            return None
+        state = lifecycle_state or self._lifecycle.get_by_conversation(
+            self._conversation_id
+        )
+        if (
+            state is None
+            or state.current_session_id != self._session_id
+            or state.current_bound_at is None
+        ):
+            return None
+        try:
+            return self._background_compaction.activate_session(
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                expected_lifecycle_bound_at=float(state.current_bound_at),
+                expected_lifecycle_reset_at=state.last_reset_at,
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            if log_contention:
+                logger.warning(
+                    "LCM background publication fence activation deferred: %s",
+                    exc,
+                )
+            return None
+
+    def _maybe_enqueue_background_compaction(
+        self,
+        messages: List[Dict[str, Any]],
+        observed_tokens: int | None = None,
+        *,
+        allow_canonical_prefix_adoption: bool = True,
+    ):
+        """Capture/coalesce eligible durable raw work without model I/O."""
+        if (
+            not self._background_compaction_enabled()
+            or not self._session_id
+            or not self._conversation_id
+            or self._bypasses_lcm_context_management()
+        ):
+            return None
+        lifecycle = self._lifecycle.get_by_conversation(self._conversation_id)
+        if lifecycle is None or lifecycle.current_session_id != self._session_id:
+            return None
+        fence_generation = self._reconcile_background_publication_fence(lifecycle)
+        if fence_generation is None:
+            return None
+        if allow_canonical_prefix_adoption:
+            adopted_frontier = self._maybe_adopt_existing_canonical_prefix(
+                lifecycle,
+                expected_session_fence_generation=fence_generation,
+            )
+            if adopted_frontier > int(lifecycle.current_frontier_store_id or 0):
+                # The durable frontier changed atomically.  Do not capture a
+                # stale job in this boundary; preflight/compress will rebuild
+                # the active view from the canonical DAG before considering
+                # the still-uncovered suffix on a later bounded boundary.
+                return None
+            latest_lifecycle = self._lifecycle.get_by_conversation(
+                self._conversation_id
+            )
+            if (
+                latest_lifecycle is None
+                or latest_lifecycle.current_session_id != self._session_id
+                or int(latest_lifecycle.current_frontier_store_id or 0)
+                != int(lifecycle.current_frontier_store_id or 0)
+            ):
+                return None
+        active_tokens = (
+            int(observed_tokens)
+            if observed_tokens is not None and int(observed_tokens) >= 0
+            else count_messages_tokens(messages)
+        )
+        try:
+            job = self._background_compaction.capture_and_enqueue(
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                expected_frontier_store_id=lifecycle.current_frontier_store_id,
+                active_tokens=active_tokens,
+                effective_context_window=max(0, int(self.context_length or 0)),
+                policy_fingerprint=self._background_policy_fingerprint(),
+            )
+        except sqlite3.OperationalError as exc:
+            if _is_sqlite_locked_error(exc):
+                logger.warning(
+                    "LCM background compaction enqueue deferred by SQLite lock contention"
+                )
+                return None
+            raise
+        runtime = self._background_runtime_handle
+        notify = getattr(runtime, "notify", None)
+        if job is not None and callable(notify):
+            notify()
+        return job
+
+    def _maybe_adopt_existing_canonical_prefix(
+        self,
+        lifecycle_state: Any | None = None,
+        *,
+        expected_session_fence_generation: int | None = None,
+    ) -> int:
+        """Boundedly reconcile legacy canonical coverage above the frontier.
+
+        Older foreground publication used separate DAG/frontier transactions,
+        so a crash could leave an already-canonical raw prefix above the
+        lifecycle marker.  Advance only across the normalized, contiguous
+        prefix before any provider work; the following foreground compression
+        boundary adopts that durable frontier into the active context.
+        """
+        if (
+            not self._background_compaction_enabled()
+            or not self._conversation_id
+            or not self._session_id
+        ):
+            return 0
+        lifecycle = lifecycle_state or self._lifecycle.get_by_conversation(
+            self._conversation_id
+        )
+        if lifecycle is None or lifecycle.current_session_id != self._session_id:
+            return 0
+        frontier = int(lifecycle.current_frontier_store_id or 0)
+        fence_generation = expected_session_fence_generation
+        if fence_generation is None:
+            fence_generation = self._reconcile_background_publication_fence(
+                lifecycle
+            )
+        if fence_generation is None:
+            return frontier
+        try:
+            return int(
+                self._background_compaction.adopt_contiguous_canonical_prefix(
+                    conversation_id=self._conversation_id,
+                    session_id=self._session_id,
+                    expected_frontier_store_id=frontier,
+                    expected_session_fence_generation=int(fence_generation),
+                )
+                or frontier
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            logger.warning(
+                "LCM canonical-prefix adoption deferred by SQLite lock contention"
+            )
+            return frontier
+
+    def _has_publishable_background_job(self) -> bool:
+        if not self._background_compaction_enabled() or not self._conversation_id:
+            return False
+        lifecycle = self._lifecycle.get_by_conversation(self._conversation_id)
+        expected_frontier = (
+            lifecycle.current_frontier_store_id if lifecycle is not None else None
+        )
+        return self._background_compaction.find_prepared_job(
+            conversation_id=self._conversation_id,
+            session_id=self._session_id,
+            expected_frontier_store_id=expected_frontier,
+            policy_fingerprint=self._background_policy_fingerprint(),
+        ) is not None
+
+    def _has_newer_committed_background_frontier(self) -> bool:
+        """Return whether this process still needs to adopt a sibling commit."""
+        if not self._background_compaction_enabled() or not self._conversation_id:
+            return False
+        lifecycle = self._lifecycle.get_by_conversation(self._conversation_id)
+        return bool(
+            lifecycle is not None
+            and lifecycle.current_session_id == self._session_id
+            and int(lifecycle.current_frontier_store_id or 0)
+            > int(self._last_compacted_store_id or 0)
+        )
+
+    def _all_durable_messages_after(self, store_id: int) -> List[Dict[str, Any]]:
+        """Page the complete durable suffix; MessageStore defaults to 10k rows."""
+        rows: List[Dict[str, Any]] = []
+        cursor = max(0, int(store_id or 0))
+        while True:
+            page = self._store.get_session_messages_after(
+                self._session_id,
+                cursor,
+                limit=1_000,
+                conversation_id=self._conversation_id,
+            )
+            if not page:
+                break
+            rows.extend(page)
+            next_cursor = max(int(row.get("store_id") or 0) for row in page)
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            if len(page) < 1_000:
+                break
+        return rows
+
+    def _project_durable_active_tail(
+        self,
+        store_id: int,
+        *,
+        preserve_messages: List[Dict[str, Any]] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the complete replay-safe suffix above ``store_id``.
+
+        Durable rows define ordering and make sibling-process writes visible.
+        When the caller also has an in-memory active view, overlay matching raw
+        rows with those exact objects so provider-only fields, structured media,
+        and already-established replay representations are not degraded by a
+        storage round-trip.
+        """
+        durable_rows = self._all_durable_messages_after(store_id)
+        durable_suffix_store_ids = {
+            int(row.get("store_id") or 0) for row in durable_rows
+        }
+        replay: List[Dict[str, Any]] = []
+        for row in durable_rows:
+            message = self._store.to_openai_msg(row)
+            message["_lcm_replay_store_id"] = int(row.get("store_id") or 0)
+            replay.append(message)
+        projected = project_active_replay_messages(
+            replay,
+            config=self._config,
+            session_id=self._session_id,
+            hermes_home=self._hermes_home,
+        )
+        if not preserve_messages:
+            for message in projected:
+                message.pop("_lcm_replay_store_id", None)
+            return projected
+
+        leading_count = (
+            1
+            if preserve_messages and preserve_messages[0].get("role") == "system"
+            else 0
+        )
+        active_tail = preserve_messages[leading_count:]
+        ids_by_message_id = self._get_store_id_map_for_messages(active_tail)
+        exact_by_store_id = {
+            int(ids_by_message_id[id(message)]): dict(message)
+            for message in active_tail
+            if id(message) in ids_by_message_id
+            and int(ids_by_message_id[id(message)]) > int(store_id or 0)
+        }
+        last_mapped_active_index = max(
+            (
+                index
+                for index, message in enumerate(active_tail)
+                if id(message) in ids_by_message_id
+            ),
+            default=-1,
+        )
+        merged: List[Dict[str, Any]] = []
+        represented_store_ids: set[int] = set()
+        for durable_message in projected:
+            durable_store_id = int(
+                durable_message.pop("_lcm_replay_store_id", 0) or 0
+            )
+            represented_store_ids.add(durable_store_id)
+            exact_message = exact_by_store_id.get(durable_store_id)
+            merged.append(
+                dict(exact_message) if exact_message is not None else durable_message
+            )
+
+        # A normal publication/adoption follows ingestion, so every live raw
+        # message should map durably.  Preserve any genuinely new unmapped
+        # caller suffix defensively, while excluding synthetic context scaffolds
+        # that the freshly assembled DAG prefix will replace.
+        for index, message in enumerate(active_tail):
+            mapped_store_id = ids_by_message_id.get(id(message))
+            if mapped_store_id is not None:
+                mapped_store_id = int(mapped_store_id)
+                if mapped_store_id in represented_store_ids:
+                    continue
+                if mapped_store_id <= int(store_id or 0):
+                    continue
+                if mapped_store_id in durable_suffix_store_ids:
+                    # The durable projector considered this row.  If it is not
+                    # represented above, replay policy deliberately filtered it
+                    # (for example, an ignored turn or its dependent reply).
+                    # Never resurrect or move that row behind later kept rows.
+                    continue
+            elif index <= last_mapped_active_index:
+                # Unmapped ignore/quarantine placeholders can sit inside the
+                # consumed range.  Their position does not prove they are a
+                # new suffix, so fail closed instead of moving them beyond the
+                # published frontier.  Only caller objects after every mapped
+                # durable row are demonstrably newer.
+                continue
+            if (
+                message.get("display_kind") == "context_projection"
+                or self._is_replayed_context_scaffold_message(message)
+            ):
+                continue
+            merged.append(dict(message))
+        return merged
+
+    def _adopt_committed_background_frontier(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]] | None:
+        """Adopt a sibling process's committed frontier at a foreground boundary."""
+        if not self._background_compaction_enabled() or not self._conversation_id:
+            return None
+        lifecycle = self._lifecycle.get_by_conversation(self._conversation_id)
+        if (
+            lifecycle is None
+            or lifecycle.current_session_id != self._session_id
+            or int(lifecycle.current_frontier_store_id or 0)
+            <= int(self._last_compacted_store_id or 0)
+        ):
+            return None
+        committed_frontier = int(lifecycle.current_frontier_store_id or 0)
+        tail_messages = self._project_durable_active_tail(
+            committed_frontier,
+            preserve_messages=messages,
+        )
+        leading = (
+            dict(messages[0])
+            if messages and messages[0].get("role") == "system"
+            else None
+        )
+        assembled = self._assemble_context(leading, tail_messages)
+        assembled = self._sanitize_active_context_messages(assembled)
+        self._last_compacted_store_id = committed_frontier
+        self._ingest_cursor = len(assembled)
+        self._ingest_cursor_needs_reconcile = False
+        return assembled
+
+    def run_background_compaction_once(self, summarizer=None):
+        """Claim and prepare one durable job (deterministic tests/operators)."""
+        if not self._background_compaction_enabled():
+            return None
+        if self._session_id and self._conversation_id:
+            self._maybe_enqueue_background_compaction(
+                self._store.get_session_messages(self._session_id),
+                observed_tokens=self.last_prompt_tokens,
+            )
+        owner = f"manual-{os.getpid()}-{threading.get_ident()}"
+        job = self._background_compaction.run_next_job(
+            owner=owner,
+            summarizer=summarizer,
+            circuit_breaker=self._summary_circuit_breaker,
+            spend_guard=self._summary_spend_guard,
+        )
+        return job
+
+    def promote_prepared_compaction(
+        self,
+        job_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        current_tokens: int | None = None,
+    ) -> PromotionResult:
+        """Atomically publish one prepared range, then assemble a new list."""
+        if not self._background_compaction_enabled():
+            return PromotionResult(
+                promoted=False,
+                reason="background_compaction_disabled",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        scoped_job = self._background_compaction.get_job(str(job_id or ""))
+        if scoped_job is None:
+            return PromotionResult(
+                promoted=False,
+                reason="job_not_found",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        if (
+            scoped_job.conversation_id != self._conversation_id
+            or scoped_job.session_id != self._session_id
+        ):
+            return PromotionResult(
+                promoted=False,
+                reason="job_scope_mismatch",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        observed_tokens = (
+            max(0, int(current_tokens))
+            if current_tokens is not None
+            else max(0, int(count_messages_tokens(messages)))
+        )
+        publication_trigger = self._background_publication_trigger_tokens()
+        if publication_trigger <= 0 or observed_tokens < publication_trigger:
+            return PromotionResult(
+                promoted=False,
+                reason="publication_trigger_not_reached",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        owner = f"publish-{os.getpid()}-{threading.get_ident()}"
+        lease = self._background_compaction.acquire_publication_lease(
+            job_id,
+            owner=owner,
+        )
+        if lease is None:
+            return PromotionResult(
+                promoted=False,
+                reason="publication_lease_unavailable",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        result = self._background_compaction.publish_prepared(
+            job_id,
+            owner=owner,
+            generation=lease.lease_generation,
+            policy_fingerprint=self._background_policy_fingerprint(),
+        )
+        if not result.promoted:
+            result.messages = list(messages)
+            return result
+
+        committed_frontier = int(
+            result.captured_watermark_store_id or lease.captured_watermark_store_id
+        )
+        try:
+            tail_messages = self._project_durable_active_tail(
+                committed_frontier,
+                preserve_messages=messages,
+            )
+            leading = (
+                dict(messages[0])
+                if messages and messages[0].get("role") == "system"
+                else None
+            )
+            assembled = self._assemble_context(leading, tail_messages)
+            assembled = self._sanitize_active_context_messages(assembled)
+        except Exception:
+            # The SQLite publication/frontier CAS is already committed and is
+            # authoritative.  Do not turn a local replay/assembly fault into an
+            # apparent failed publication, and do not advance the process-local
+            # marker: the next foreground boundary can adopt the durable
+            # frontier again.  Returning the caller view preserves the current
+            # turn without deleting or duplicating raw storage.
+            logger.exception(
+                "LCM published background compaction but deferred local context rebuild"
+            )
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = "published context rebuild deferred"
+            result.reason = "published_context_rebuild_deferred"
+            result.messages = list(messages)
+            return result
+        self._last_compacted_store_id = committed_frontier
+        self._ingest_cursor = len(assembled)
+        self._ingest_cursor_needs_reconcile = False
+        self.compression_count += 1
+        self._last_compression_status = "compacted"
+        self._last_compression_noop_reason = ""
+        result.messages = assembled
+        return result
+
+    def _publish_prepared_background_compaction(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        current_tokens: int,
+    ) -> PromotionResult | None:
+        if not self._background_compaction_enabled():
+            return None
+        job = self._background_compaction.find_prepared_job(
+            conversation_id=self._conversation_id,
+            session_id=self._session_id,
+            expected_frontier_store_id=self._last_compacted_store_id,
+            policy_fingerprint=self._background_policy_fingerprint(),
+        )
+        if job is None:
+            return None
+        return self.promote_prepared_compaction(
+            job.job_id,
+            messages,
+            current_tokens=current_tokens,
+        )
+
+    def _supersede_background_jobs_after_foreground(self) -> int:
+        if not self._background_compaction_enabled() or not self._conversation_id:
+            return 0
+        return self._background_compaction.supersede_overlapping(
+            conversation_id=self._conversation_id,
+            new_frontier_store_id=self._last_compacted_store_id,
+            reason="foreground_emergency_compaction",
+        )
+
+    def _publish_foreground_background_node(
+        self,
+        node: SummaryNode,
+        *,
+        expected_session_fence_generation: int,
+        expected_frontier_store_id: int,
+        consumed_store_ids: List[int],
+        expected_source_identity_hash: str,
+    ) -> PromotionResult:
+        """Atomically fence a foreground node against prepared publishers."""
+        if not self._background_compaction_enabled() or not consumed_store_ids:
+            return PromotionResult(False, "background_compaction_disabled")
+        watermark = max(int(store_id) for store_id in consumed_store_ids)
+        try:
+            result = self._background_compaction.publish_foreground_node(
+                node,
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                expected_session_fence_generation=expected_session_fence_generation,
+                expected_frontier_store_id=expected_frontier_store_id,
+                captured_watermark_store_id=watermark,
+                expected_source_identity_hash=expected_source_identity_hash,
+                debt_tokens=int(node.source_token_count or 0),
+                reason="foreground_emergency_compaction",
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            logger.warning(
+                "LCM foreground emergency publication deferred by SQLite lock contention"
+            )
+            try:
+                self._background_compaction.record_diagnostic_event(
+                    "sqlite_lock_contention",
+                    conversation_id=self._conversation_id,
+                    session_id=self._session_id,
+                    detail=exc,
+                    deduplicate_seconds=60.0,
+                    write_timeout_ms=100,
+                )
+            except sqlite3.OperationalError:
+                # Contention diagnostics must never extend the bounded
+                # foreground path merely because the same writer is busy.
+                pass
+            return PromotionResult(False, "sqlite_lock_contention")
+        if result.promoted:
+            node.node_id = result.node_ids[0]
+            self._last_compacted_store_id = watermark
+        return result
+
     def get_background_compaction_status(self) -> Dict[str, Any]:
         """Return durable worker/job status, or an inert disabled view."""
+        compatibility_blocker = self._background_compaction_compatibility_blocker()
+        configured_enabled = bool(
+            getattr(self._config, "background_compaction_enabled", False)
+        )
         helper = getattr(self, "_background_compaction", None)
         if helper is not None:
             status = helper.status(
@@ -1049,9 +1667,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         else:
             status = {
-                "enabled": bool(
-                    getattr(self._config, "background_compaction_enabled", False)
-                ),
+                "enabled": configured_enabled and not compatibility_blocker,
                 "worker_count": int(
                     getattr(self._config, "background_compaction_workers", 1)
                 ),
@@ -1070,6 +1686,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "current_debt_tokens": 0,
                 "last_preparation_result": None,
                 "last_publication_result": None,
+                "durable_frontier_store_id": 0,
                 "active_coverage": "raw",
             }
         status["publication_trigger_tokens"] = (
@@ -1077,6 +1694,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         status["emergency_trigger_tokens"] = (
             self._background_emergency_trigger_tokens()
+        )
+        status["configured_enabled"] = configured_enabled
+        if compatibility_blocker:
+            status["enabled"] = False
+            status["worker_count"] = 0
+            status["worker_available"] = False
+            status["compatibility_blocked_reason"] = compatibility_blocker
+        durable_frontier = max(
+            0,
+            int(status.get("durable_frontier_store_id") or 0),
+        )
+        status["active_coverage"] = (
+            "published_summary"
+            if durable_frontier > 0
+            and int(self._last_compacted_store_id or 0) >= durable_frontier
+            else "raw"
         )
         return status
 
@@ -1604,12 +2237,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._ingest_messages(messages)
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                logger.debug(
-                    "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
-                    self._session_id, len(messages), self._ingest_cursor,
-                )
             except Exception as e:
                 self._record_ingest_failure("per-turn ingest()", e)
+                return
+            try:
+                self._maybe_enqueue_background_compaction(
+                    messages,
+                    observed_tokens=max(
+                        int(self.last_prompt_tokens or 0),
+                        count_messages_tokens(messages),
+                    ),
+                )
+            except Exception as e:
+                # Immutable raw ingest already committed successfully.  Queue
+                # maintenance is opportunistic and must not corrupt ingest
+                # health accounting or cause the host to retry this raw batch.
+                logger.warning(
+                    "LCM background compaction enqueue failed after raw ingest: %s",
+                    e,
+                )
+            logger.debug(
+                "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
+                self._session_id, len(messages), self._ingest_cursor,
+            )
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -1652,11 +2302,146 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         return current_chunk[:-1]
 
+    def _acquire_foreground_emergency_provider_permit(
+        self,
+        *,
+        deadline: float,
+        expected_session_fence_generation: int,
+    ) -> ProviderPermit:
+        """Reserve durable provider capacity immediately before thread start."""
+        state = getattr(
+            self._thread_context,
+            "foreground_emergency_provider_permit",
+            None,
+        )
+        if state is not None:
+            if state.get("guardian_owned"):
+                raise ForegroundProviderPermitUnavailable(
+                    "foreground emergency provider call is still physically running"
+                )
+            return state["permit"]
+        helper = self._background_compaction
+        if helper is None or not self._conversation_id:
+            raise ForegroundProviderPermitUnavailable(
+                "foreground emergency provider permit is unavailable"
+            )
+        # The first lease covers the complete foreground wall plus a short
+        # publication cushion.  If the physical call outlives that wall, the
+        # guardian begins heartbeating before this reservation can expire.
+        remaining = max(0.0, float(deadline) - time.monotonic())
+        lease_seconds = max(
+            float(
+                getattr(
+                    self._config,
+                    "background_compaction_lease_seconds",
+                    300,
+                )
+                or 300
+            ),
+            (remaining * 2.0) + 5.0,
+        )
+        owner = f"foreground-{os.getpid()}-{threading.get_ident()}"
+        try:
+            permit = helper.acquire_emergency_provider_permit(
+                conversation_id=self._conversation_id,
+                owner=owner,
+                session_id=self._session_id,
+                expected_session_fence_generation=expected_session_fence_generation,
+                lease_seconds=lease_seconds,
+                global_limit=int(
+                    getattr(
+                        self._config,
+                        "background_compaction_global_limit",
+                        2,
+                    )
+                    or 0
+                ),
+            )
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            permit = None
+        if permit is None:
+            raise ForegroundProviderPermitUnavailable(
+                "foreground emergency provider capacity is unavailable"
+            )
+        self._thread_context.foreground_emergency_provider_permit = {
+            "permit": permit,
+            "guardian_owned": False,
+        }
+        return permit
+
+    def _handoff_foreground_emergency_provider_permit(
+        self,
+        completed: threading.Event,
+    ) -> None:
+        """Keep a timed-out physical call fenced until it actually returns."""
+        state = getattr(
+            self._thread_context,
+            "foreground_emergency_provider_permit",
+            None,
+        )
+        if state is None or state.get("guardian_owned"):
+            return
+        permit: ProviderPermit = state["permit"]
+        state["guardian_owned"] = True
+        helper = self._background_compaction
+        if helper is None:
+            return
+        helper._start_provider_permit_guardian(
+            completed,
+            job_id=permit.job_id,
+            owner=permit.lease_owner,
+            generation=permit.lease_generation,
+        )
+
+    def _release_foreground_emergency_provider_permit(self) -> None:
+        """Release this foreground thread's permit after publication or failure."""
+        state = getattr(
+            self._thread_context,
+            "foreground_emergency_provider_permit",
+            None,
+        )
+        if state is None:
+            return
+        try:
+            del self._thread_context.foreground_emergency_provider_permit
+        except AttributeError:
+            pass
+        if state.get("guardian_owned"):
+            return
+        permit: ProviderPermit = state["permit"]
+        helper = self._background_compaction
+        if helper is None:
+            return
+        try:
+            helper.release_provider_permit(
+                permit.job_id,
+                owner=permit.lease_owner,
+                generation=permit.lease_generation,
+                busy_timeout_ms=0,
+            )
+        except BaseException:
+            logger.warning(
+                "LCM deferred release of a foreground emergency provider permit",
+                exc_info=True,
+            )
+            completed = threading.Event()
+            completed.set()
+            helper._start_provider_permit_guardian(
+                completed,
+                job_id=permit.job_id,
+                owner=permit.lease_owner,
+                generation=permit.lease_generation,
+            )
+
     def _summarize_leaf_chunk_with_rescue(
         self,
         initial_chunk: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         deadline: Optional[float] = None,
+        require_durable_provider_permit: bool = False,
+        expected_session_fence_generation: int | None = None,
     ) -> tuple[List[Dict[str, Any]], int, str, int, int]:
         attempt_chunk = list(initial_chunk)
         max_attempts = 3
@@ -1676,21 +2461,80 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     if remaining_seconds <= 0:
                         raise TimeoutError("threshold full sweep time budget exhausted")
                     timeout_seconds = min(timeout_seconds, remaining_seconds)
-                summary_text, level = summarize_with_escalation(
-                    text=serialized,
-                    source_tokens=source_tokens,
-                    token_budget=token_budget,
-                    depth=0,
-                    model=self._config.summary_model,
-                    fallback_models=self._config.summary_fallback_models,
-                    circuit_breaker=self._summary_circuit_breaker,
-                    spend_guard=self._summary_spend_guard,
-                    timeout=timeout_seconds,
-                    l2_budget_ratio=self._config.l2_budget_ratio,
-                    l3_truncate_tokens=self._config.l3_truncate_tokens,
-                    focus_topic=focus_topic or "",
-                    custom_instructions=self._config.custom_instructions,
-                )
+                call_kwargs = {
+                    "text": serialized,
+                    "source_tokens": source_tokens,
+                    "token_budget": token_budget,
+                    "depth": 0,
+                    "model": self._config.summary_model,
+                    "fallback_models": self._config.summary_fallback_models,
+                    "circuit_breaker": self._summary_circuit_breaker,
+                    "spend_guard": self._summary_spend_guard,
+                    "timeout": timeout_seconds,
+                    "l2_budget_ratio": self._config.l2_budget_ratio,
+                    "l3_truncate_tokens": self._config.l3_truncate_tokens,
+                    "focus_topic": focus_topic or "",
+                    "custom_instructions": self._config.custom_instructions,
+                }
+                if deadline is None:
+                    summary_text, level = summarize_with_escalation(**call_kwargs)
+                else:
+                    completed = threading.Event()
+                    result_box: dict[str, Any] = {}
+
+                    def call_provider() -> None:
+                        try:
+                            result_box["value"] = summarize_with_escalation(
+                                **call_kwargs
+                            )
+                        except BaseException as provider_error:
+                            result_box["error"] = provider_error
+                        finally:
+                            completed.set()
+
+                    provider_thread = threading.Thread(
+                        target=call_provider,
+                        name="lcm-foreground-summary-deadline",
+                        daemon=True,
+                    )
+                    if require_durable_provider_permit:
+                        if expected_session_fence_generation is None:
+                            raise ForegroundProviderPermitUnavailable(
+                                "foreground emergency session fence is unavailable"
+                            )
+                        self._acquire_foreground_emergency_provider_permit(
+                            deadline=deadline,
+                            expected_session_fence_generation=(
+                                expected_session_fence_generation
+                            ),
+                        )
+                    try:
+                        provider_thread.start()
+                    except BaseException:
+                        if require_durable_provider_permit:
+                            self._release_foreground_emergency_provider_permit()
+                        raise
+                    try:
+                        finished = completed.wait(
+                            timeout=max(0.001, timeout_seconds)
+                        )
+                    except BaseException:
+                        if require_durable_provider_permit and not completed.is_set():
+                            self._handoff_foreground_emergency_provider_permit(
+                                completed
+                            )
+                        raise
+                    if not finished:
+                        if require_durable_provider_permit:
+                            self._handoff_foreground_emergency_provider_permit(
+                                completed
+                            )
+                        raise TimeoutError(
+                            "foreground compaction provider deadline exceeded"
+                        )
+                    if "error" in result_box:
+                        raise result_box["error"]
+                    summary_text, level = result_box["value"]
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
@@ -1799,6 +2643,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
+
+        if self._background_compaction_enabled():
+            self._reconcile_background_publication_fence(
+                state,
+                log_contention=True,
+            )
 
         # Garbage-collect empty lifecycle rows when the table exceeds threshold.
         # Gateway restarts, ephemeral cron ticks, and crash-loops all create
@@ -2493,6 +3343,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     after_store_id=frontier,
                 )
             )
+
+        if can_reassign and self._background_compaction_enabled():
+            try:
+                can_reassign = (
+                    self._background_compaction.begin_session_reset(
+                        conversation_id=conversation_id,
+                        session_id=source_session_id,
+                        reason="compression_rollover",
+                    )
+                    is not None
+                )
+            except sqlite3.OperationalError as exc:
+                can_reassign = False
+                logger.warning(
+                    "LCM compression carry-over skipped because the old-session publication fence could not be acquired: %s",
+                    exc,
+                )
 
         if can_reassign:
             self._lifecycle.finalize_session(
@@ -3527,8 +4394,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._pending_reset_session_id = self._session_id
         self._pending_reset_conversation_id = self._conversation_id
         self._pending_reset_frontier_store_id = self._last_compacted_store_id
+        background_reset_fenced = True
+        if (
+            self._background_compaction_enabled()
+            and self._session_id
+            and self._conversation_id
+        ):
+            try:
+                background_reset_fenced = (
+                    self._background_compaction.begin_session_reset(
+                        conversation_id=self._conversation_id,
+                        session_id=self._session_id,
+                    )
+                    is not None
+                )
+            except sqlite3.OperationalError as exc:
+                # Never free canonical coverage while publication could still
+                # race the batched reset. Preserving the derived nodes is the
+                # fail-closed outcome; immutable raw messages are unaffected.
+                background_reset_fenced = False
+                logger.warning(
+                    "LCM reset preserved DAG nodes because the background publication fence could not be acquired: %s",
+                    exc,
+                )
         super().on_session_reset()
-        self._lifecycle.record_reset(self._conversation_id)
         self._reset_session_scoped_runtime_state()
 
         # Retain DAG nodes across sessions based on config.
@@ -3536,7 +4425,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         #    0  → delete everything
         #    N  → keep nodes at depth >= N (e.g. 2 keeps d2+)
         retain = self._config.new_session_retain_depth
-        if self._session_id and retain != -1:
+        if self._session_id and retain != -1 and background_reset_fenced:
             if retain == 0:
                 self._dag.delete_session_nodes(
                     self._session_id,
@@ -3548,6 +4437,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     retain,
                     on_deleted_batch=self._purge_embeddings_for_nodes,
                 )
+        elif self._session_id and retain != -1 and not background_reset_fenced:
+            logger.warning(
+                "LCM reset skipped DAG pruning because publication was not durably fenced"
+            )
+        # Publish the new reset epoch only after all batched DAG mutation is
+        # complete. A sibling process cannot reopen the closed fence while
+        # deletion is in progress; the next foreground bind/reconciliation may
+        # safely activate this completed epoch.
+        self._lifecycle.record_reset(self._conversation_id)
 
     def _purge_embeddings_for_nodes(
         self,
@@ -4177,6 +5075,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._session_id,
                 after_store_id=after_store_id,
                 limit=1000,
+                conversation_id=self._conversation_id,
             )
             if not rows:
                 return False
@@ -5145,72 +6044,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
-        parts = []
-        matched_tool_ids = _matched_tool_call_ids(messages)
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = redact_sensitive_value(
-                msg.get("content") or "",
-                self._config,
-                parse_json_strings=False,
-            )
-            if role == "tool":
-                tool_id = str(msg.get("tool_call_id") or "").strip()
-                externalized = maybe_externalize_tool_output(
-                    content,
-                    tool_call_id=tool_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized:
-                    content = externalized["placeholder"]
-                else:
-                    content = sanitize_pre_compaction_content(content)
-                    if len(content) > 3000:
-                        content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
-                continue
-
-            content = sanitize_pre_compaction_content(content)
-
-            if role == "assistant":
-                tool_calls = msg.get("tool_calls", [])
-                matched_tool_calls = [
-                    tc for tc in tool_calls
-                    if not _tool_call_id(tc) or _tool_call_id(tc) in matched_tool_ids
-                ]
-                if _is_synthetic_assistant_noise(content):
-                    if not matched_tool_calls:
-                        continue
-                    content = ""
-                if len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                if matched_tool_calls:
-                    tc_parts = []
-                    for tc in matched_tool_calls:
-                        if isinstance(tc, dict):
-                            fn = tc.get("function", {})
-                            name = fn.get("name", "?")
-                            args = fn.get("arguments", "")
-                            args = redact_sensitive_value(
-                                args,
-                                self._config,
-                                parse_json_strings=True,
-                            )
-                            args = sanitize_pre_compaction_tool_arguments(args)
-                            if len(args) > 500:
-                                args = args[:400] + "..."
-                            tc_parts.append(f"  {name}({args})")
-                    content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
-                parts.append(f"[ASSISTANT]: {content}")
-                continue
-
-            if len(content) > 3000:
-                content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-            parts.append(f"[{role.upper()}]: {content}")
-
-        return "\n\n".join(parts)
+        return serialize_summary_messages(
+            messages,
+            config=self._config,
+            session_id=self._session_id,
+            hermes_home=self._hermes_home,
+        )
 
     # -- Internal: tool-pair sanitization ------------------------------------
 
@@ -5672,14 +6511,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _summary_frontier_nodes(self) -> List[SummaryNode]:
         """Return all provider-visible summary frontier nodes for the active session."""
-        all_nodes = self._dag.get_session_nodes(self._session_id, limit=100_000)
-        referenced = {
-            source_id
-            for node in all_nodes
-            if node.source_type == "nodes"
-            for source_id in node.source_ids
-        }
-        return [node for node in all_nodes if node.node_id not in referenced]
+        return self._dag.get_active_frontier_nodes(self._session_id)
 
     def _summary_frontier_tokens(self) -> int:
         return sum(node.token_count for node in self._summary_frontier_nodes())
@@ -6086,26 +6918,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Node ids placed in the summary prefix — used to dedupe proactive-recall
         # injection against summaries already visible in the active context.
         active_summary_node_ids: set = set()
-        all_nodes = self._dag.get_session_nodes(self._session_id)
-        if all_nodes:
-            # Group by depth, take the most recent uncondensed at each level
-            # For active context, we want the highest-level summaries
-            # that haven't been condensed into even higher levels
-            depths = sorted(set(n.depth for n in all_nodes), reverse=True)
-            for d in depths:
-                uncondensed = self._dag.get_uncondensed_at_depth(self._session_id, d)
-                for node in uncondensed:
-                    active_summary_node_ids.add(node.node_id)
-                    depth_label = {
-                        0: "Recent",
-                        1: "Session Arc",
-                        2: "Durable",
-                    }.get(d, f"Depth-{d}")
-                    summary_parts.append(
-                        f"[{depth_label} Summary (d{d}, node {node.node_id})]\n"
-                        f"{node.summary}\n"
-                        f"[Expand for details: {node.expand_hint}]"
-                    )
+        frontier_nodes = self._summary_frontier_nodes()
+        for node in frontier_nodes:
+            active_summary_node_ids.add(node.node_id)
+            depth_label = {
+                0: "Recent",
+                1: "Session Arc",
+                2: "Durable",
+            }.get(node.depth, f"Depth-{node.depth}")
+            summary_parts.append(
+                f"[{depth_label} Summary (d{node.depth}, node {node.node_id})]\n"
+                f"{node.summary}\n"
+                f"[Expand for details: {node.expand_hint}]"
+            )
 
         if summary_parts:
             selected_parts = summary_parts
@@ -6651,12 +7476,4 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+        self._close_storage()

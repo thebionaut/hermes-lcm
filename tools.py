@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -555,6 +557,7 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
         "runtime_identity",
         "lineage",
         "messages",
+        "background_compaction",
         "compaction",
         "dag",
         "externalized_refs",
@@ -595,6 +598,385 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
         compact["truncation"]["omitted_top_level_sections"] = omitted
         encoded = json.dumps(compact, ensure_ascii=False)
     return encoded
+
+
+_BACKGROUND_DIAGNOSTIC_REASONS = frozenset({
+    "background_summary_prepared",
+    "prepared_summary_published",
+    "prepared_summary_superseded",
+    "foreground_emergency_compaction",
+    "provider_timeout",
+    "lease_expiration",
+    "sqlite_lock_contention",
+    "worker_unavailable",
+    "no_eligible_raw_range",
+    "session_reset_fence",
+    "canonical_prefix_adopted",
+    "partial_atomic_repair_pending",
+    "partial_atomic_repair_published",
+})
+
+_BACKGROUND_COMPATIBILITY_BLOCKERS = frozenset({
+    "file_extraction_requires_foreground_compaction",
+    "assertion_extraction_requires_foreground_compaction",
+})
+
+
+def _opaque_operator_hint(value: object) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _sanitize_background_error(value: object) -> tuple[str, bool]:
+    """Bound and redact common credential shapes in worker/provider errors."""
+    text, truncated = _bounded_operator_field(value)
+    text = re.sub(
+        r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+",
+        r"\1 [redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password|authorization)\b"
+        r"\s*[:=]\s*[^\s,;]+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:sk-ant-|sk-|gh[pousr]_|xox[baprs]-)[a-z0-9._=-]{8,}",
+        "[redacted credential]",
+        text,
+    )
+    private_key_at = text.lower().find("-----begin ")
+    if private_key_at >= 0 and "private key-----" in text[private_key_at:].lower():
+        text = text[:private_key_at] + "[redacted private key]"
+        truncated = True
+    return text, truncated
+
+
+def _sanitize_persisted_background_error(value: object) -> tuple[str, bool]:
+    """Expose only the allowlisted durable error format from current builds."""
+    text = str(value or "").strip()
+    if not text:
+        return "", False
+    if re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,64}:"
+        r"(?:timeout|connection_error|sqlite_busy|provider_error)"
+        r"(?::http_[1-9][0-9]{2})?",
+        text,
+    ):
+        return text, False
+    return "background_error:redacted", True
+
+
+def _background_result_payload(value: Any) -> Any:
+    if not isinstance(value, dict):
+        bounded, _truncated = _sanitize_background_error(value)
+        return bounded or None
+    result = {
+        key: value.get(key)
+        for key in (
+            "status",
+            "reason",
+            "at",
+            "duration_ms",
+            "expected_frontier_store_id",
+            "captured_watermark_store_id",
+            "frontier_store_id",
+            "debt_tokens",
+        )
+        if key in value
+    }
+    if value.get("job_id"):
+        result["job_hint"] = _opaque_operator_hint(value.get("job_id"))
+    for key in ("status", "reason"):
+        if key in result:
+            result[key], _truncated = _sanitize_background_error(result[key])
+    bounded, truncated = _bound_operator_strings(result)
+    if truncated:
+        bounded["truncated"] = True
+    return bounded
+
+
+def _background_compaction_status_payload(engine: "LCMEngine") -> dict[str, Any]:
+    """Return bounded background status without raw job or lease identifiers."""
+    configured_enabled = bool(
+        getattr(engine._config, "background_compaction_enabled", False)
+    )
+    configured_workers = max(
+        0, int(getattr(engine._config, "background_compaction_workers", 1) or 0)
+    )
+    configured_global_limit = max(
+        0,
+        int(
+            getattr(engine._config, "background_compaction_global_limit", 2)
+            or 0
+        ),
+    )
+    configured_backlog = max(
+        0,
+        int(
+            getattr(engine._config, "background_compaction_backlog_tokens", 32_000)
+            or 0
+        ),
+    )
+    try:
+        configured_prepare_ratio = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    getattr(engine._config, "background_compaction_prepare_ratio", 0.55)
+                    or 0.0
+                ),
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        configured_prepare_ratio = 0.55
+    try:
+        raw = engine.get_background_compaction_status() or {}
+        if not isinstance(raw, dict):
+            raise TypeError("background status is not a mapping")
+    except Exception as exc:  # pragma: no cover - defensive diagnostics path
+        error = (
+            re.sub(r"[^A-Za-z0-9_.-]", "", type(exc).__name__)[:64]
+            or "BackgroundStatusError"
+        ) + ":status_unavailable"
+        truncated = False
+        return {
+            "configured_enabled": configured_enabled,
+            "enabled": False,
+            "compatibility_blocked_reason": None,
+            "worker_count": configured_workers,
+            "global_limit": configured_global_limit,
+            "worker_available": False,
+            "queued_jobs": 0,
+            "running_jobs": 0,
+            "prepared_jobs": 0,
+            "retry_jobs": 0,
+            "published_jobs": 0,
+            "superseded_jobs": 0,
+            "failed_jobs": 0,
+            "active_provider_permits": 0,
+            "active_non_timed_out_provider_permits": 0,
+            "timed_out_provider_permits": 0,
+            "provider_permit_oldest_age_seconds": None,
+            "provider_permit_min_lease_remaining_seconds": None,
+            "oldest_queued_job_age_seconds": None,
+            "current_job": None,
+            "publication_fence": None,
+            "current_debt_tokens": 0,
+            "last_preparation_result": None,
+            "last_publication_result": None,
+            "durable_event_counts": {},
+            "durable_event_reasons": [],
+            "backlog_trigger_tokens": configured_backlog,
+            "prepare_ratio": configured_prepare_ratio,
+            "publication_trigger_tokens": 0,
+            "emergency_trigger_tokens": 0,
+            "durable_frontier_store_id": 0,
+            "active_coverage": "raw",
+            "diagnostic_reasons": (
+                ["worker_unavailable"] if configured_enabled else []
+            ),
+            "status_error": error,
+            **({"truncated": True} if truncated else {}),
+        }
+
+    def _integer(mapping: dict[str, Any], key: str, fallback: str = "") -> int:
+        value = mapping.get(key)
+        if value is None and fallback:
+            value = mapping.get(fallback)
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _number(mapping: dict[str, Any], key: str) -> float | int | None:
+        value = mapping.get(key)
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        return int(parsed) if parsed.is_integer() else round(parsed, 3)
+
+    current_job_raw = raw.get("current_job")
+    current_job = None
+    if isinstance(current_job_raw, dict):
+        last_error, error_truncated = _sanitize_persisted_background_error(
+            current_job_raw.get("last_error") or ""
+        )
+        current_job = {
+            "job_hint": _opaque_operator_hint(current_job_raw.get("job_id")),
+            "state": str(current_job_raw.get("state") or "")[:64],
+            "expected_frontier_store_id": _integer(
+                current_job_raw, "expected_frontier_store_id"
+            ),
+            "captured_watermark_store_id": _integer(
+                current_job_raw, "captured_watermark_store_id"
+            ),
+            "debt_tokens": _integer(
+                current_job_raw, "debt_tokens", "current_debt_tokens"
+            ),
+            "attempt_count": _integer(current_job_raw, "attempt_count"),
+            "lease_owner_hint": _opaque_operator_hint(
+                current_job_raw.get("lease_owner_hint")
+                or current_job_raw.get("lease_owner")
+            ),
+            "lease_remaining_seconds": _number(
+                current_job_raw, "lease_remaining_seconds"
+            ),
+            "next_retry_at": _number(current_job_raw, "next_retry_at"),
+            "last_error": last_error,
+        }
+        if error_truncated:
+            current_job["last_error_truncated"] = True
+
+    publication_fence_raw = raw.get("publication_fence")
+    publication_fence = None
+    if isinstance(publication_fence_raw, dict):
+        publication_fence = {
+            "generation": _integer(publication_fence_raw, "generation"),
+            "publishable": bool(publication_fence_raw.get("publishable")),
+            "updated_at": _number(publication_fence_raw, "updated_at"),
+        }
+
+    durable_counts_raw = raw.get("durable_event_counts")
+    if not isinstance(durable_counts_raw, dict):
+        durable_counts_raw = {}
+    durable_event_counts = {
+        reason: _integer(durable_counts_raw, reason)
+        for reason in sorted(_BACKGROUND_DIAGNOSTIC_REASONS)
+        if reason in durable_counts_raw
+    }
+    durable_event_reasons = sorted({
+        str(reason)
+        for reason in (raw.get("durable_event_reasons") or [])
+        if str(reason) in _BACKGROUND_DIAGNOSTIC_REASONS
+    })
+
+    reasons = {
+        str(reason)
+        for reason in (raw.get("diagnostic_reasons") or [])
+        if str(reason) in _BACKGROUND_DIAGNOSTIC_REASONS
+    }
+    reasons.update(durable_event_reasons)
+    reason_counts = {
+        "foreground_emergency_count": "foreground_emergency_compaction",
+        "provider_timeout_count": "provider_timeout",
+        "lease_expiration_count": "lease_expiration",
+        "sqlite_lock_contention_count": "sqlite_lock_contention",
+        "worker_unavailable_count": "worker_unavailable",
+        "no_eligible_raw_range_count": "no_eligible_raw_range",
+    }
+    for count_key, reason in reason_counts.items():
+        if _integer(raw, count_key):
+            reasons.add(reason)
+    if bool(raw.get("enabled")) and raw.get("worker_available") is False:
+        reasons.add("worker_unavailable")
+
+    result_reason_map = {
+        "timeout": "provider_timeout",
+        "sqlite_locked": "sqlite_lock_contention",
+        "lock_contention": "sqlite_lock_contention",
+        "worker_unavailable": "worker_unavailable",
+        "no_eligible_raw_range": "no_eligible_raw_range",
+        "foreground_emergency": "foreground_emergency_compaction",
+        "superseded": "prepared_summary_superseded",
+        "published": "prepared_summary_published",
+        "prepared": "background_summary_prepared",
+        "lease_expired": "lease_expiration",
+        "lease_lost": "lease_expiration",
+    }
+    for result_key in ("last_preparation_result", "last_publication_result"):
+        result = raw.get(result_key)
+        if isinstance(result, dict):
+            result_text = " ".join(
+                str(result.get(key) or "") for key in ("status", "reason")
+            ).lower()
+        else:
+            result_text = str(result or "").lower()
+        for needle, reason in result_reason_map.items():
+            if needle in result_text:
+                reasons.add(reason)
+
+    compatibility_blocker = str(
+        raw.get("compatibility_blocked_reason") or ""
+    )
+    if compatibility_blocker not in _BACKGROUND_COMPATIBILITY_BLOCKERS:
+        compatibility_blocker = ""
+    prepare_ratio = _number(raw, "prepare_ratio")
+    payload = {
+        "configured_enabled": bool(
+            raw.get("configured_enabled", configured_enabled)
+        ),
+        "enabled": bool(raw.get("enabled")),
+        "compatibility_blocked_reason": compatibility_blocker or None,
+        "worker_count": _integer(raw, "worker_count"),
+        "global_limit": _integer(raw, "global_limit"),
+        "worker_available": raw.get("worker_available"),
+        "queued_jobs": _integer(raw, "queued_jobs"),
+        "running_jobs": _integer(raw, "running_jobs"),
+        "prepared_jobs": _integer(raw, "prepared_jobs"),
+        "retry_jobs": _integer(raw, "retry_jobs"),
+        "published_jobs": _integer(raw, "published_jobs"),
+        "superseded_jobs": _integer(raw, "superseded_jobs"),
+        "failed_jobs": _integer(raw, "failed_jobs"),
+        "active_provider_permits": _integer(raw, "active_provider_permits"),
+        "active_non_timed_out_provider_permits": _integer(
+            raw, "active_non_timed_out_provider_permits"
+        ),
+        "timed_out_provider_permits": _integer(
+            raw, "timed_out_provider_permits"
+        ),
+        "provider_permit_oldest_age_seconds": _number(
+            raw, "provider_permit_oldest_age_seconds"
+        ),
+        "provider_permit_min_lease_remaining_seconds": _number(
+            raw, "provider_permit_min_lease_remaining_seconds"
+        ),
+        "oldest_queued_job_age_seconds": _number(
+            raw, "oldest_queued_job_age_seconds"
+        ),
+        "current_job": current_job,
+        "publication_fence": publication_fence,
+        "current_debt_tokens": _integer(raw, "current_debt_tokens"),
+        "last_preparation_result": _background_result_payload(
+            raw.get("last_preparation_result")
+        ),
+        "last_publication_result": _background_result_payload(
+            raw.get("last_publication_result")
+        ),
+        "durable_event_counts": durable_event_counts,
+        "durable_event_reasons": durable_event_reasons,
+        "backlog_trigger_tokens": _integer(raw, "backlog_trigger_tokens")
+        if "backlog_trigger_tokens" in raw
+        else configured_backlog,
+        "prepare_ratio": (
+            max(0.0, min(1.0, float(prepare_ratio)))
+            if prepare_ratio is not None
+            else configured_prepare_ratio
+        ),
+        "publication_trigger_tokens": _integer(raw, "publication_trigger_tokens"),
+        "emergency_trigger_tokens": _integer(raw, "emergency_trigger_tokens"),
+        "durable_frontier_store_id": _integer(
+            raw, "durable_frontier_store_id"
+        ),
+        "active_coverage": str(raw.get("active_coverage") or "raw")[:64],
+        "diagnostic_reasons": sorted(reasons),
+    }
+    for count_key in reason_counts:
+        if count_key in raw:
+            payload[count_key] = _integer(raw, count_key)
+    bounded, truncated = _bound_operator_strings(payload)
+    if truncated:
+        bounded["truncated"] = True
+    return bounded
 
 
 def _compute_stage(
@@ -6241,6 +6623,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
 
     session_id = engine.current_session_id
     conversation_id = engine.current_conversation_id
+    background_compaction = _background_compaction_status_payload(engine)
     if not session_id:
         full_status = engine.get_status()
         return _bounded_inspect_json({
@@ -6249,6 +6632,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "runtime_identity": full_status.get("runtime_identity") or engine.get_runtime_identity(),
             "ingest_protection": full_status.get("ingest_protection"),
             "temporal_rollups": _temporal_rollups_status(engine),
+            "background_compaction": background_compaction,
         })
 
     full_status = engine.get_status()
@@ -6366,6 +6750,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
                 "lifecycle_last_finalized_frontier_store_id": lifecycle_finalized_frontier,
             },
         },
+        "background_compaction": background_compaction,
         "dag": {
             "total_nodes": total_dag_nodes,
             "total_tokens": total_dag_tokens,
@@ -6406,10 +6791,12 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     # been bound, so cron-only or stateless-only deployments still report
     # something usable.
     session_id = engine.current_session_id
+    background_compaction = _background_compaction_status_payload(engine)
     if not session_id:
         return json.dumps({
             "error": "No active session",
             "runtime_identity": engine.get_runtime_identity(),
+            "background_compaction": background_compaction,
         })
 
     # Store stats
@@ -6478,6 +6865,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
                 f"d{depth}": info for depth, info in sorted(depths.items())
             },
         },
+        "background_compaction": background_compaction,
         "config": {
             "fresh_tail_count": engine._config.fresh_tail_count,
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
@@ -6504,6 +6892,15 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "summary_spend_max_calls": engine._config.summary_spend_max_calls,
             "summary_spend_window_seconds": engine._config.summary_spend_window_seconds,
             "summary_spend_backoff_seconds": engine._config.summary_spend_backoff_seconds,
+            "background_compaction_enabled": getattr(
+                engine._config, "background_compaction_enabled", False
+            ),
+            "background_compaction_workers": getattr(
+                engine._config, "background_compaction_workers", 1
+            ),
+            "background_compaction_global_limit": getattr(
+                engine._config, "background_compaction_global_limit", 2
+            ),
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "proactive_recall": {
@@ -6552,6 +6949,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "LCM engine not initialized"})
 
     checks: list[dict] = []
+    background_compaction = _background_compaction_status_payload(engine)
     # Diagnose the foreground session, not whatever side-channel session
     # currently owns engine._session_id. Falls back to the bound id when no
     # foreground has ever been bound.
@@ -6876,6 +7274,35 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "status": "pass" if engine.last_prompt_tokens < trigger_tokens else "warn",
             "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
         })
+
+    # 8. Durable background-compaction worker and queue health. Prepared,
+    # published, and superseded outcomes are observable states rather than
+    # failures; retry/worker/lease/provider/SQLite problems warrant review.
+    background_fault_reasons = {
+        "provider_timeout",
+        "lease_expiration",
+        "sqlite_lock_contention",
+        "worker_unavailable",
+    }
+    observed_background_reasons = set(
+        background_compaction.get("diagnostic_reasons") or []
+    )
+    if not background_compaction.get("enabled"):
+        background_check_status = "pass"
+    elif (
+        background_compaction.get("status_error")
+        or int(background_compaction.get("failed_jobs", 0) or 0) > 0
+        or int(background_compaction.get("retry_jobs", 0) or 0) > 0
+        or bool(observed_background_reasons & background_fault_reasons)
+    ):
+        background_check_status = "warn"
+    else:
+        background_check_status = "pass"
+    checks.append({
+        "check": "background_compaction",
+        "status": background_check_status,
+        "detail": background_compaction,
+    })
 
     overall = "healthy"
     if any(ch["status"] == "fail" for ch in checks):

@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
+from .background_compaction import ForegroundProviderPermitUnavailable
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
@@ -42,6 +44,50 @@ class CompactionMixin:
         if callable(maybe_reclassify):
             maybe_reclassify()
 
+    def _background_publication_trigger_tokens(self) -> int:
+        """Fixed-reserve publication boundary for the effective context window."""
+        reserve = max(0, int(self._config.context_reserve_tokens or 0))
+        if reserve > 0 and self.context_length > 0:
+            return max(1, int(self.context_length) - reserve)
+        return max(0, int(self.threshold_tokens or 0))
+
+    def _background_emergency_trigger_tokens(self) -> int:
+        """Bounded synchronous fallback boundary, independent of preparation."""
+        context_length = max(0, int(self.context_length or 0))
+        if context_length <= 0:
+            return 0
+        backlog_floor = max(32_000, int(context_length * 0.05))
+        return max(1, context_length - backlog_floor)
+
+    def _background_preflight_requested(self, observed_tokens: int) -> bool:
+        """Whether foreground work is justified by publish or emergency pressure."""
+        try:
+            if self._has_newer_committed_background_frontier():
+                return True
+        except Exception:
+            logger.warning(
+                "LCM could not inspect the durable background frontier",
+                exc_info=True,
+            )
+        emergency_trigger = self._background_emergency_trigger_tokens()
+        if emergency_trigger > 0 and observed_tokens >= emergency_trigger:
+            return True
+        publication_trigger = self._background_publication_trigger_tokens()
+        publishable = False
+        if publication_trigger > 0 and observed_tokens >= publication_trigger:
+            try:
+                publishable = self._has_publishable_background_job()
+            except Exception:
+                logger.warning(
+                    "LCM could not inspect prepared background work",
+                    exc_info=True,
+                )
+        return bool(
+            publication_trigger > 0
+            and observed_tokens >= publication_trigger
+            and publishable
+        )
+
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._bypasses_lcm_context_management():
             if self._compression_boundary_cooldown_active():
@@ -59,9 +105,13 @@ class CompactionMixin:
             if self.threshold_tokens <= 0:
                 return False
             return tokens >= self.threshold_tokens
+        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if self._background_compaction_enabled():
+            if self._should_force_overflow_recovery(observed_tokens=tokens):
+                return True
+            return self._background_preflight_requested(max(0, int(tokens or 0)))
         if self._compression_boundary_cooldown_active():
             return False
-        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self._should_force_overflow_recovery(observed_tokens=tokens):
             return True
         if self.threshold_tokens <= 0:
@@ -81,6 +131,12 @@ class CompactionMixin:
                 return True
             return self.threshold_tokens > 0 and rough >= self.threshold_tokens
         rough = count_messages_tokens(messages)
+        background_mode = self._background_compaction_enabled()
+        background_pressure = (
+            max(rough, int(self.last_prompt_tokens or 0))
+            if background_mode
+            else rough
+        )
         pre_ingest_placeholder_ambiguous_noop = False
         pre_ingest_noop_reason = ""
         if (
@@ -114,9 +170,46 @@ class CompactionMixin:
                 # job is to keep the prompt under the provider limit; it converges
                 # via deterministic L3 truncation without needing the store write.
                 self._record_ingest_failure("preflight", e)
-                if self._should_force_overflow_recovery(observed_tokens=rough):
+                if background_mode and self._background_preflight_requested(
+                    background_pressure
+                ):
+                    return self._mark_preflight_compression_requested()
+                if self._should_force_overflow_recovery(
+                    observed_tokens=background_pressure if background_mode else rough
+                ):
                     return True
                 return False
+        if background_mode:
+            replay_view = replay_messages if replay_messages is not None else messages
+            try:
+                self._maybe_enqueue_background_compaction(
+                    replay_view,
+                    background_pressure,
+                )
+            except Exception:
+                # Preparation is opportunistic.  Durable ingest has already
+                # succeeded, so queue contention must not block this turn.
+                logger.warning(
+                    "LCM could not enqueue background compaction",
+                    exc_info=True,
+                )
+            if (
+                self._should_force_overflow_recovery(
+                    observed_tokens=background_pressure,
+                    messages=replay_view,
+                )
+                or self._background_preflight_requested(background_pressure)
+            ):
+                return self._mark_preflight_compression_requested()
+            if replay_messages is not None and replay_messages != messages:
+                # Preserve the existing safety path for redaction,
+                # externalization, and tool-result cleanup.  This is not a
+                # summary-model compaction request.
+                if self._replay_diff_requests_ingest_cleanup(messages, replay_messages):
+                    return self._mark_preflight_compression_requested()
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = "background preparation queued"
+            return False
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
             cleanup_requested = self._replay_diff_requests_ingest_cleanup(
@@ -365,6 +458,14 @@ class CompactionMixin:
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""
             raise
+        finally:
+            release_permit = getattr(
+                self,
+                "_release_foreground_emergency_provider_permit",
+                None,
+            )
+            if callable(release_permit):
+                release_permit()
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
                        current_tokens: int = None,
@@ -406,10 +507,44 @@ class CompactionMixin:
             )
 
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
-        force_overflow = self._should_force_overflow_recovery(
+        background_feature_enabled = self._background_compaction_enabled()
+        background_mode = background_feature_enabled and not force
+        background_message_tokens = count_messages_tokens(messages)
+        background_observed_tokens = max(
+            background_message_tokens,
+            int(
+                observed_prompt_tokens
+                if observed_prompt_tokens is not None
+                else self.last_prompt_tokens or 0
+            ),
+        )
+        background_prompt_overhead = max(
+            0,
+            background_observed_tokens - background_message_tokens,
+        )
+        if background_mode:
+            observed_prompt_tokens = background_observed_tokens
+        background_foreground_deadline = (
+            time.monotonic() + _AUTOMATIC_FOREGROUND_MAX_SECONDS
+            if background_mode
+            else None
+        )
+        host_force_overflow = self._should_force_overflow_recovery(
             observed_tokens=observed_prompt_tokens,
             messages=messages,
         )
+        emergency_trigger = self._background_emergency_trigger_tokens()
+        background_emergency = bool(
+            background_mode
+            and (
+                host_force_overflow
+                or (
+                    emergency_trigger > 0
+                    and background_observed_tokens >= emergency_trigger
+                )
+            )
+        )
+        force_overflow = host_force_overflow or background_emergency
         # NOTE: deliberately do NOT clear the spend guard on force_overflow.
         # force_overflow is automatic (set every turn the prompt exceeds the
         # assembly cap), which is exactly the sustained-over-cap state a runaway
@@ -430,6 +565,60 @@ class CompactionMixin:
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        if background_mode:
+            try:
+                adopted_messages = self._adopt_committed_background_frontier(
+                    working_messages
+                )
+                if adopted_messages is None:
+                    # A pre-background canonical node can legitimately exist
+                    # above a lagging lifecycle frontier after an old-process
+                    # crash.  Reconcile at most one bounded prefix per
+                    # foreground boundary, then reuse the normal durable
+                    # frontier-adoption path to rebuild the active context.
+                    self._maybe_adopt_existing_canonical_prefix()
+                    adopted_messages = self._adopt_committed_background_frontier(
+                        working_messages
+                    )
+            except Exception:
+                logger.warning(
+                    "LCM could not adopt a committed background frontier",
+                    exc_info=True,
+                )
+                adopted_messages = None
+            if adopted_messages is not None:
+                working_messages = adopted_messages
+                ingest_cleanup_changed_active_context = True
+                # A sibling publication can remove most of the raw prefix that
+                # made this turn look critical.  Preserve only the prompt
+                # overhead that publication cannot change, then recalculate the
+                # emergency gate from the newly active context before spending
+                # on the synchronous fallback.
+                background_observed_tokens = (
+                    count_messages_tokens(working_messages)
+                    + background_prompt_overhead
+                )
+                observed_prompt_tokens = background_observed_tokens
+                host_force_overflow = self._should_force_overflow_recovery(
+                    observed_tokens=background_observed_tokens,
+                    messages=working_messages,
+                )
+                background_emergency = bool(
+                    host_force_overflow
+                    or (
+                        emergency_trigger > 0
+                        and background_observed_tokens >= emergency_trigger
+                    )
+                )
+                force_overflow = host_force_overflow or background_emergency
+                recovery_assembly_cap = (
+                    self._overflow_recovery_assembly_cap(
+                        observed_tokens=background_observed_tokens,
+                        messages=working_messages,
+                    )
+                    if force_overflow
+                    else None
+                )
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown
             and not force_overflow
@@ -458,6 +647,181 @@ class CompactionMixin:
                 )
             )
             return sanitized_messages
+        if background_mode:
+            try:
+                self._maybe_enqueue_background_compaction(
+                    working_messages,
+                    background_observed_tokens,
+                    allow_canonical_prefix_adoption=False,
+                )
+            except Exception:
+                logger.warning(
+                    "LCM could not enqueue background compaction during compress",
+                    exc_info=True,
+                )
+
+            publication_trigger = self._background_publication_trigger_tokens()
+            publication = None
+            publishable = False
+            if publication_trigger > 0 and background_observed_tokens >= publication_trigger:
+                try:
+                    publishable = self._has_publishable_background_job()
+                except Exception:
+                    logger.warning(
+                        "LCM could not inspect prepared background work during compress",
+                        exc_info=True,
+                    )
+            if (
+                publication_trigger > 0
+                and background_observed_tokens >= publication_trigger
+                and publishable
+            ):
+                try:
+                    publication = self._publish_prepared_background_compaction(
+                        working_messages,
+                        current_tokens=background_observed_tokens,
+                    )
+                except Exception:
+                    # A failed compare-and-swap or short SQLite contention must
+                    # never turn ordinary publication pressure into a slow
+                    # synchronous model request.  Emergency pressure below is
+                    # the only automatic route into the legacy pipeline.
+                    logger.warning(
+                        "LCM prepared background publication failed",
+                        exc_info=True,
+                    )
+
+            published_messages = None
+            if isinstance(publication, list):
+                published_messages = publication
+            elif isinstance(publication, Mapping):
+                if publication.get("promoted"):
+                    published_messages = publication.get("messages")
+            elif publication is not None and getattr(publication, "promoted", False):
+                published_messages = getattr(publication, "messages", None)
+            if published_messages is not None:
+                published_messages = self._sanitize_active_context_messages(
+                    list(published_messages)
+                )
+                self._ingest_cursor = len(published_messages)
+                self._ingest_cursor_needs_reconcile = False
+                self._last_compression_status = "compacted"
+                self._last_compression_noop_reason = ""
+                self._write_generated_ignored_placeholder_hash_counts(
+                    self._generated_placeholder_digest_budget_for_active_replay(
+                        published_messages
+                    )
+                )
+                self._write_generated_ignored_placeholder_hash_ordinals(
+                    self._generated_placeholder_digest_ordinals_for_active_replay(
+                        published_messages
+                    )
+                )
+                published_tokens = count_messages_tokens(published_messages)
+                published_pressure_tokens = (
+                    published_tokens + background_prompt_overhead
+                )
+                if (
+                    not background_emergency
+                    or emergency_trigger <= 0
+                    or published_pressure_tokens < emergency_trigger
+                ):
+                    return published_messages
+                # A small prepared batch won the CAS but did not clear emergency
+                # pressure. Continue into the one-pass shared-deadline fallback.
+                working_messages = published_messages
+                try:
+                    self._maybe_enqueue_background_compaction(
+                        working_messages,
+                        published_pressure_tokens,
+                        allow_canonical_prefix_adoption=False,
+                    )
+                except Exception:
+                    logger.warning(
+                        "LCM could not enqueue follow-on background compaction "
+                        "after publication",
+                        exc_info=True,
+                    )
+
+            if background_emergency:
+                partial_repair_pending = False
+                try:
+                    lifecycle = self._lifecycle.get_by_conversation(
+                        self._conversation_id
+                    )
+                    if (
+                        lifecycle is not None
+                        and lifecycle.current_session_id == self._session_id
+                    ):
+                        partial_repair_pending = (
+                            self._background_compaction.has_active_partial_atomic_repair(
+                                conversation_id=self._conversation_id,
+                                session_id=self._session_id,
+                                expected_frontier_store_id=int(
+                                    lifecycle.current_frontier_store_id or 0
+                                ),
+                            )
+                        )
+                except Exception:
+                    logger.warning(
+                        "LCM could not inspect pending partial atomic repair",
+                        exc_info=True,
+                    )
+                if partial_repair_pending:
+                    leading_anchor_count = self._leading_anchor_count(
+                        working_messages
+                    )
+                    compressed = self._assemble_overflow_recovery_context(
+                        (
+                            working_messages[0]
+                            if leading_anchor_count
+                            else None
+                        ),
+                        working_messages[leading_anchor_count:],
+                        assembly_cap_override=recovery_assembly_cap,
+                    )
+                    result = self._finalize_forced_overflow_result(
+                        working_messages,
+                        compressed,
+                        assembly_cap_override=recovery_assembly_cap,
+                        ingest_cleanup_changed_active_context=(
+                            ingest_cleanup_changed_active_context
+                        ),
+                    )
+                    self._last_compression_noop_reason = (
+                        "partial atomic repair pending"
+                    )
+                    return result
+
+            if not background_emergency:
+                sanitized_messages = self._sanitize_active_context_messages(
+                    working_messages,
+                    insert_missing_tool_stubs=False,
+                )
+                self._refresh_raw_backlog_debt(
+                    sanitized_messages,
+                    observed_tokens=background_observed_tokens,
+                )
+                if sanitized_messages != working_messages or ingest_cleanup_changed_active_context:
+                    self._ingest_cursor = len(sanitized_messages)
+                    self._last_compression_status = "sanitized"
+                    self._last_compression_noop_reason = ""
+                else:
+                    self._last_compression_status = "noop"
+                    self._last_compression_noop_reason = (
+                        "prepared background summary unavailable below emergency trigger"
+                    )
+                self._write_generated_ignored_placeholder_hash_counts(
+                    self._generated_placeholder_digest_budget_for_active_replay(
+                        sanitized_messages
+                    )
+                )
+                self._write_generated_ignored_placeholder_hash_ordinals(
+                    self._generated_placeholder_digest_ordinals_for_active_replay(
+                        sanitized_messages
+                    )
+                )
+                return sanitized_messages
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
@@ -485,7 +849,11 @@ class CompactionMixin:
             if automatic_foreground
             else _MANUAL_FULL_SWEEP_MAX_SECONDS
         )
-        sweep_deadline = time.monotonic() + sweep_seconds_budget
+        sweep_deadline = (
+            background_foreground_deadline
+            if background_foreground_deadline is not None
+            else time.monotonic() + sweep_seconds_budget
+        )
         configured_sweep_target = int(self._config.summary_prefix_target_tokens)
         sweep_target_tokens = max(
             1,
@@ -516,7 +884,8 @@ class CompactionMixin:
             messages=working_messages,
         )
         deferred_maintenance_active = (
-            not force_overflow
+            not background_mode
+            and not force_overflow
             and not threshold_full_sweep_active
             and self._should_run_deferred_maintenance(
                 working_messages,
@@ -531,6 +900,8 @@ class CompactionMixin:
             else 1
         )
         max_leaf_passes = base_max_leaf_passes
+        if background_emergency and automatic_foreground:
+            max_leaf_passes = _AUTOMATIC_FOREGROUND_MAX_PASSES
         if threshold_full_sweep_active:
             max_leaf_passes = sweep_pass_budget
         if deferred_maintenance_active:
@@ -719,6 +1090,46 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
+            foreground_source_snapshot = None
+            if background_feature_enabled:
+                prospective_store_ids = self._get_store_ids_for_messages(
+                    selected_raw_chunk
+                )
+                if not prospective_store_ids:
+                    noop_reason = "foreground durable source interval is unavailable"
+                    break
+                foreground_source_snapshot = (
+                    self._background_compaction.capture_foreground_source_snapshot(
+                        conversation_id=self._conversation_id,
+                        session_id=self._session_id,
+                        expected_frontier_store_id=self._last_compacted_store_id,
+                        captured_watermark_store_id=max(prospective_store_ids),
+                        expected_source_store_ids=prospective_store_ids,
+                    )
+                )
+                if foreground_source_snapshot is None:
+                    # A sibling ingest or mutation changed the durable interval
+                    # represented by the caller's active messages. Never ask a
+                    # provider to summarize one view and retire another.
+                    noop_reason = "foreground durable source interval changed"
+                    break
+                # Bind the caller view to the durable snapshot. If any source
+                # row changed between the first active-to-store mapping and
+                # the snapshot read, the same active messages no longer map to
+                # the same IDs and provider I/O must not begin.
+                if self._get_store_ids_for_messages(
+                    selected_raw_chunk
+                ) != prospective_store_ids:
+                    noop_reason = "foreground active source snapshot changed"
+                    break
+            foreground_session_fence_generation: int | None = None
+            if background_feature_enabled:
+                foreground_session_fence_generation = (
+                    self._reconcile_background_publication_fence()
+                )
+                if foreground_session_fence_generation is None:
+                    noop_reason = "background publication session is reset or rebound"
+                    break
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]
@@ -755,6 +1166,11 @@ class CompactionMixin:
                         "focus_topic": focus_topic,
                         "deadline": sweep_deadline,
                     }
+                    if background_emergency:
+                        summary_kwargs["require_durable_provider_permit"] = True
+                        summary_kwargs["expected_session_fence_generation"] = (
+                            foreground_session_fence_generation
+                        )
                     (
                         compacted_chunk,
                         source_tokens,
@@ -765,6 +1181,12 @@ class CompactionMixin:
                         summary_input_chunk,
                         **summary_kwargs,
                     )
+                except ForegroundProviderPermitUnavailable:
+                    # Provider capacity is deliberately non-blocking in the
+                    # foreground.  The forced-overflow branch below converges
+                    # with the existing deterministic, no-provider fallback.
+                    noop_reason = "foreground emergency provider permit unavailable"
+                    break
                 except Exception as exc:
                     if threshold_full_sweep_active and leaf_compacted_this_turn:
                         sweep_stop_reason = "leaf_summary_error"
@@ -794,10 +1216,48 @@ class CompactionMixin:
             source_lineage_chunk = [
                 message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
             ]
-            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
-            source_store_ids = sorted(dict.fromkeys(source_store_ids))
+            summary_source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
+            summary_source_store_ids = sorted(dict.fromkeys(summary_source_store_ids))
             consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
             consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
+            if background_feature_enabled:
+                snapshot_ids = [
+                    int(message.get("store_id") or 0)
+                    for message in (foreground_source_snapshot or ())
+                ]
+                expected_consumed_ids = snapshot_ids[: len(source_lookup_chunk)]
+                if (
+                    len(consumed_store_ids) != len(source_lookup_chunk)
+                    or consumed_store_ids != expected_consumed_ids
+                ):
+                    # Never remove N caller messages after publishing lineage
+                    # for a shorter mapped prefix. A concurrent source change
+                    # is a bounded no-op; durable raw remains authoritative.
+                    noop_reason = "foreground consumed source mapping changed"
+                    break
+            # Foreground emergency publication advances the durable frontier
+            # across every mapped raw row in ``source_lookup_chunk``.  Its
+            # canonical DAG node must carry that exact lineage and matching
+            # time bounds even when provider policy filtered a dependent row.
+            # Retain the legacy subset in disabled mode because the synchronous
+            # tool-result GC below expects source IDs aligned to compacted input.
+            source_store_ids = (
+                consumed_store_ids
+                if background_feature_enabled
+                else summary_source_store_ids
+            )
+            foreground_source_identity_hash = ""
+            if background_feature_enabled:
+                foreground_source_identity_hash = str(
+                    self._background_compaction.foreground_source_identity_hash(
+                        foreground_source_snapshot or (),
+                        consumed_store_ids,
+                    )
+                    or ""
+                )
+                if not foreground_source_identity_hash:
+                    noop_reason = "foreground durable source identity is unavailable"
+                    break
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
 
@@ -814,11 +1274,61 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            self._dag.add_node(node)
-            self._invalidate_rollups_for_published_node(node)
-            self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-            self._persist_frontier_marker()
+            if background_feature_enabled:
+                expected_frontier = self._last_compacted_store_id
+                foreground_publication = self._publish_foreground_background_node(
+                    node,
+                    expected_session_fence_generation=int(
+                        foreground_session_fence_generation or 0
+                    ),
+                    expected_frontier_store_id=expected_frontier,
+                    consumed_store_ids=consumed_store_ids,
+                    expected_source_identity_hash=(
+                        foreground_source_identity_hash
+                    ),
+                )
+                if not foreground_publication.promoted:
+                    lifecycle = self._lifecycle.get_by_conversation(
+                        self._conversation_id
+                    )
+                    if (
+                        lifecycle is not None
+                        and lifecycle.current_session_id == self._session_id
+                        and lifecycle.current_frontier_store_id > expected_frontier
+                    ):
+                        # A prepared publisher won the serialized frontier CAS.
+                        # Rebuild from its committed frontier; never drop raw rows
+                        # beyond the range it actually published.
+                        committed_frontier = int(
+                            lifecycle.current_frontier_store_id
+                        )
+                        rebuilt_tail = self._project_durable_active_tail(
+                            committed_frontier,
+                            preserve_messages=working_messages,
+                        )
+                        rebuilt = working_messages[:leading_anchor_count] + rebuilt_tail
+                        working_messages = self._sanitize_active_context_messages(
+                            rebuilt
+                        )
+                        self._last_compacted_store_id = committed_frontier
+                        pressure_messages = list(working_messages)
+                        leaf_compacted_this_turn = True
+                        leaf_passes += 1
+                        sweep_stop_reason = "prepared_publication_won_race"
+                        break
+                    noop_reason = foreground_publication.reason
+                    break
+            else:
+                self._dag.add_node(node)
+                self._invalidate_rollups_for_published_node(node)
+                self._maybe_gc_compacted_tool_results(
+                    compacted_chunk,
+                    source_store_ids,
+                )
+                self._last_compacted_store_id = (
+                    max(consumed_store_ids) if consumed_store_ids else 0
+                )
+                self._persist_frontier_marker()
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
@@ -962,7 +1472,7 @@ class CompactionMixin:
                         focus_topic=focus_topic,
                     )
                 )
-        else:
+        elif not background_emergency:
             self._maybe_condense(
                 focus_topic=focus_topic,
                 leaf_compacted_this_turn=True,

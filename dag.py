@@ -31,6 +31,7 @@ from .db_bootstrap import (
 
 _DELETE_SESSION_SCOPE_TABLE = "temp_lcm_delete_session_scope"
 _DELETE_SESSION_SCOPE_INSERT_CHUNK = 512
+_NODE_EDGES_MIGRATION_STEP = "background_compaction_node_edges_v1"
 from .search_query import (
     AGE_DECAY_RATE,
     compute_search_candidate_cap,
@@ -546,6 +547,66 @@ class SummaryDAG:
                 (session_id, depth, session_id, depth, limit),
             ).fetchall()
         return [self._row_to_node(r) for r in rows]
+
+    def get_active_frontier_nodes(self, session_id: str) -> List[SummaryNode]:
+        """Return every active summary root for ``session_id`` exactly.
+
+        Once the normalized edge backfill is complete, reverse-edge lookup is
+        indexed.  Older databases remain correct through an uncapped JSON
+        fallback until that optional migration has finished.
+        """
+        with self._db_lock:
+            edges_complete = self._conn.execute(
+                """
+                SELECT 1 FROM lcm_migration_state
+                WHERE step_name=?
+                """,
+                (_NODE_EDGES_MIGRATION_STEP,),
+            ).fetchone() is not None
+            if edges_complete:
+                rows = self._conn.execute(
+                    """
+                    SELECT n.*
+                    FROM summary_nodes AS n
+                    WHERE n.session_id=?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM lcm_compaction_node_edges AS edge
+                          JOIN summary_nodes AS parent
+                            ON parent.node_id=edge.parent_node_id
+                          WHERE edge.session_id=?
+                            AND edge.child_node_id=n.node_id
+                            AND parent.session_id=n.session_id
+                            AND parent.depth>n.depth
+                            AND parent.source_type='nodes'
+                      )
+                    ORDER BY n.depth DESC, n.created_at, n.node_id
+                    """,
+                    (session_id, session_id),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT n.*
+                    FROM summary_nodes AS n
+                    WHERE n.session_id=?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM summary_nodes AS parent,
+                               json_each(
+                                   CASE WHEN json_valid(parent.source_ids)
+                                        THEN parent.source_ids ELSE '[]' END
+                               ) AS source
+                          WHERE parent.session_id=n.session_id
+                            AND parent.depth>n.depth
+                            AND parent.source_type='nodes'
+                            AND CAST(source.value AS INTEGER)=n.node_id
+                      )
+                    ORDER BY n.depth DESC, n.created_at, n.node_id
+                    """,
+                    (session_id,),
+                ).fetchall()
+        return [self._row_to_node(row) for row in rows]
 
     # -- Search -------------------------------------------------------------
 

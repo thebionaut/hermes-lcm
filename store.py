@@ -788,14 +788,25 @@ class MessageStore:
 
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
-                                   limit: int = 10000) -> List[Dict[str, Any]]:
+                                   limit: int = 10000,
+                                   conversation_id: str | None = None) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ? AND store_id > ?
-               ORDER BY store_id LIMIT ?""",
-            (session_id, after_store_id, limit),
-        ).fetchall()
+        if conversation_id is None:
+            rows = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE session_id = ? AND store_id > ?
+                   ORDER BY store_id LIMIT ?""",
+                (session_id, after_store_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE session_id = ? AND store_id > ?
+                     AND (conversation_id = ? OR conversation_id = ''
+                          OR conversation_id IS NULL)
+                   ORDER BY store_id LIMIT ?""",
+                (session_id, after_store_id, str(conversation_id), limit),
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:

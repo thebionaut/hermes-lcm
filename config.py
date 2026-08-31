@@ -911,7 +911,11 @@ class LCMConfig:
                 value = int(getattr(self, field_name))
             except (TypeError, ValueError):
                 value = default
-            setattr(self, field_name, max(1, value))
+            minimum = 0 if field_name == "background_compaction_workers" else 1
+            value = max(minimum, value)
+            if field_name == "background_compaction_workers":
+                value = min(1, value)
+            setattr(self, field_name, value)
 
         try:
             ratio = float(self.background_compaction_prepare_ratio)

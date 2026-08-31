@@ -99,7 +99,14 @@ def _run_policy(
     engine._assemble_context = count_publication
     started = time.perf_counter()
     try:
-        compressed = engine.compress(messages, current_tokens=tokens_before)
+        # The sweep arm intentionally exercises the explicit/manual full-sweep
+        # contract.  Automatic foreground maintenance is separately bounded to
+        # one pass so it cannot become turn-critical work.
+        compressed = engine.compress(
+            messages,
+            current_tokens=tokens_before,
+            force=full_sweep,
+        )
         duration_ms = (time.perf_counter() - started) * 1000.0
         tokens_after = count_messages_tokens(compressed)
         source_facts = _visible_facts(messages)

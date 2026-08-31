@@ -179,6 +179,24 @@ After a fresh Hermes restart, `/lcm status` may show `session_id: (unbound)` or
 `threshold_tokens: (uninitialized)`. Send one normal Hermes message first, then
 run `lcm_status` or `/lcm status` again for live per-session fields.
 
+### Compaction reports `partial atomic repair pending`
+
+This is a fail-closed recovery state for a legacy assistant/tool-result group
+whose raw rows have mixed canonical ownership. Foreground compaction does not
+wait for or duplicate the summary provider call. It returns a bounded
+provider-valid overflow view while the durable high-priority repair remains
+queued, running, retrying, or prepared.
+
+Check `lcm_status` for worker availability, the current job state, lease owner
+hint and remaining lease, attempts, sanitized error, captured watermark, and
+frontier. Normal recovery is for the background worker to prepare the repair
+and for a later foreground boundary to publish it. Repeated provider errors,
+expired leases, `partial_repair_*_changed` supersession reasons, or SQLite lock
+events should be investigated; do not delete raw rows, coverage, prepared
+rows, or normalized edge/epoch tables manually. Disabling background
+compaction safely stops new repair work but leaves all optional state and raw
+history intact for diagnosis or rollback.
+
 ## Configuration
 
 Most installs only need `plugins.enabled` and `context.engine: lcm`. Useful
@@ -196,6 +214,14 @@ environment variables:
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
 | `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
+| `LCM_BACKGROUND_COMPACTION_ENABLED` | `false` | Opt into durable asynchronous summary preparation with foreground-only atomic publication; see [Async background compaction](async-background-compaction.md) |
+| `LCM_BACKGROUND_COMPACTION_WORKERS` | `1` | Process-local worker request, clamped to `0` or `1`; effective only when background compaction is enabled |
+| `LCM_BACKGROUND_COMPACTION_GLOBAL_LIMIT` | `2` | Durable cross-process provider-call limit |
+| `LCM_BACKGROUND_COMPACTION_MAX_PASSES` | `4` | Maximum provider passes captured by one background job |
+| `LCM_BACKGROUND_COMPACTION_JOB_TIMEOUT_SECONDS` | `120` | Shared wall-clock deadline for all provider calls in one job |
+| `LCM_BACKGROUND_COMPACTION_LEASE_SECONDS` | `300` | Job, publication, and provider-permit lease duration |
+| `LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS` | `32000` | Old durable raw backlog that makes preparation eligible |
+| `LCM_BACKGROUND_COMPACTION_PREPARE_RATIO` | `0.55` | Active-context pressure that independently makes preparation eligible |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |

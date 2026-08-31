@@ -384,6 +384,14 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
 | `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
+| `LCM_BACKGROUND_COMPACTION_ENABLED` | `false` | Opt into durable asynchronous summary preparation with foreground-only atomic publication |
+| `LCM_BACKGROUND_COMPACTION_WORKERS` | `1` | Process-local worker request, clamped to `0` or `1`; effective only when background compaction is enabled |
+| `LCM_BACKGROUND_COMPACTION_GLOBAL_LIMIT` | `2` | Durable cross-process provider-call limit |
+| `LCM_BACKGROUND_COMPACTION_MAX_PASSES` | `4` | Maximum provider passes captured by one background job |
+| `LCM_BACKGROUND_COMPACTION_JOB_TIMEOUT_SECONDS` | `120` | Shared wall-clock deadline for all provider calls in one job |
+| `LCM_BACKGROUND_COMPACTION_LEASE_SECONDS` | `300` | Job, publication, and provider-permit lease duration |
+| `LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS` | `32000` | Old durable raw backlog that makes preparation eligible |
+| `LCM_BACKGROUND_COMPACTION_PREPARE_RATIO` | `0.55` | Active-context pressure that independently makes preparation eligible |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |
@@ -800,6 +808,8 @@ exposes retrieval tools that can drill back into exact stored sources.
   env profiles: coding agent, long-horizon assistant, fully-local, cost-guarded
 - [Operator guide](docs/operator-guide.md) — install, activation, full
   configuration reference, diagnostics
+- [Async background compaction](docs/async-background-compaction.md) — durable
+  job, threshold, publication, rollback, and rollout contract
 - [Retrieval tools reference](docs/retrieval-tools.md) — exact tool contracts
 - [Embeddings setup](docs/embeddings-setup.md) — free-tier and local embedding
   providers, warmup, backfill
