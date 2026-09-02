@@ -151,7 +151,11 @@ def serialize_summary_messages(
 
         content = sanitize_pre_compaction_content(content)
         if role == "assistant":
-            tool_calls = message.get("tool_calls", [])
+            # Persisted Hermes rows use SQL NULL for assistant messages that
+            # did not make a tool call.  ``dict.get(..., [])`` only applies
+            # the default when the key is absent, so normalize an explicit
+            # None before iterating.
+            tool_calls = message.get("tool_calls") or []
             matched_tool_calls = [
                 tool_call
                 for tool_call in tool_calls

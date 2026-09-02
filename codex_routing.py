@@ -26,7 +26,10 @@ _CODEX_OAUTH_CONTEXT_CAPS: dict[str, int] = {
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
-    "gpt-5.6": 372_000,
+    # The Codex OAuth model catalog currently advertises a 900K total window
+    # for the GPT-5.6 family.  Context admission keeps its separate 80% input
+    # reserve; this value is the total provider window, not the request cap.
+    "gpt-5.6": 900_000,
     "gpt-5": 272_000,
 }
 
