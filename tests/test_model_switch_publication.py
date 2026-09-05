@@ -35,6 +35,72 @@ def receipt(state):
     return {'id':'job', 'session_id':'session', 'revision':'revision', 'state':state}
 
 
+def test_engine_partition_binding_preserves_tail(setup):
+    engine, publication, ids = setup
+    prefix = [{'role': 'user', 'content': 'old source'},
+              {'role': 'assistant', 'content': 'old answer'}]
+    tail = [{'role': 'user', 'content': 'protected pending prompt'}]
+    engine.reserve_model_switch(job_id='job', host_revision='revision', prefix=prefix, tail=tail,
+                                deadline=time.monotonic() + 30, wall_deadline=time.time() + 30)
+    engine.finish_model_switch({**receipt('committed'), 'lcm_summary': 'Old task decisions'})
+    assert engine._last_compacted_store_id == ids[1]
+    assert engine._store.get_session_count('session') == 3
+    assert engine._dag.get_active_frontier_nodes('session')[0].summary == 'Old task decisions'
+
+
+def test_engine_partition_rejects_unmapped_source(setup):
+    engine, publication, ids = setup
+    with pytest.raises(ValueError, match='without LCM source identity'):
+        engine.reserve_model_switch(job_id='job', host_revision='revision',
+                                    prefix=[{'role': 'user', 'content': 'not stored'}], tail=[],
+                                    deadline=time.monotonic() + 30, wall_deadline=time.time() + 30)
+    assert engine._background_compaction.get_publishable_session_fence_generation(
+        conversation_id='conversation', session_id='session') is not None
+
+
+def test_engine_partition_rejects_hole_in_prefix(setup):
+    engine, publication, ids = setup
+    with pytest.raises(ValueError, match='protected tail|source range changed'):
+        engine.reserve_model_switch(job_id='job', host_revision='revision',
+                                    prefix=[{'role': 'assistant', 'content': 'old answer'}],
+                                    tail=[{'role': 'user', 'content': 'old source'}],
+                                    deadline=time.monotonic() + 30, wall_deadline=time.time() + 30)
+
+
+def test_failed_intent_before_reservation_can_be_released(setup):
+    engine, publication, ids = setup
+    engine.finish_model_switch(receipt('failed'))
+    assert engine._store.get_session_count('session') == 3
+    with pytest.raises(ValueError, match='does not match reservation'):
+        engine.finish_model_switch({**receipt('committed'), 'lcm_summary': 'unconfirmed'})
+
+
+def test_partition_must_include_previous_root_and_replaces_it_once(setup):
+    engine, publication, ids = setup
+    reserve(publication, ids)
+    engine.finish_model_switch({**receipt('committed'), 'lcm_summary': 'Earlier confirmed decisions'})
+    added = engine._store.append_batch('session', [
+        {'role': 'assistant', 'content': 'follow-up answer'},
+        {'role': 'user', 'content': 'new pending prompt'},
+    ], conversation_id='conversation', token_estimates=[10, 10])
+    prefix = [{'role': 'user', 'content': 'protected pending prompt'},
+              {'role': 'assistant', 'content': 'follow-up answer'}]
+    tail = [{'role': 'user', 'content': 'new pending prompt'}]
+    with pytest.raises(ValueError, match='active summary is not represented'):
+        engine.reserve_model_switch(job_id='next', host_revision='next-revision', prefix=prefix, tail=tail,
+                                    deadline=time.monotonic() + 30, wall_deadline=time.time() + 30)
+    prefix.insert(0, {'role': 'user', 'content': '[Summary] Earlier confirmed decisions'})
+    engine.reserve_model_switch(job_id='next', host_revision='next-revision', prefix=prefix, tail=tail,
+                                deadline=time.monotonic() + 30, wall_deadline=time.time() + 30)
+    engine.finish_model_switch({'id': 'next', 'revision': 'next-revision', 'session_id': 'session',
+                                'state': 'committed', 'lcm_summary': 'One consolidated summary'})
+    roots = engine._dag.get_active_frontier_nodes('session')
+    assert len(roots) == 1 and roots[0].summary == 'One consolidated summary'
+    assert engine._last_compacted_store_id == added[0]
+    assert engine._store.get_session_count('session') == 5
+    assert engine._dag.source_message_ids(roots[0].node_id, limit=20) == ids + [added[0]]
+
+
 def test_adoption_preserves_raw_source_and_pending_tail(setup):
     engine, publication, ids = setup
     reservation = reserve(publication, ids)

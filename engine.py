@@ -8438,6 +8438,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     return
                 raise
 
+    def reserve_model_switch(self, **kwargs):
+        from .model_switch_binding import reserve_model_switch
+        return reserve_model_switch(self, **kwargs)
+
+    def finish_model_switch(self, receipt):
+        from .model_switch_binding import finish_model_switch
+        return finish_model_switch(self, receipt)
+
     def prepare_model_switch_summary(
         self, messages, token_budget, deadline, cancel_event, *, admit_request
     ):
