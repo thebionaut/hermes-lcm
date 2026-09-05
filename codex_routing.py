@@ -55,8 +55,18 @@ def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | N
     bare_model = _bare_model_slug(model)
     if not bare_model:
         return None
+    # Reuse the host's offline route metadata; never duplicate verified
+    # exceptions (Astra/5.4/5.6) in a second independently drifting table.
+    try:
+        from agent.model_metadata import _CODEX_OAUTH_CONTEXT_FALLBACK, _verified_codex_ctx_for_slug
+        verified = _verified_codex_ctx_for_slug(bare_model)
+        if verified is not None:
+            return verified
+        caps = _CODEX_OAUTH_CONTEXT_FALLBACK
+    except ImportError:
+        caps = _CODEX_OAUTH_CONTEXT_CAPS
     for slug, cap in sorted(
-        _CODEX_OAUTH_CONTEXT_CAPS.items(), key=lambda item: len(item[0]), reverse=True
+        caps.items(), key=lambda item: len(item[0]), reverse=True
     ):
         if slug in bare_model:
             return cap

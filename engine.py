@@ -1003,6 +1003,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         context-threshold value, so expose the stricter cap here; otherwise a
         tool/schema-heavy request can skip host preflight entirely.
         """
+        publication_cap = getattr(self, "_admission_publication_tokens", 0)
+        if publication_cap:
+            context_threshold_tokens = min(context_threshold_tokens, publication_cap) if context_threshold_tokens > 0 else publication_cap
         assembly_cap = self._effective_assembly_token_cap()
         if assembly_cap is not None and assembly_cap > 0:
             if context_threshold_tokens > 0:
@@ -1112,32 +1115,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return self._last_compression_status == "noop"
 
     def _background_publication_trigger_tokens(self) -> int:
-        """Return the active-token boundary for publishing prepared summaries.
-
-        Background preparation deliberately does not replace the host's fixed
-        reserve policy.  Keeping this calculation next to the runtime context
-        metadata makes diagnostics and the foreground publication gate use the
-        same effective (route-capped) window as normal LCM compaction.
-        """
-        effective_window = max(0, int(self.context_length or 0))
+        """Publish before the host admission budget, retaining earlier policy."""
+        window = max(0, int(self.context_length or 0))
         reserve = max(0, int(self._config.context_reserve_tokens or 0))
-        if effective_window <= 0:
-            return max(0, int(self.threshold_tokens or 0))
-        if reserve > 0:
-            return max(1, effective_window - reserve)
-        return max(0, int(self.threshold_tokens or 0))
+        trigger = max(1, window - reserve) if window > 0 and reserve > 0 else max(0, int(self.threshold_tokens or 0))
+        bound = getattr(self, "_admission_publication_tokens", 0)
+        if bound:
+            trigger = min(trigger or bound, bound, self._effective_assembly_token_cap() or bound)
+        return trigger
 
     def _background_emergency_trigger_tokens(self) -> int:
-        """Return the bounded foreground-emergency boundary.
-
-        Emergency work is intentionally later than background publication:
-        effective_window - max(32k, five percent of the effective window).
-        """
-        effective_window = max(0, int(self.context_length or 0))
-        if effective_window <= 0:
+        """Recover with headroom before assembly and final host admission."""
+        window = max(0, int(self.context_length or 0))
+        if window <= 0:
             return 0
-        emergency_reserve = max(32_000, int(effective_window * 0.05))
-        return max(1, effective_window - emergency_reserve)
+        trigger = max(1, window - max(32_000, int(window * 0.05)))
+        bound = getattr(self, "_admission_emergency_tokens", 0)
+        if bound:
+            trigger = min(trigger, bound, self._effective_assembly_token_cap() or bound)
+        return trigger
 
     def _background_compaction_enabled(self) -> bool:
         return bool(
@@ -1323,7 +1319,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 session_id=self._session_id,
                 expected_frontier_store_id=lifecycle.current_frontier_store_id,
                 active_tokens=active_tokens,
-                effective_context_window=max(0, int(self.context_length or 0)),
+                effective_context_window=max(0, int(getattr(self, "_admission_safe_input_tokens", 0) or self.context_length or 0)),
                 policy_fingerprint=self._background_policy_fingerprint(),
                 lock_timeout_seconds=remaining,
                 deadline=deadline,
@@ -1888,7 +1884,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 policy_fingerprint=self._background_policy_fingerprint(),
                 write_timeout_ms=write_timeout_ms,
                 observed_active_tokens=observed_tokens,
-                effective_context_window=max(0, int(self.context_length or 0)),
+                effective_context_window=max(0, int(getattr(self, "_admission_safe_input_tokens", 0) or self.context_length or 0)),
                 publication_trigger_tokens=publication_trigger,
                 emergency_trigger_tokens=self._background_emergency_trigger_tokens(),
                 trigger_policy=(
@@ -5935,6 +5931,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 }
         return status
 
+    def bind_context_budget(self, budget: Any) -> None:
+        super().bind_context_budget(budget)
+        self._set_context_length(self.raw_context_length, source=self._context_length_source)
+
     def update_model(self, model: str, context_length: int,
                      base_url: str = "", api_key: str = "",
                      provider: str = "",
@@ -5946,6 +5946,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 parent_session_id,
             )
             return
+        for field in ("_admission_safe_input_tokens", "_admission_publication_tokens", "_admission_emergency_tokens", "_admission_assembly_tokens"):
+            setattr(self, field, 0)
         self.model = str(model or "")
         self.base_url = str(base_url or "")
         self.api_key = str(api_key or "")
@@ -9990,6 +9992,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         - reserve_tokens_floor: keep headroom inside context_length
         """
         caps: list[int] = []
+        admission_cap = getattr(self, "_admission_assembly_tokens", 0)
+        if admission_cap:
+            caps.append(admission_cap)
+
 
         if self._config.max_assembly_tokens > 0:
             caps.append(self._config.max_assembly_tokens)
