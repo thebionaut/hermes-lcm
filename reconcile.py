@@ -530,58 +530,59 @@ class ReconcileMixin:
                     "tool_calls": decoded_tool_calls,
                 })
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
+        # The cursor search visits overlapping prefixes. Build expensive replay
+        # identities and filters once, then slice by precomputed prefix counts.
+        visible_messages = []
+        identity_messages = []
+        visible_identities = []
+        identities = []
+        visible_counts = [0]
+        identity_counts = [0]
+        scaffold_evidence = [False]
+        quarantine_evidence = [False]
+        for index, msg in enumerate(messages):
+            if index % 32 == 0:
+                self._reconcile_deadline_checkpoint("indexing active replay prefixes")
+            identity = self._message_replay_identity(msg)
+            scaffold = self._is_replayed_context_scaffold_message(msg)
+            quarantined = self._is_quarantined_assistant_replay_identity(identity)
+            if not scaffold and not self._matches_ignore_message_patterns(msg):
+                visible_messages.append(msg)
+                visible_identities.append(identity)
+                content = text_content_for_pattern_matching(msg.get("content")) or ""
+                placeholder = (
+                    self._is_volatile_ignored_quarantine_placeholder(msg, content)
+                    or self._is_ignored_active_replay_placeholder(msg, content)
+                    or (self._compiled_ignore_message_patterns and quarantined
+                        and self._matches_ignore_message_patterns(msg, stored_row=True))
+                )
+                if not placeholder:
+                    identity_messages.append(msg)
+                    identities.append(identity)
+            visible_counts.append(len(visible_messages))
+            identity_counts.append(len(identity_messages))
+            scaffold_evidence.append(scaffold_evidence[-1] or scaffold)
+            quarantine_evidence.append(quarantine_evidence[-1] or quarantined)
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
             self._reconcile_deadline_checkpoint(
                 f"cursor {cursor} of {len(messages)}"
             )
             candidate_messages = messages[:cursor]
-            candidate_visible_messages = [
-                msg
-                for msg in candidate_messages
-                if not self._is_replayed_context_scaffold_message(msg)
-                and not self._matches_ignore_message_patterns(msg)
-            ]
-            candidate_non_placeholder_messages = [
-                msg
-                for msg in candidate_visible_messages
-                if not self._is_volatile_ignored_quarantine_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not (
-                    self._compiled_ignore_message_patterns
-                    and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
-                    )
-                    and self._matches_ignore_message_patterns(msg, stored_row=True)
-                )
-            ]
+            visible_count = visible_counts[cursor]
+            identity_count = identity_counts[cursor]
+            candidate_visible_messages = visible_messages[:visible_count]
+            candidate_non_placeholder_messages = identity_messages[:identity_count]
             filtered_candidate_placeholders = len(candidate_non_placeholder_messages) < len(candidate_visible_messages)
-            candidate_has_scaffold_evidence = any(
-                self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
-            )
-            candidate_has_quarantined_replay_evidence = any(
-                self._is_quarantined_assistant_replay_identity(self._message_replay_identity(msg))
-                for msg in candidate_messages
-            )
+            candidate_has_scaffold_evidence = scaffold_evidence[cursor]
+            candidate_has_quarantined_replay_evidence = quarantine_evidence[cursor]
             candidate_identity_messages = (
                 candidate_non_placeholder_messages
                 if candidate_non_placeholder_messages or filtered_candidate_placeholders
                 else candidate_visible_messages
             )
-            candidate_visible_prefix = [
-                self._message_replay_identity(msg)
-                for msg in candidate_visible_messages
-            ]
-            candidate_prefix = [
-                self._message_replay_identity(msg)
-                for msg in candidate_identity_messages
-            ]
+            candidate_visible_prefix = visible_identities[:visible_count]
+            candidate_prefix = identities[:identity_count]
             self._reconcile_deadline_checkpoint(
                 f"cursor {cursor} of {len(messages)}"
             )
