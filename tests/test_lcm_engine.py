@@ -1384,7 +1384,7 @@ class TestEscalationStripReasoning:
         agent_mod = sys.modules.get("agent") or types.ModuleType("agent")
         aux_mod = types.ModuleType("agent.auxiliary_client")
         aux_mod.call_llm = fake_call_llm
-        agent_mod.auxiliary_client = aux_mod
+        monkeypatch.setattr(agent_mod, "auxiliary_client", aux_mod, raising=False)
         monkeypatch.setitem(sys.modules, "agent", agent_mod)
         monkeypatch.setitem(sys.modules, "agent.auxiliary_client", aux_mod)
         return aux_mod

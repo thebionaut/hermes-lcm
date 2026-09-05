@@ -26,7 +26,7 @@ def _install_failing_auxiliary_client(monkeypatch) -> None:
         raise RuntimeError(f"provider rejected Authorization: {_SECRET_MARKER}")
 
     auxiliary_module.call_llm = fail_call
-    agent_module.auxiliary_client = auxiliary_module
+    monkeypatch.setattr(agent_module, "auxiliary_client", auxiliary_module, raising=False)
     monkeypatch.setitem(sys.modules, "agent", agent_module)
     monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary_module)
 
