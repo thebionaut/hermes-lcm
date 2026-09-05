@@ -8438,6 +8438,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     return
                 raise
 
+    def prepare_model_switch_summary(
+        self, messages, token_budget, deadline, cancel_event, *, admit_request
+    ):
+        """Prepare a detached summary without changing LCM or host history."""
+        from .model_switch_preparation import prepare_model_switch_summary
+
+        return prepare_model_switch_summary(
+            self, messages, token_budget, deadline, cancel_event,
+            admit_request=admit_request,
+        )
+
     def _serialize_messages(
         self,
         messages: List[Dict[str, Any]],

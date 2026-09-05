@@ -182,8 +182,15 @@ def serialize_summary_messages(
     cancel_event: threading.Event | None = None,
     now: Callable[[], float] | None = None,
     ownership: ExternalizationOwnership | None = None,
+    preparation_only: bool = False,
 ) -> str:
-    """Serialize messages through the canonical summary-provider scrub."""
+    """Serialize messages through the canonical summary-provider scrub.
+
+    ``preparation_only`` preserves complete text and does not externalize tool
+    results. It is for detached, budget-validated model-switch preparation,
+    where truncation or filesystem writes must not precede a confirmed commit.
+    Sensitive-data and injected-context scrubbing still apply.
+    """
     _require_projection_active(
         deadline=deadline,
         cancel_event=cancel_event,
@@ -206,7 +213,7 @@ def serialize_summary_messages(
         )
         if role == "tool":
             tool_id = str(message.get("tool_call_id") or "").strip()
-            externalized = maybe_externalize_tool_output(
+            externalized = None if preparation_only else maybe_externalize_tool_output(
                 content,
                 tool_call_id=tool_id,
                 session_id=session_id,
@@ -226,7 +233,7 @@ def serialize_summary_messages(
                 content = externalized["placeholder"]
             else:
                 content = sanitize_pre_compaction_content(content)
-                if len(content) > 3000:
+                if not preparation_only and len(content) > 3000:
                     content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
             parts.append(f"[TOOL RESULT {tool_id}]: {content}")
             continue
@@ -244,11 +251,11 @@ def serialize_summary_messages(
                 if not _tool_call_id(tool_call)
                 or _tool_call_id(tool_call) in matched_tool_ids
             ]
-            if _is_synthetic_assistant_noise(content):
+            if not preparation_only and _is_synthetic_assistant_noise(content):
                 if not matched_tool_calls:
                     continue
                 content = ""
-            if len(content) > 3000:
+            if not preparation_only and len(content) > 3000:
                 content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
             if matched_tool_calls:
                 call_parts: list[str] = []
@@ -268,14 +275,14 @@ def serialize_summary_messages(
                         parse_json_strings=True,
                     )
                     arguments = sanitize_pre_compaction_tool_arguments(arguments)
-                    if len(arguments) > 500:
+                    if not preparation_only and len(arguments) > 500:
                         arguments = arguments[:400] + "..."
                     call_parts.append(f"  {name}({arguments})")
                 content += "\n[Tool calls:\n" + "\n".join(call_parts) + "\n]"
             parts.append(f"[ASSISTANT]: {content}")
             continue
 
-        if len(content) > 3000:
+        if not preparation_only and len(content) > 3000:
             content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
         parts.append(f"[{str(role).upper()}]: {content}")
     _require_projection_active(
