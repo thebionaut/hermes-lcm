@@ -22,6 +22,7 @@ import json
 import re
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +48,7 @@ from .ingest_protection import (
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
+from .sqlite_util import _is_sqlite_locked_error, _temporary_sqlite_busy_timeout
 
 import logging
 
@@ -59,10 +61,55 @@ class ReconcileBudgetExceeded(Exception):
     """Ingest-cursor reconciliation outlived its budget; abort the batch."""
 
 
+class ForegroundDeadlineExceeded(ReconcileBudgetExceeded):
+    """The shared automatic foreground deadline expired at a safe boundary."""
+
+    def __init__(self, stage: str, detail: str = "") -> None:
+        self.stage = str(stage or "foreground work")
+        self.detail = str(detail or "")
+        message = f"foreground deadline exhausted during {self.stage}"
+        if self.detail:
+            message = f"{message}: {self.detail}"
+        super().__init__(message)
+
+
 class ReconcileMixin:
     # Real engines install an instance lock. This class lock is a safe fallback
     # for lightweight mixin harnesses and external consumers.
     _reconcile_lock = threading.Lock()
+
+    def _foreground_now(self) -> float:
+        """Monotonic clock seam shared by foreground work and deterministic tests."""
+        clock = getattr(self, "_foreground_monotonic", None)
+        return float(clock() if callable(clock) else time.monotonic())
+
+    def _foreground_deadline_remaining(self, deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        return max(0.0, float(deadline) - self._foreground_now())
+
+    def _foreground_deadline_checkpoint(
+        self,
+        deadline: float | None,
+        stage: str,
+        detail: str = "",
+    ) -> None:
+        if deadline is not None and self._foreground_now() >= float(deadline):
+            raise ForegroundDeadlineExceeded(stage, detail)
+
+    def _reconcile_deadline_checkpoint(self, detail: str = "") -> None:
+        deadline = getattr(self, "_reconcile_deadline", None)
+        if deadline is None or self._foreground_now() < float(deadline):
+            return
+        foreground_deadline = getattr(self, "_reconcile_foreground_deadline", None)
+        if (
+            foreground_deadline is not None
+            and float(foreground_deadline) <= float(deadline)
+            and self._foreground_now() >= float(foreground_deadline)
+        ):
+            raise ForegroundDeadlineExceeded("reconciliation", detail)
+        suffix = f": {detail}" if detail else ""
+        raise ReconcileBudgetExceeded(f"reconcile exceeded its budget{suffix}")
 
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
@@ -139,6 +186,7 @@ class ReconcileMixin:
     _IDENTITY_MEMO_MISS = object()
 
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+        self._reconcile_deadline_checkpoint("building replay identity")
         # Per-ingest-call memo: reconciliation recomputes identities for every
         # candidate prefix (O(N^2) call sites); within one ingest call the
         # message dicts are held alive by the caller, so id(msg) keys are
@@ -151,6 +199,7 @@ class ReconcileMixin:
         if hit is not ReconcileMixin._IDENTITY_MEMO_MISS:
             return hit
         value = self._compute_message_replay_identity(msg, stored_row=stored_row)
+        self._reconcile_deadline_checkpoint("building replay identity")
         memo[key] = value
         return value
 
@@ -259,11 +308,13 @@ class ReconcileMixin:
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
         ref = extract_externalized_ref(content)
         if ref and "quarantined_assistant_output" not in content:
+            self._reconcile_deadline_checkpoint("loading externalized replay payload")
             payload = load_externalized_payload(
                 ref,
                 config=self._config,
                 hermes_home=self._hermes_home,
             )
+            self._reconcile_deadline_checkpoint("loading externalized replay payload")
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
@@ -444,7 +495,9 @@ class ReconcileMixin:
         assistant rows may be removed or have internal content stripped.
         """
         sanitized_tail: list[tuple[str, str, str, str]] = []
-        for identity in stored_tail:
+        for index, identity in enumerate(stored_tail):
+            if index % 32 == 0:
+                self._reconcile_deadline_checkpoint("sanitizing durable replay tail")
             cleaned_identity = self._active_cleanup_replay_identity(identity)
             if cleaned_identity is not None:
                 sanitized_tail.append(cleaned_identity)
@@ -479,11 +532,9 @@ class ReconcileMixin:
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
-            deadline = getattr(self, "_reconcile_deadline", None)
-            if deadline is not None and time.monotonic() > deadline:
-                raise ReconcileBudgetExceeded(
-                    f"reconcile budget exceeded at cursor {cursor} of {len(messages)}"
-                )
+            self._reconcile_deadline_checkpoint(
+                f"cursor {cursor} of {len(messages)}"
+            )
             candidate_messages = messages[:cursor]
             candidate_visible_messages = [
                 msg
@@ -531,6 +582,9 @@ class ReconcileMixin:
                 self._message_replay_identity(msg)
                 for msg in candidate_identity_messages
             ]
+            self._reconcile_deadline_checkpoint(
+                f"cursor {cursor} of {len(messages)}"
+            )
             if not candidate_prefix:
                 empty_prefix_cursor = cursor
                 if allow_empty_prefix and (
@@ -578,6 +632,9 @@ class ReconcileMixin:
                 candidate_prefix,
                 stored_tail,
                 stored_tail_rows,
+            )
+            self._reconcile_deadline_checkpoint(
+                f"cursor {cursor} of {len(messages)}"
             )
             candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
@@ -776,6 +833,9 @@ class ReconcileMixin:
                 or has_raw_cleanup_replay
             ):
                 return cursor
+            self._reconcile_deadline_checkpoint(
+                f"cursor {cursor} of {len(messages)}"
+            )
         return empty_prefix_cursor if allow_empty_prefix else None
 
     def _record_ingest_reconciliation(
@@ -838,58 +898,145 @@ class ReconcileMixin:
             return False
         return stored_head[: len(incoming_identities)] == incoming_identities
 
-    def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
+    def _reconcile_ingest_cursor_from_store(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> int:
         # Budget wrapper: reconciliation runs synchronously inside the
         # post-LLM ingest hook, so it must never run unbounded. On budget
         # exhaustion the caller aborts the ingest batch (no duplicate rows)
-        # and retries next turn with a warm payload index.
+        # and retries next turn with a warm payload index. Automatic foreground
+        # work supplies the same absolute deadline used by the rest of the
+        # compression attempt; the configured reconcile budget may shorten but
+        # must never extend that caller-owned wall.
         budget = float(getattr(self._config, "reconcile_budget_seconds", 45.0) or 0.0)
-        deadline = (time.monotonic() + budget) if budget > 0 else None
-        if deadline is None:
+        now = self._foreground_now()
+        configured_deadline = (now + budget) if budget > 0 else None
+        foreground_deadline = float(deadline) if deadline is not None else None
+        effective_deadline = configured_deadline
+        if foreground_deadline is not None:
+            effective_deadline = (
+                foreground_deadline
+                if effective_deadline is None
+                else min(effective_deadline, foreground_deadline)
+            )
+        if effective_deadline is None:
             acquired = self._reconcile_lock.acquire()
         else:
             acquired = self._reconcile_lock.acquire(
-                timeout=max(0.0, deadline - time.monotonic())
+                timeout=max(0.0, effective_deadline - self._foreground_now())
             )
         if not acquired:
+            if (
+                foreground_deadline is not None
+                and self._foreground_now() >= foreground_deadline
+            ):
+                raise ForegroundDeadlineExceeded(
+                    "reconciliation",
+                    "lock wait exceeded the shared deadline",
+                )
             raise ReconcileBudgetExceeded("reconcile lock wait exceeded its budget")
-        if deadline is not None and time.monotonic() >= deadline:
+        if (
+            effective_deadline is not None
+            and self._foreground_now() >= effective_deadline
+        ):
             self._reconcile_lock.release()
+            if (
+                foreground_deadline is not None
+                and self._foreground_now() >= foreground_deadline
+            ):
+                raise ForegroundDeadlineExceeded(
+                    "reconciliation",
+                    "lock wait consumed the shared deadline",
+                )
             raise ReconcileBudgetExceeded("reconcile lock wait consumed its budget")
-        self._reconcile_deadline = deadline
+        self._reconcile_deadline = effective_deadline
+        self._reconcile_foreground_deadline = foreground_deadline
         self._identity_memo = {}
         try:
             try:
-                result = self._reconcile_ingest_cursor_from_store_impl(messages)
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise ReconcileBudgetExceeded("reconcile exceeded its budget")
+                timeout_ms = None
+                if effective_deadline is not None:
+                    timeout_ms = max(
+                        0,
+                        int(
+                            max(
+                                0.0,
+                                effective_deadline - self._foreground_now(),
+                            )
+                            * 1000
+                        ),
+                    )
+                with _temporary_sqlite_busy_timeout(
+                    [getattr(getattr(self, "_store", None), "_conn", None)],
+                    timeout_ms if timeout_ms is not None else 0,
+                ) if timeout_ms is not None else nullcontext():
+                    self._reconcile_deadline_checkpoint("before durable store scan")
+                    result = self._reconcile_ingest_cursor_from_store_impl(messages)
+                    self._reconcile_deadline_checkpoint("after durable store scan")
                 return result
             except ExternalizedPayloadLookupBudgetExceeded as exc:
+                if (
+                    foreground_deadline is not None
+                    and self._foreground_now() >= foreground_deadline
+                ):
+                    raise ForegroundDeadlineExceeded(
+                        "reconciliation",
+                        "payload lookup exceeded the shared deadline",
+                    ) from exc
                 raise ReconcileBudgetExceeded(
                     "reconcile payload lookup exceeded its budget"
                 ) from exc
+            except Exception as exc:
+                if _is_sqlite_locked_error(exc) and foreground_deadline is not None:
+                    raise ForegroundDeadlineExceeded(
+                        "reconciliation",
+                        "SQLite wait consumed the shared deadline",
+                    ) from exc
+                raise
         finally:
             self._identity_memo = None
             self._reconcile_deadline = None
+            self._reconcile_foreground_deadline = None
             self._reconcile_lock.release()
 
     def _reconcile_ingest_cursor_from_store_impl(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
+        self._reconcile_deadline_checkpoint("starting durable replay scan")
         if not self._session_id or not messages:
             return 0
 
         try:
-            session_count = self._store.get_session_count(self._session_id)
+            session_count = self._store.get_session_count(
+                self._session_id,
+                lock_timeout_seconds=(
+                    None
+                    if getattr(self, "_reconcile_deadline", None) is None
+                    else max(
+                        0.0,
+                        float(self._reconcile_deadline) - self._foreground_now(),
+                    )
+                ),
+                deadline=getattr(self, "_reconcile_deadline", None),
+                deadline_clock=self._foreground_now,
+            )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
             return 0
+        self._reconcile_deadline_checkpoint("counting durable replay rows")
         if session_count <= 0:
             placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
             placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
             if placeholder_budget and placeholder_ordinals:
                 consumed: dict[str, int] = {}
                 cursor = 0
-                for msg in messages:
+                for index, msg in enumerate(messages):
+                    if index % 32 == 0:
+                        self._reconcile_deadline_checkpoint(
+                            "matching generated replay placeholders"
+                        )
                     text = text_content_for_pattern_matching(msg.get("content")) or ""
                     digest = self._active_replay_placeholder_digest(text)
                     if not digest:
@@ -914,7 +1061,22 @@ class ReconcileMixin:
             return 0
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
-        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        self._reconcile_deadline_checkpoint("reading durable replay tail")
+        stored_rows = self._store.get_session_tail(
+            self._session_id,
+            limit=tail_limit,
+            lock_timeout_seconds=(
+                None
+                if getattr(self, "_reconcile_deadline", None) is None
+                else max(
+                    0.0,
+                    float(self._reconcile_deadline) - self._foreground_now(),
+                )
+            ),
+            deadline=getattr(self, "_reconcile_deadline", None),
+            deadline_clock=self._foreground_now,
+        )
+        self._reconcile_deadline_checkpoint("reading durable replay tail")
         if not stored_rows:
             return 0
         stored_tail_rows = [
@@ -934,6 +1096,7 @@ class ReconcileMixin:
             session_count=len(stored_tail),
             raw_session_count=session_count,
         )
+        self._reconcile_deadline_checkpoint("matching durable replay tail")
         if cursor is not None and cursor > 0:
             reason = (
                 "skipped scaffold-only prefix"
@@ -961,11 +1124,24 @@ class ReconcileMixin:
             return cursor
 
         incoming_identities = self._effective_replay_identities(messages)
+        self._reconcile_deadline_checkpoint("reading durable replay head")
         stored_head_rows = self._store.get_session_messages(
             self._session_id,
             limit=tail_limit,
+            lock_timeout_seconds=(
+                None
+                if getattr(self, "_reconcile_deadline", None) is None
+                else max(
+                    0.0,
+                    float(self._reconcile_deadline) - self._foreground_now(),
+                )
+            ),
+            deadline=getattr(self, "_reconcile_deadline", None),
+            deadline_clock=self._foreground_now,
         )
+        self._reconcile_deadline_checkpoint("reading durable replay head")
         stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
+        self._reconcile_deadline_checkpoint("matching durable replay head")
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
         # filters may suppress noisy rows for tail reconciliation, but filtered
         # history alone must not create replay evidence for skipping a batch.
@@ -1024,7 +1200,12 @@ class ReconcileMixin:
             str(msg.get("tool_call_id") or ""),
         )
 
-    def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+    def _get_store_id_map_for_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
         Matching starts strictly after ``_last_compacted_store_id`` so repeated
@@ -1035,13 +1216,56 @@ class ReconcileMixin:
         synthetic/carry-over and left unmapped so they cannot steal later stored
         literal copies with the same content.
         """
+        inherited_deadline = getattr(self, "_reconcile_deadline", None)
+        effective_deadline = (
+            float(deadline)
+            if deadline is not None
+            else inherited_deadline
+        )
+
+        def checkpoint(detail: str) -> None:
+            if deadline is not None:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "source mapping",
+                    detail,
+                )
+            elif inherited_deadline is not None:
+                self._reconcile_deadline_checkpoint(detail)
+
         candidates: list[Dict[str, Any]] = []
         next_candidate_after = self._last_compacted_store_id
         while True:
-            page = self._store.get_session_messages_after(
-                self._session_id,
-                after_store_id=next_candidate_after,
-            )
+            checkpoint("before durable source page")
+            remaining = self._foreground_deadline_remaining(effective_deadline)
+            try:
+                page = self._store.get_session_messages_after(
+                    self._session_id,
+                    after_store_id=next_candidate_after,
+                    lock_timeout_seconds=remaining,
+                    deadline=effective_deadline,
+                    deadline_clock=self._foreground_now,
+                    busy_timeout_ms=(
+                        max(0, int(remaining * 1000))
+                        if remaining is not None
+                        else None
+                    ),
+                )
+            except TimeoutError as exc:
+                if deadline is not None:
+                    raise ForegroundDeadlineExceeded(
+                        "source mapping",
+                        "message-store page read exceeded the shared deadline",
+                    ) from exc
+                raise
+            except Exception as exc:
+                if deadline is not None and _is_sqlite_locked_error(exc):
+                    raise ForegroundDeadlineExceeded(
+                        "source mapping",
+                        "SQLite contention prevented a bounded source page read",
+                    ) from exc
+                raise
+            checkpoint("after durable source page")
             if not page:
                 break
             candidates.extend(page)

@@ -20,11 +20,13 @@ from hermes_lcm.background_compaction import (
     background_policy_fingerprint,
 )
 from hermes_lcm.config import LCMConfig
-from hermes_lcm.dag import SummaryDAG
+from hermes_lcm.dag import SummaryDAG, SummaryNode
+from hermes_lcm.engine import LCMEngine
 from hermes_lcm.externalize import (
     externalize_ingest_payload,
     maybe_externalize_tool_output,
 )
+from hermes_lcm.ingest_protection import extract_ingest_externalized_refs
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.store import MessageStore
 
@@ -43,6 +45,7 @@ def _config(tmp_path: Path) -> LCMConfig:
         background_compaction_job_timeout_seconds=10,
         background_compaction_lease_seconds=30,
         background_compaction_backlog_tokens=1,
+        background_compaction_min_provider_source_tokens=1,
         background_compaction_prepare_ratio=0.55,
         fresh_tail_count=0,
         fresh_tail_max_tokens=0,
@@ -103,7 +106,11 @@ def _capture(store: BackgroundCompactionStore, config: LCMConfig):
     return job, policy
 
 
-def _single_externalized_raw_fixture(tmp_path: Path):
+def _single_externalized_raw_fixture(
+    tmp_path: Path,
+    *,
+    token_estimate: int = 100,
+):
     config = _config(tmp_path)
     original = (
         "PAYLOAD_HEAD api_key=synthetic-sensitive-value\n"
@@ -124,6 +131,7 @@ def _single_externalized_raw_fixture(tmp_path: Path):
     source_ids = _initialize_source_rows(
         config,
         [{"role": "user", "content": placeholder}],
+        token_estimates=[token_estimate],
     )
     return config, original, placeholder, payload_path, source_ids
 
@@ -140,6 +148,116 @@ def _damage_payload(path: Path, mode: str) -> None:
     replacement_prefix = "X" if not original.startswith("X") else "Y"
     payload["content"] = replacement_prefix + original[1:]
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_44_token_externalized_marker_skips_provider_and_remains_exactly_expandable(
+    tmp_path,
+):
+    config, original, placeholder, payload_path, source_ids = (
+        _single_externalized_raw_fixture(tmp_path, token_estimate=44)
+    )
+    config.background_compaction_min_provider_source_tokens = 256
+    messages = MessageStore(config.database_path)
+    try:
+        canonical_id = messages.append_batch(
+            SESSION_ID,
+            [{"role": "assistant", "content": "already canonical island"}],
+            token_estimates=[50],
+            conversation_id=CONVERSATION_ID,
+        )[0]
+    finally:
+        messages.close()
+    dag = SummaryDAG(config.database_path)
+    try:
+        dag.add_node(
+            SummaryNode(
+                session_id=SESSION_ID,
+                depth=0,
+                summary="existing canonical island",
+                source_ids=[canonical_id],
+                source_type="messages",
+                source_token_count=50,
+                token_count=4,
+            )
+        )
+    finally:
+        dag.close()
+
+    background = BackgroundCompactionStore(config.database_path, config=config)
+    provider_calls: list[dict] = []
+    raw_before = _stored_source_rows(config)
+    assert len(raw_before) == 2
+    assert raw_before[0]["store_id"] == source_ids[0]
+    assert raw_before[0]["content"] == placeholder
+    assert raw_before[0]["token_estimate"] == 44
+    assert raw_before[1]["store_id"] == canonical_id
+    try:
+        job, policy = _capture(background, config)
+        assert job.source_store_ids == (source_ids[0],)
+        assert job.source_token_count == 44
+        assert job.state == "prepared"
+        assert job.completion_reason == "insufficient_compressible_source"
+        assert background.run_next_job(
+            owner="must-not-call-provider",
+            summarizer=lambda **kwargs: provider_calls.append(kwargs) or ("bad", 1),
+        ) is None
+        assert provider_calls == []
+
+        lease = background.acquire_publication_lease(job.job_id, owner="publisher")
+        assert lease is not None
+        published = background.publish_prepared(
+            job.job_id,
+            owner="publisher",
+            generation=lease.lease_generation,
+            policy_fingerprint=policy,
+            observed_active_tokens=272_000,
+            effective_context_window=372_000,
+            publication_trigger_tokens=272_000,
+            emergency_trigger_tokens=340_000,
+        )
+        assert published.promoted is True
+        assert _stored_source_rows(config) == raw_before
+        assert background.capture_and_enqueue(
+            conversation_id=CONVERSATION_ID,
+            session_id=SESSION_ID,
+            expected_frontier_store_id=source_ids[0],
+            active_tokens=1,
+            effective_context_window=372_000,
+            policy_fingerprint=policy,
+        ) is None
+        assert background.connection.execute(
+            "SELECT COUNT(*) FROM lcm_compaction_jobs WHERE conversation_id=?",
+            (CONVERSATION_ID,),
+        ).fetchone()[0] == 1
+    finally:
+        background.close()
+
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    engine._session_id = SESSION_ID
+    engine._conversation_id = CONVERSATION_ID
+    try:
+        expanded_node = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": published.node_ids[0], "max_tokens": 100_000},
+            )
+        )
+        assert expanded_node["expanded"][0]["store_id"] == source_ids[0]
+        assert expanded_node["expanded"][0]["content"] == placeholder
+        assert extract_ingest_externalized_refs(
+            expanded_node["expanded"][0]["content"]
+        ) == [payload_path.name]
+
+        expanded_payload = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"externalized_ref": payload_path.name, "max_tokens": 100_000},
+            )
+        )
+        assert expanded_payload["content"] == original
+        assert expanded_payload["content_truncated"] is False
+    finally:
+        engine.shutdown()
 
 
 def _stored_source_rows(config: LCMConfig) -> list[dict]:

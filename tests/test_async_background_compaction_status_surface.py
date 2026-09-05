@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 from hermes_lcm.config import LCMConfig
@@ -68,6 +69,52 @@ def _complete_status() -> dict:
         "current_debt_tokens": 32_123,
         "last_preparation_result": None,
         "last_publication_result": None,
+        "last_publication_telemetry": {
+            "job_id": "private-job-id",
+            "range_identity": "private-source-identity",
+            "publication_fence_generation": 7,
+            "observed_active_tokens": 900_321,
+            "effective_context_window": 1_000_000,
+            "publication_trigger_tokens": 900_000,
+            "emergency_trigger_tokens": 950_000,
+            "trigger_policy": "fixed_reserve",
+            "prepared_to_published_seconds": 12.3456,
+            "source_token_count": 32_000,
+            "summary_token_count": 400,
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "published_at": 124.0,
+        },
+        "last_provider_attempt": {
+            "job_id": "private-job-id",
+            "attempt_number": 2,
+            "chunk_ordinal": 1,
+            "escalation_level": 1,
+            "logical_route_ordinal": 1,
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "attribution_available": True,
+            "fallback_used": True,
+            "outcome": "success",
+            "failure_reason": "",
+            "source_token_count": 32_000,
+            "summary_token_count": 400,
+            "latency_ms": 1_234,
+            "finished_at": 123.0,
+        },
+        "recent_provider_outcomes": {
+            "success": 2,
+            "provider_timeout": 1,
+            "not_a_stable_reason": 999,
+        },
+        "provider_attribution": {
+            "prepared_nodes": 4,
+            "attributed_nodes": 3,
+        },
+        "range_dispositions": {
+            "insufficient_compressible_source": 2,
+            "not_a_stable_reason": 999,
+        },
         "durable_event_counts": {
             **event_counts,
             "not_a_stable_reason": 999,
@@ -77,6 +124,7 @@ def _complete_status() -> dict:
             "not_a_stable_reason",
         ],
         "backlog_trigger_tokens": 32_000,
+        "minimum_provider_source_tokens": 256,
         "prepare_ratio": 0.61,
         "publication_trigger_tokens": 90_000,
         "emergency_trigger_tokens": 100_000,
@@ -114,11 +162,39 @@ def test_json_status_preserves_scoped_durable_diagnostics_without_inference():
         "updated_at": 123.457,
     }
     assert payload["backlog_trigger_tokens"] == 32_000
+    assert payload["minimum_provider_source_tokens"] == 256
     assert payload["prepare_ratio"] == 0.61
     assert payload["publication_trigger_tokens"] == 90_000
     assert payload["emergency_trigger_tokens"] == 100_000
     assert payload["durable_frontier_store_id"] == 456
     assert payload["active_coverage"] == "raw"
+    publication = payload["last_publication_telemetry"]
+    assert publication["job_hint"] != "private-job-id"
+    assert publication["range_identity_hint"] != "private-source-identity"
+    assert publication["observed_active_tokens"] == 900_321
+    assert publication["publication_trigger_tokens"] == 900_000
+    assert publication["trigger_policy"] == "fixed_reserve"
+    assert publication["prepared_to_published_seconds"] == 12.346
+    attempt = payload["last_provider_attempt"]
+    assert attempt["job_hint"] == publication["job_hint"]
+    assert attempt["provider"] == "openai-codex"
+    assert attempt["model"] == "gpt-5.6-luna"
+    assert attempt["fallback_used"] is True
+    assert payload["recent_provider_outcomes"] == {
+        "success": 2,
+        "provider_timeout": 1,
+    }
+    assert payload["provider_attribution"] == {
+        "prepared_nodes": 4,
+        "attributed_nodes": 3,
+        "coverage_ratio": 0.75,
+    }
+    assert payload["range_dispositions"] == {
+        "insufficient_compressible_source": 2,
+    }
+    serialized = json.dumps(payload)
+    assert "private-job-id" not in serialized
+    assert "private-source-identity" not in serialized
 
     expected_counts = {
         reason: raw["durable_event_counts"][reason]
@@ -156,7 +232,10 @@ def test_text_status_surfaces_policy_frontier_debt_permits_and_exact_events():
         "timed_out=2 oldest_age_seconds=12.346 "
         "min_lease_remaining_seconds=8.765"
     ) in text
-    assert "background_compaction_policy: backlog=32000 prepare_ratio=0.61" in text
+    assert (
+        "background_compaction_policy: backlog=32000 "
+        "min_provider_source=256 prepare_ratio=0.61"
+    ) in text
     assert "background_compaction_triggers: publication=90000 emergency=100000" in text
     assert (
         "background_compaction_frontier: durable=456 debt=32123 coverage=raw"
@@ -166,6 +245,11 @@ def test_text_status_surfaces_policy_frontier_debt_permits_and_exact_events():
         "publishable=no updated_at=123.457"
     ) in text
     assert "background_compaction_durable_event_counts:" in text
+    assert "background_compaction_publication_telemetry:" in text
+    assert "background_compaction_last_provider_attempt:" in text
+    assert "background_compaction_recent_provider_outcomes_24h:" in text
+    assert "background_compaction_provider_attribution:" in text
+    assert "background_compaction_range_dispositions:" in text
     for reason in _BACKGROUND_DIAGNOSTIC_REASONS:
         assert f'"{reason}":' in text
     assert "not_a_stable_reason" not in text
@@ -186,6 +270,123 @@ def test_status_failure_keeps_configured_and_effective_state_distinct():
     assert payload["durable_event_counts"] == {}
     assert payload["durable_event_reasons"] == []
     assert "top-secret" not in payload["status_error"]
+
+
+def test_doctor_warns_when_background_status_collection_fails(
+    tmp_path,
+    monkeypatch,
+):
+    config = LCMConfig(
+        database_path=str(tmp_path / "broken-status-doctor.db"),
+        background_compaction_enabled=True,
+        background_compaction_workers=0,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes-home"))
+    engine.on_session_start("scope-a", platform="cli", context_length=200_000)
+    try:
+        def broken_status() -> dict:
+            raise RuntimeError("token=top-secret")
+
+        monkeypatch.setattr(engine, "get_background_compaction_status", broken_status)
+
+        check = _doctor_background_check(engine)
+
+        assert check["detail"]["configured_enabled"] is True
+        assert check["detail"]["enabled"] is False
+        assert "top-secret" not in check["detail"]["status_error"]
+        assert check["status"] == "warn"
+    finally:
+        engine.shutdown()
+
+
+def _doctor_background_check(engine: LCMEngine) -> dict:
+    doctor = json.loads(lcm_doctor({}, engine=engine))
+    return next(
+        check
+        for check in doctor["checks"]
+        if check["check"] == "background_compaction"
+    )
+
+
+def test_doctor_warns_when_enabled_background_worker_is_unavailable(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "worker-unavailable-doctor.db"),
+        background_compaction_enabled=True,
+        background_compaction_workers=0,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes-home"))
+    engine.on_session_start("scope-a", platform="cli", context_length=200_000)
+    try:
+        check = _doctor_background_check(engine)
+
+        assert check["detail"]["enabled"] is True
+        assert check["detail"]["worker_available"] is False
+        assert "worker_unavailable" in check["detail"]["diagnostic_reasons"]
+        assert check["status"] == "warn"
+    finally:
+        engine.shutdown()
+
+
+def test_doctor_warns_while_timed_out_provider_permit_is_active(
+    tmp_path,
+    monkeypatch,
+):
+    config = LCMConfig(
+        database_path=str(tmp_path / "timed-out-permit-doctor.db"),
+        background_compaction_enabled=True,
+        background_compaction_workers=0,
+        background_compaction_lease_seconds=30,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes-home"))
+    engine.on_session_start("scope-a", platform="cli", context_length=200_000)
+    background = engine._background_compaction
+    assert background is not None
+    try:
+        generation = background.get_publishable_session_fence_generation(
+            conversation_id=engine.current_conversation_id,
+            session_id="scope-a",
+        )
+        assert generation is not None
+        permit = background.acquire_emergency_provider_permit(
+            conversation_id=engine.current_conversation_id,
+            session_id="scope-a",
+            expected_session_fence_generation=generation,
+            owner="timed-out-doctor-test",
+            lease_seconds=30,
+        )
+        assert permit is not None
+        background.connection.execute(
+            """
+            UPDATE lcm_compaction_provider_leases
+            SET timed_out_at=?
+            WHERE job_id=?
+            """,
+            (time.time(), permit.job_id),
+        )
+        real_status = engine.get_background_compaction_status
+
+        def available_worker_status() -> dict:
+            status = real_status()
+            status["worker_available"] = True
+            status["worker_count"] = 1
+            return status
+
+        monkeypatch.setattr(
+            engine,
+            "get_background_compaction_status",
+            available_worker_status,
+        )
+
+        check = _doctor_background_check(engine)
+
+        assert check["detail"]["enabled"] is True
+        assert check["detail"]["worker_available"] is True
+        assert check["detail"]["timed_out_provider_permits"] == 1
+        assert check["detail"]["retry_jobs"] == 0
+        assert check["detail"]["recent_provider_outcomes"] == {}
+        assert check["status"] == "warn"
+    finally:
+        engine.shutdown()
 
 
 def test_lcm_status_keeps_durable_events_scoped_to_active_conversation(tmp_path):

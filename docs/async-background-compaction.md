@@ -12,20 +12,21 @@ The design has five non-negotiable invariants:
 
 ## Configuration
 
-All eight settings are explicit environment overrides. Defaults preserve existing foreground-only behavior because the master enable flag is false.
+All nine settings are explicit environment overrides. Defaults preserve existing foreground-only behavior because the master enable flag is false.
 
 | Config field | Environment variable | Default | Meaning |
 | --- | --- | ---: | --- |
 | `background_compaction_enabled` | `LCM_BACKGROUND_COMPACTION_ENABLED` | `false` | Enables the optional store, preparation, and foreground publication paths. |
 | `background_compaction_workers` | `LCM_BACKGROUND_COMPACTION_WORKERS` | `1` | Process-local worker request. Normalization clamps this to `0` or `1`; `0` keeps operator/test one-shot preparation available without an automatic worker. |
-| `background_compaction_global_limit` | `LCM_BACKGROUND_COMPACTION_GLOBAL_LIMIT` | `2` | Maximum live provider permits across all processes sharing the database. |
+| `background_compaction_global_limit` | `LCM_BACKGROUND_COMPACTION_GLOBAL_LIMIT` | `2` | Maximum live provider permits across all processes sharing the database; normalized to the safe range `1..2`. |
 | `background_compaction_max_passes` | `LCM_BACKGROUND_COMPACTION_MAX_PASSES` | `4` | Maximum source chunks/provider passes captured in one job. |
 | `background_compaction_job_timeout_seconds` | `LCM_BACKGROUND_COMPACTION_JOB_TIMEOUT_SECONDS` | `120` | Total wall-clock deadline shared by every provider call in one job. |
 | `background_compaction_lease_seconds` | `LCM_BACKGROUND_COMPACTION_LEASE_SECONDS` | `300` | Job, publication, and provider-permit lease duration; live work heartbeats it. |
 | `background_compaction_backlog_tokens` | `LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS` | `32000` | Durable old-raw backlog that independently makes preparation eligible. |
+| `background_compaction_min_provider_source_tokens` | `LCM_BACKGROUND_COMPACTION_MIN_PROVIDER_SOURCE_TOKENS` | `256` | Provider-input floor; smaller isolated ranges use an exact lossless local projection and make no provider call. |
 | `background_compaction_prepare_ratio` | `LCM_BACKGROUND_COMPACTION_PREPARE_RATIO` | `0.55` | Active-token pressure fraction that independently makes preparation eligible. |
 
-Integer limits except worker count normalize to at least 1. The preparation ratio clamps to `[0.0, 1.0]`; an invalid or non-finite value returns to `0.55`.
+Integer limits except worker count normalize to at least 1. The global provider limit additionally clamps to at most 2. The preparation ratio clamps to `[0.0, 1.0]`; an invalid or non-finite value returns to `0.55`.
 
 `background_compaction_global_limit` is not a thread-pool size. Every enabled Hermes process may request its one process-local worker, while durable provider permits enforce the shared cross-process limit.
 
@@ -86,7 +87,7 @@ Q = max(1, E - max(32000, floor(0.05 * E)))    when E > 0
 Q = 0                                          when E <= 0
 ```
 
-At or above `Q`, or when the existing overflow-recovery guard fires, the engine enters the foreground fallback when preparation is absent, stale, blocked, or too small. This fallback shares one 15-second deadline from the start of the background-mode foreground compaction and permits at most one automatic leaf pass. Immediately before starting its provider thread, it atomically acquires a permit from the same durable global/per-conversation pool as background workers. If either capacity or the conversation permit is unavailable, it does not wait or call the provider; it uses deterministic overflow recovery instead. A successful permit is held through canonical publication. If the daemon provider thread ignores its timeout, the foreground stops waiting at the deadline and never publishes that late result, while an independent guardian heartbeats the permit until the physical call returns and then releases it.
+At or above `Q`, or when the existing overflow-recovery guard fires, the engine enters the foreground fallback when preparation is absent, stale, blocked, or too small. One 15-second monotonic deadline begins at public `compress()` entry and covers token counting, reconciliation, ingest and SQLite waits, canonical-frontier adoption, publication, context reconstruction, and at most one automatic provider leaf pass. Expiry returns the exact caller message list, records the stage, and leaves durable rows/background work intact. Immediately before starting its provider thread, the engine atomically acquires a permit from the same durable global/per-conversation pool as background workers. If either capacity or the conversation permit is unavailable, it does not wait or call the provider; it uses deterministic overflow recovery instead. A successful permit is held through canonical publication. If the daemon provider thread ignores its timeout, the foreground stops waiting at the deadline and never publishes that late result, while an independent guardian heartbeats the permit until the physical call returns and then releases it.
 
 If a prepared batch publishes at emergency pressure but the rebuilt prompt remains at or above `Q`, the engine continues into the same one-pass/shared-deadline emergency fallback. Manual `force=True` compaction retains the existing synchronous/manual behavior rather than entering background mode.
 
@@ -103,6 +104,9 @@ The optional schema is created lazily only when an enabled engine opens `Backgro
 - `lcm_compaction_node_sources`: normalized `(node_id, session_id, store_id)` lineage used only to elect a surviving owner when legacy duplicate leaves are reassigned or deleted. It is derived from `summary_nodes` and backfilled in bounded batches.
 - `lcm_compaction_node_edges`: normalized parent-declared DAG edges used by active-frontier and repair-topology checks. An edge is active only while its parent and child are both live in the edge's parent session.
 - `lcm_compaction_dag_epochs`: a monotonic per-session mutation generation. Repair jobs bind this generation before provider I/O and require the identical generation at publication.
+- `lcm_compaction_range_dispositions`: durable terminal or locally prepared range outcomes keyed by conversation, session, fence, frontier, watermark, policy, and exact source identity. Identical terminal work stays suppressed across restarts and processes until one of those inputs changes.
+- `lcm_compaction_attempts`: bounded, content-free route-attempt telemetry including actual provider/model attribution when the host supplies it, latency, outcome class, token counts, and fallback selection.
+- `lcm_compaction_publications`: one content-free audit row per successful publication CAS, including the fence, observed active tokens, effective window, calculated publication/emergency triggers, fixed-reserve policy, provider/model, and prepared-to-published wait.
 
 Indexes provide:
 
@@ -175,6 +179,8 @@ Capture:
 6. Keeps an assistant tool call and its contiguous tool results in one atomic chunk.
 7. Uses the configured leaf size, including dynamic doubling up to `dynamic_leaf_chunk_max`, and caps the job at `background_compaction_max_passes` chunks.
 
+If the exact provider-visible source is below `background_compaction_min_provider_source_tokens`, capture prepares a deterministic `lossless_raw_projection` locally. The projection contains the policy-redacted serialized rows verbatim, owns the exact raw IDs, and is attributed to `local` / `deterministic/lossless-raw-v1`; it never calls an LLM. This lets an isolated externalized marker or other tiny canonical gap advance without pretending it was summarized, while exact expansion still reads the authoritative raw rows.
+
 Once claimed, a job's watermark is immutable; later foreground rows remain above it. An explicit coalesce may extend a still-queued or retrying request before its next claim, but merely appending raw rows does not move the stored watermark.
 
 The job stores two related lineages:
@@ -219,7 +225,7 @@ Claim uses a short `BEGIN IMMEDIATE` transaction. In that transaction it:
 
 The worker heartbeats both records. Every worker progress/completion write validates owner, generation, and unexpired lease, so a late worker from an expired generation cannot save progress or publish.
 
-Reset and compression carry-over first close the old session's durable publication fence and supersede active jobs in the same transaction, then prune or reassign DAG nodes. A reset that cannot acquire this short fence fails closed by preserving derived nodes. The lifecycle reset epoch is recorded only after batched DAG mutation completes. Fence activation rechecks the lifecycle session plus bind/reset epochs inside its own writer transaction, so a stale process cannot overwrite a newer process's bind; a transient lock can be retried on a later foreground turn without reopening an in-progress reset. Prepared publication, foreground emergency permit acquisition, and final emergency publication all require the originally captured fence generation.
+Reset and compression carry-over first close the old session's durable publication fence and supersede active jobs in the same transaction, then prune or reassign DAG nodes. A reset that cannot acquire this short fence fails closed by preserving derived nodes. The lifecycle reset epoch is recorded only after batched DAG mutation completes. Fence activation rechecks the lifecycle session plus bind/reset epochs inside its own writer transaction, so a stale process cannot overwrite a newer process's bind; a transient lock can be retried on a later foreground turn without reopening an in-progress reset. Rebinding the same conversation and session after an ordinary finalized tool/API turn restores its valid frontier and keeps the current fence generation; only a reset, rollover, reassignment, stale frontier/source, policy change, or explicit administrative invalidation advances the fence. Prepared publication, foreground emergency permit acquisition, and final emergency publication all require the originally captured fence generation.
 
 ### Partial progress and retry
 
@@ -233,7 +239,7 @@ Retry delay is exponential and bounded:
 delay = min(300 seconds, 5 * 2^(attempt_count - 1))
 ```
 
-The fifth failed attempt is terminal `failed`. Provider exception bodies are never persisted. Durable errors contain only an allowlisted exception class, failure category, and optional numeric HTTP status; legacy free-form values are replaced with an opaque redacted marker on operator surfaces.
+The fifth failed attempt is terminal `failed`. A terminal range disposition records the exact conversation/session/fence/frontier/watermark/policy/source identity, so another turn or process cannot recreate identical work. Changed source material, frontier, fence, or policy naturally produces a different key and can be prepared. A non-compressing final escalation is terminal immediately rather than consuming five identical job attempts. Provider exception bodies are never persisted. Durable errors contain only an allowlisted exception class, failure category, and optional numeric HTTP status; legacy free-form values are replaced with an opaque redacted marker on operator surfaces.
 
 Expired `running` work returns to due `retry` with a new lease generation. An expired publication lease on `prepared` work is cleared without discarding the prepared nodes.
 
@@ -286,6 +292,10 @@ Background state is included in `lcm_status`, `lcm_inspect`, `lcm_doctor`, and t
 - current job state, frontier/watermark, debt, attempts, lease time remaining, retry time, and scrubbed error;
 - current publication-fence generation, publishability, and last update time;
 - last preparation and publication result;
+- last foreground-deadline outcome and precise exhausted stage;
+- last publication proof: observed active tokens, effective window, calculated publication/emergency triggers, fixed-reserve policy, fence, and prepared wait;
+- recent content-free provider outcomes and the last actual route attempt, including latency, token counts, fallback, and whether attribution was available;
+- prepared-node attribution coverage and unresolved durable range dispositions;
 - backlog, prepare-ratio, publication, and emergency thresholds;
 - durable frontier and process-local active coverage;
 - active/timed-out provider-permit counts, oldest age, and minimum remaining lease; and
@@ -302,6 +312,18 @@ Recognized reason codes are:
 | `prepared_summary_superseded` | Prepared or in-flight work lost to a policy/session/frontier change or another publisher. |
 | `foreground_emergency_compaction` | The bounded synchronous fallback published progress. |
 | `provider_timeout` | A background provider exceeded the shared job deadline. |
+| `provider_connection_error` | The selected provider could not be reached. |
+| `provider_auth_error` | The provider rejected authentication (HTTP 401/403). |
+| `provider_quota` | The provider reported exhausted payment/quota capacity. |
+| `provider_rate_limit` | The provider rate-limited the route. |
+| `invalid_provider_response` | The provider returned an unusable response shape. |
+| `reasoning_only_output` | The provider returned reasoning but no usable summary. |
+| `non_compressing_output` | The provider output did not reduce the selected source. |
+| `insufficient_compressible_source` | The isolated provider-visible source was too small; it was represented losslessly without a provider call. |
+| `provider_circuit_open` | The summary circuit breaker rejected the attempt. |
+| `provider_spend_guard` | The configured spend guard rejected the attempt. |
+| `stale_lease` | The worker lost its generation-fenced job or provider permit. |
+| `foreground_deadline_exhausted` | Foreground work stopped at its shared 15-second deadline and preserved the caller view. |
 | `lease_expiration` | A job/publication lease expired or a generation lost ownership. |
 | `sqlite_lock_contention` | A bounded queue/publication write could not obtain SQLite's writer lock. |
 | `worker_unavailable` | Background mode is enabled but this process has no live runtime for the database. |
@@ -311,9 +333,9 @@ Recognized reason codes are:
 | `partial_atomic_repair_pending` | A mixed-ownership legacy assistant/tool group is waiting for its exact bridge-and-parent repair; emergency foreground compaction is failing closed. |
 | `partial_atomic_repair_published` | The exact legacy atomic-group bridge and parent committed with their frontier CAS. |
 
-`lcm_doctor` treats prepared/published/superseded/reset-fence/canonical-prefix outcomes as observations. It warns for retry/failed work and for provider, lease, SQLite, or worker faults.
+`lcm_doctor` treats durable historical events and terminal jobs as observations. It warns for current retry work, status-read faults, or failed provider attempts in the bounded recent telemetry window; an old recovered timeout does not leave health permanently yellow.
 
-The event ledger recognizes all thirteen codes and prunes oldest rows to a bounded retention limit. Conversation-scoped status never leaks results, events, or permits from another conversation; aggregate status is available only when no conversation scope is requested.
+The event ledger recognizes the documented codes and prunes oldest rows to a bounded retention limit. Conversation-scoped status never leaks results, events, attempts, dispositions, publications, or permits from another conversation; aggregate status is available only when no conversation scope is requested.
 
 ## Operational rollout
 

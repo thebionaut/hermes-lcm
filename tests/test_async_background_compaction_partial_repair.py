@@ -25,6 +25,7 @@ def _config(db_path, **overrides):
         background_compaction_enabled=True,
         background_compaction_workers=0,
         background_compaction_backlog_tokens=1,
+        background_compaction_min_provider_source_tokens=1,
         background_compaction_prepare_ratio=0.0,
         background_compaction_max_passes=4,
         background_compaction_lease_seconds=300,

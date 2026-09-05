@@ -391,6 +391,7 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_BACKGROUND_COMPACTION_JOB_TIMEOUT_SECONDS` | `120` | Shared wall-clock deadline for all provider calls in one job |
 | `LCM_BACKGROUND_COMPACTION_LEASE_SECONDS` | `300` | Job, publication, and provider-permit lease duration |
 | `LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS` | `32000` | Old durable raw backlog that makes preparation eligible |
+| `LCM_BACKGROUND_COMPACTION_MIN_PROVIDER_SOURCE_TOKENS` | `256` | Ranges below this provider-input floor use an exact, lossless local projection instead of an LLM call |
 | `LCM_BACKGROUND_COMPACTION_PREPARE_RATIO` | `0.55` | Active-context pressure that independently makes preparation eligible |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |

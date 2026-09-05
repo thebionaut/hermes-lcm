@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Sequence
+import threading
+import time
+from typing import Any, Callable, Mapping, Sequence
 
-from .externalize import load_externalized_payload, maybe_externalize_tool_output
+from .externalize import (
+    ExternalizationOwnership,
+    load_externalized_payload,
+    maybe_externalize_tool_output,
+)
 from .extraction import (
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
@@ -23,13 +29,35 @@ from .message_content import stored_text_content_for_pattern_matching
 from .message_patterns import compile_message_patterns, matches_message_pattern
 
 
+def _require_projection_active(
+    *,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+    now: Callable[[], float] | None,
+) -> None:
+    clock = now or time.monotonic
+    if (
+        (cancel_event is not None and cancel_event.is_set())
+        or (deadline is not None and float(clock()) >= float(deadline))
+    ):
+        raise TimeoutError("summary serialization deadline exceeded")
+
+
 def _externalized_text_parts(
     message: Mapping[str, Any],
     *,
     config: Any,
     session_id: str,
     hermes_home: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
 ) -> list[str]:
+    _require_projection_active(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    )
     ref_sources: list[str] = []
     content = message.get("content")
     if isinstance(content, str):
@@ -48,10 +76,20 @@ def _externalized_text_parts(
     parts: list[str] = []
     message_session_id = str(message.get("session_id") or session_id or "")
     for ref in refs:
+        _require_projection_active(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
         payload = load_externalized_payload(
             ref,
             config=config,
             hermes_home=hermes_home,
+        )
+        _require_projection_active(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
         )
         if not payload:
             continue
@@ -75,8 +113,16 @@ def filter_summary_messages(
     session_id: str = "",
     hermes_home: str = "",
     resolve_externalized: bool = True,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply stored-row ignore policy and dependent-reply suppression."""
+    _require_projection_active(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    )
     compiled = compile_message_patterns(
         list(getattr(config, "ignore_message_patterns", ()) or ())
     )
@@ -86,6 +132,11 @@ def filter_summary_messages(
     kept: list[dict[str, Any]] = []
     drop_dependent_reply = False
     for value in messages:
+        _require_projection_active(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
         message = dict(value)
         role = str(message.get("role") or "")
         content = stored_text_content_for_pattern_matching(message.get("content")) or ""
@@ -98,6 +149,9 @@ def filter_summary_messages(
                     config=config,
                     session_id=session_id,
                     hermes_home=hermes_home,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
                 )
                 if part
             )
@@ -110,6 +164,11 @@ def filter_summary_messages(
         if role in {"user", "system"}:
             drop_dependent_reply = False
         kept.append(message)
+    _require_projection_active(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    )
     return kept
 
 
@@ -119,12 +178,26 @@ def serialize_summary_messages(
     config: Any,
     session_id: str = "",
     hermes_home: str = "",
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> str:
     """Serialize messages through the canonical summary-provider scrub."""
+    _require_projection_active(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    )
     normalized = [dict(message) for message in messages]
     parts: list[str] = []
     matched_tool_ids = _matched_tool_call_ids(normalized)
     for message in normalized:
+        _require_projection_active(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
         role = message.get("role", "unknown")
         content = redact_sensitive_value(
             message.get("content") or "",
@@ -139,6 +212,15 @@ def serialize_summary_messages(
                 session_id=session_id,
                 config=config,
                 hermes_home=hermes_home,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
+            )
+            _require_projection_active(
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
             )
             if externalized:
                 content = externalized["placeholder"]
@@ -171,6 +253,11 @@ def serialize_summary_messages(
             if matched_tool_calls:
                 call_parts: list[str] = []
                 for tool_call in matched_tool_calls:
+                    _require_projection_active(
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                        now=now,
+                    )
                     if not isinstance(tool_call, dict):
                         continue
                     function = tool_call.get("function", {})
@@ -191,6 +278,11 @@ def serialize_summary_messages(
         if len(content) > 3000:
             content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
         parts.append(f"[{str(role).upper()}]: {content}")
+    _require_projection_active(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    )
     return "\n\n".join(parts)
 
 
@@ -200,6 +292,9 @@ def project_active_replay_messages(
     config: Any,
     session_id: str = "",
     hermes_home: str = "",
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
 ) -> list[dict[str, Any]]:
     """Project durable raw rows into a policy-safe active replay view.
 
@@ -208,20 +303,38 @@ def project_active_replay_messages(
     ignore/dependent-message filter and sensitive-value redaction here.  The
     summary serializer owns pre-compaction cleanup and truncation.
     """
+    _require_projection_active(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    )
     filtered = filter_summary_messages(
         messages,
         config=config,
         session_id=session_id,
         hermes_home=hermes_home,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
     )
     projected: list[dict[str, Any]] = []
     for message in filtered:
+        _require_projection_active(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
         protected = redact_sensitive_value(
             dict(message),
             config,
             parse_json_strings=True,
         )
         projected.append(protected)
+    _require_projection_active(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    )
     return projected
 
 

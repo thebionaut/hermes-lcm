@@ -46,6 +46,7 @@ def test_lazy_migration_backfills_existing_canonical_message_coverage(tmp_path):
         database_path=str(db_path),
         background_compaction_enabled=True,
         background_compaction_workers=0,
+        background_compaction_min_provider_source_tokens=1,
     )
     background = BackgroundCompactionStore(db_path, config=config)
     try:
@@ -836,6 +837,7 @@ def _legacy_prefix_fixture(
         database_path=str(db_path),
         background_compaction_enabled=True,
         background_compaction_workers=0,
+        background_compaction_min_provider_source_tokens=1,
     )
     background = BackgroundCompactionStore(db_path, config=config)
     generation = background.activate_session(

@@ -22,6 +22,7 @@ def _config(db_path):
         background_compaction_workers=0,
         background_compaction_global_limit=2,
         background_compaction_backlog_tokens=1,
+        background_compaction_min_provider_source_tokens=1,
         background_compaction_prepare_ratio=0.55,
         fresh_tail_count=1,
         fresh_tail_max_tokens=0,

@@ -21,7 +21,7 @@ from agent.context_engine import ContextEngine
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
-from hermes_lcm.externalize import externalize_ingest_payload
+from hermes_lcm.externalize import externalize_ingest_payload, resolve_large_output_storage_dir
 from hermes_lcm.tokens import count_message_tokens, count_messages_tokens
 
 
@@ -7841,6 +7841,7 @@ class TestMessageFiltering:
             hermes_home=str(hermes_home),
         )
         try:
+            resolve_large_output_storage_dir(first._config, hermes_home=str(hermes_home))
             first.on_session_start("session", platform="telegram", context_length=1000)
             active = first.compress(
                 [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}],
@@ -7888,6 +7889,7 @@ class TestMessageFiltering:
             hermes_home=str(hermes_home),
         )
         try:
+            resolve_large_output_storage_dir(first._config, hermes_home=str(hermes_home))
             first.on_session_start("session", platform="telegram", context_length=1000)
             active = first.compress(
                 [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}],
@@ -8909,6 +8911,7 @@ class TestMessageFiltering:
             )
         )
         try:
+            resolve_large_output_storage_dir(second._config)
             second.on_session_start("session", platform="telegram", context_length=1000)
             messages = [
                 {"role": "user", "content": placeholder},
@@ -11704,7 +11707,7 @@ class TestEngineCompress:
         finally:
             instance.shutdown()
 
-    def test_threshold_full_sweep_stops_between_calls_at_time_budget(self, tmp_path, monkeypatch):
+    def test_threshold_full_sweep_stops_between_calls_at_foreground_deadline(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
             leaf_chunk_tokens=1,
@@ -11721,30 +11724,53 @@ class TestEngineCompress:
             {"role": "user", "content": "fresh"},
             {"role": "assistant", "content": "answer"},
         ]
-        monotonic_calls = 0
+        now = 0.0
+        leaf_calls = 0
 
         def fake_monotonic():
-            nonlocal monotonic_calls
-            monotonic_calls += 1
-            return 0.0 if monotonic_calls <= 2 else 121.0
+            return now
 
         def fake_leaf(chunk, focus_topic=None, deadline=None):
+            nonlocal leaf_calls
             del focus_topic, deadline
+            leaf_calls += 1
             return chunk, count_messages_tokens(chunk), "timed summary", 1, 0
+
+        original_checkpoint = instance._foreground_deadline_checkpoint
+
+        def expire_after_completed_leaf(deadline, stage, detail=""):
+            nonlocal now
+            original_checkpoint(deadline, stage, detail)
+            if stage == "foreground compaction sweep" and leaf_calls == 1:
+                now = 16.0
 
         import hermes_lcm.compaction as compaction_module
 
         monkeypatch.setattr(compaction_module, "_AUTOMATIC_FOREGROUND_MAX_PASSES", 2)
-        monkeypatch.setattr(compaction_module.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(
+            instance,
+            "_foreground_monotonic",
+            fake_monotonic,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            instance,
+            "_foreground_deadline_checkpoint",
+            expire_after_completed_leaf,
+        )
         monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
         try:
-            instance.compress(messages, current_tokens=count_messages_tokens(messages))
-            telemetry = instance.get_status()["threshold_full_sweep"]
+            result = instance.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+            )
 
-            assert telemetry["leaf_passes"] == 1
-            assert telemetry["status"] == "partial"
-            assert telemetry["stop_reason"] == "time_budget_exhausted"
-            assert telemetry["budget_exhausted"] is True
+            assert result is messages
+            assert leaf_calls == 1
+            assert len(instance._dag.get_session_nodes("test-session")) == 1
+            assert instance.last_compression_noop_reason == (
+                "foreground deadline exhausted during foreground compaction sweep"
+            )
         finally:
             instance.shutdown()
 
@@ -25141,7 +25167,9 @@ class TestEngineTools:
             large_output_externalization_threshold_chars=200,
             large_output_transcript_gc_enabled=True,
         )
-        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        hermes_home = str(tmp_path / "hermes")
+        resolve_large_output_storage_dir(config, hermes_home=hermes_home)
+        engine = LCMEngine(config=config, hermes_home=hermes_home)
         engine._session_id = "test-session"
         engine.context_length = 200000
         engine.threshold_tokens = int(200000 * config.context_threshold)
@@ -25190,7 +25218,9 @@ class TestEngineTools:
             large_output_externalization_threshold_chars=200,
             large_output_transcript_gc_enabled=True,
         )
-        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        hermes_home = str(tmp_path / "hermes")
+        resolve_large_output_storage_dir(config, hermes_home=hermes_home)
+        engine = LCMEngine(config=config, hermes_home=hermes_home)
         engine._session_id = "test-session"
         engine.context_length = 200000
         engine.threshold_tokens = int(200000 * config.context_threshold)
@@ -25328,7 +25358,9 @@ class TestEngineTools:
             large_output_externalization_threshold_chars=200,
             large_output_transcript_gc_enabled=True,
         )
-        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        hermes_home = str(tmp_path / "hermes")
+        resolve_large_output_storage_dir(config, hermes_home=hermes_home)
+        engine = LCMEngine(config=config, hermes_home=hermes_home)
         engine._session_id = "test-session"
         engine.context_length = 200000
         engine.threshold_tokens = int(200000 * config.context_threshold)

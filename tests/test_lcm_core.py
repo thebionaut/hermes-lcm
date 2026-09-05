@@ -612,6 +612,7 @@ class TestConfig:
         assert c.background_compaction_job_timeout_seconds == 120
         assert c.background_compaction_lease_seconds == 300
         assert c.background_compaction_backlog_tokens == 32_000
+        assert c.background_compaction_min_provider_source_tokens == 256
         assert c.background_compaction_prepare_ratio == 0.55
 
     def test_background_compaction_from_exact_env_names(self, monkeypatch, tmp_path):
@@ -643,6 +644,11 @@ class TestConfig:
                 "LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS",
                 "32000",
                 32_000,
+            ),
+            "background_compaction_min_provider_source_tokens": (
+                "LCM_BACKGROUND_COMPACTION_MIN_PROVIDER_SOURCE_TOKENS",
+                "256",
+                256,
             ),
             "background_compaction_prepare_ratio": (
                 "LCM_BACKGROUND_COMPACTION_PREPARE_RATIO",
@@ -6568,6 +6574,7 @@ class TestIngestExternalization:
         from hermes_lcm.engine import LCMEngine
 
         engine, output_dir = self._engine(tmp_path)
+        output_dir.mkdir()
         content = "ACTIVE_RAW_NEEDLE:" + ("r" * 5000)
         messages = [{"role": "user", "content": content}]
 
@@ -6609,7 +6616,8 @@ class TestIngestExternalization:
         assert rows[-1]["content"] == "followup"
 
     def test_preflight_requests_cleanup_for_oversized_raw_payload_stub(self, tmp_path):
-        engine, _output_dir = self._engine(tmp_path)
+        engine, output_dir = self._engine(tmp_path)
+        output_dir.mkdir()
         content = "PREFLIGHT_RAW_NEEDLE:" + ("r" * 5000)
         messages = [{"role": "user", "content": content}]
 
@@ -7070,6 +7078,7 @@ class TestExtraction:
                     "content": "Please save this image for later\n\ndata:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA",
                 },
             ])
+            assert engine._extraction_persistence_idle.wait(timeout=2)
         finally:
             ext_module._call_extraction_llm = original
 
@@ -7169,6 +7178,7 @@ class TestExtraction:
                 {"role": "user", "content": "Let's use Redis"},
                 {"role": "assistant", "content": "Done"},
             ])
+            assert engine._extraction_persistence_idle.wait(timeout=2)
             extraction_dir = tmp_path / "hermes" / "lcm-extractions"
             files = list(extraction_dir.glob("*.md"))
             assert len(files) == 1

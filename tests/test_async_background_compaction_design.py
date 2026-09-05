@@ -53,6 +53,7 @@ def _config(db_path, **overrides):
         background_compaction_job_timeout_seconds=120,
         background_compaction_lease_seconds=300,
         background_compaction_backlog_tokens=1,
+        background_compaction_min_provider_source_tokens=1,
         background_compaction_prepare_ratio=0.55,
         fresh_tail_count=2,
         fresh_tail_max_tokens=0,
@@ -401,6 +402,73 @@ def test_atomic_claim_and_global_limit_across_independent_connections(tmp_path):
     finally:
         first.close()
         second.close()
+
+
+def test_global_provider_limit_configuration_is_clamped_to_two(tmp_path):
+    config = _config(
+        tmp_path / "configured-global-cap.db",
+        background_compaction_global_limit=99,
+    )
+
+    assert config.background_compaction_global_limit == 2
+
+
+@pytest.mark.parametrize("admission_path", ["job_claim", "emergency"])
+def test_untrusted_provider_limit_cannot_admit_more_than_two_cross_connection(
+    tmp_path,
+    admission_path,
+):
+    db_path = tmp_path / f"hard-global-cap-{admission_path}.db"
+    config = _config(db_path)
+    # Exercise defense in depth after config construction, as a stale embedder
+    # can mutate or pass an unvalidated value directly to the store API.
+    config.background_compaction_global_limit = 99
+    stores: list[BackgroundCompactionStore] = []
+    try:
+        if admission_path == "job_claim":
+            source_ranges = [
+                _seed(
+                    db_path,
+                    session=f"session-{index}",
+                    conversation=f"conversation-{index}",
+                )
+                for index in range(3)
+            ]
+        stores = [
+            BackgroundCompactionStore(db_path, config=config)
+            for _ in range(3)
+        ]
+        if admission_path == "job_claim":
+            for index, source_ids in enumerate(source_ranges):
+                _explicit_job(
+                    stores[0],
+                    source_ids,
+                    session=f"session-{index}",
+                    conversation=f"conversation-{index}",
+                )
+            admitted = [
+                store.claim_next_job(
+                    owner=f"worker-{index}",
+                    global_limit=99,
+                )
+                for index, store in enumerate(stores)
+            ]
+        else:
+            admitted = [
+                store.acquire_emergency_provider_permit(
+                    conversation_id=f"conversation-{index}",
+                    owner=f"foreground-{index}",
+                    global_limit=99,
+                )
+                for index, store in enumerate(stores)
+            ]
+
+        assert sum(item is not None for item in admitted) == 2
+        assert stores[0].status()["active_provider_permits"] == 2
+        assert stores[0].status()["global_limit"] == 2
+    finally:
+        for store in stores:
+            store.close()
 
 
 def test_heartbeat_expiry_reclaim_and_late_worker_fence(tmp_path):

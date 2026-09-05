@@ -19,7 +19,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import Any, BinaryIO, Dict
+from typing import Any, BinaryIO, Callable, Dict
 
 DEFAULT_LARGE_OUTPUT_DIRNAME = "lcm-large-outputs"
 _EXTERNALIZED_REF_RE = re.compile(
@@ -36,6 +36,263 @@ def _placeholder_metadata(value: Any) -> str:
 
 
 logger = logging.getLogger(__name__)
+
+
+class ExternalizationDeadlineExceeded(TimeoutError):
+    """Raised before a guarded payload file becomes externally visible."""
+
+
+class ExternalizationRollbackError(RuntimeError):
+    """Raised when a replacement cannot restore its original payload."""
+
+    def __init__(self, path: Path, recovery_path: Path, cause: OSError) -> None:
+        super().__init__(
+            "externalized payload rollback failed for "
+            f"{path}; original retained at {recovery_path}: {cause}"
+        )
+        self.path = path
+        self.recovery_path = recovery_path
+
+
+class ExternalizationCleanupError(RuntimeError):
+    """Raised when deadline compensation cannot durably remove owned files."""
+
+    def __init__(self, paths: tuple[Path, ...]) -> None:
+        rendered = ", ".join(str(path) for path in paths)
+        super().__init__(
+            "externalized payload cleanup failed; deadline-owned files require "
+            f"recovery: {rendered}"
+        )
+        self.paths = paths
+
+
+class ExternalizationOwnership:
+    """Track payload intents owned by one foreground projection.
+
+    A deadline-bound worker only serializes immutable payload intents into this
+    object.  It never opens, writes, fsyncs, or renames a file.  After the worker
+    joins successfully, the foreground caller publishes those intents and can
+    compensate every newly visible file until its durable consumer commits.
+    Reused/pre-existing payloads are never registered and are therefore never
+    deleted by compensation.
+    """
+
+    def __init__(
+        self,
+        *,
+        defer_publication: bool = False,
+        storage_dir: Path | None = None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._state = "open"
+        self._defer_publication = bool(defer_publication)
+        self._storage_dir = storage_dir.resolve() if storage_dir is not None else None
+        self._created_paths: set[Path] = set()
+        self._prepared_paths: dict[Path, Path] = {}
+        self._pending_payloads: dict[Path, str] = {}
+
+    @property
+    def defers_publication(self) -> bool:
+        return self._defer_publication
+
+    def register_created(self, path: Path) -> bool:
+        remove_now = False
+        with self._lock:
+            if self._state != "open":
+                remove_now = True
+                # Retain the path until cleanup succeeds so a persistent
+                # filesystem refusal can be retried instead of being forgotten.
+                self._created_paths.add(path)
+            else:
+                self._created_paths.add(path)
+        if remove_now:
+            if not _unlink_partial_payload(
+                path,
+                invalidate_index=False,
+                durable=True,
+                attempts=2,
+            ):
+                raise ExternalizationCleanupError((path,))
+            with self._lock:
+                self._created_paths.discard(path)
+            return False
+        return True
+
+    def register_pending(self, path: Path, serialized_payload: str) -> bool:
+        """Queue immutable bytes; deferred workers never perform file I/O."""
+        with self._lock:
+            if self._state != "open":
+                return False
+            if self._storage_dir is None or path.parent.resolve() != self._storage_dir:
+                raise OSError(
+                    "deferred externalization storage was not prepared by the foreground"
+                )
+            existing = self._pending_payloads.get(path)
+            if existing is not None and existing != serialized_payload:
+                raise RuntimeError(
+                    f"conflicting externalized payload intent for {path}"
+                )
+            self._pending_payloads[path] = serialized_payload
+            return True
+
+    def publish(
+        self,
+        *,
+        deadline: float | None = None,
+        now: Callable[[], float] | None = None,
+    ) -> None:
+        """Publish prepared files from the joined foreground caller only.
+
+        Worker threads queue immutable serialized payloads and never perform
+        filesystem writes. The joined foreground writes in bounded chunks and
+        checks the wall around every write/fsync/rename. Only an already-entered
+        kernel syscall is non-preemptible.
+        """
+        if not self._defer_publication:
+            return
+        clock = now or time.monotonic
+        while True:
+            with self._lock:
+                if self._state == "aborted":
+                    raise ExternalizationDeadlineExceeded(
+                        "externalized payload owner was cancelled before publication"
+                    )
+                if self._state == "committed":
+                    if self._prepared_paths or self._pending_payloads:
+                        raise RuntimeError(
+                            "committed externalization ownership retained pending files"
+                        )
+                    return
+                if not self._pending_payloads:
+                    return
+                path, serialized_payload = next(iter(self._pending_payloads.items()))
+                prepared_path = path.with_name(
+                    f".{path.name}.{time.time_ns():x}.foreground"
+                )
+                self._prepared_paths[path] = prepared_path
+            if deadline is not None and float(clock()) >= float(deadline):
+                raise ExternalizationDeadlineExceeded(
+                    "externalized payload deadline expired before foreground publication"
+                )
+            try:
+                _write_serialized_payload_guarded(
+                    prepared_path,
+                    serialized_payload,
+                    deadline=deadline,
+                    now=clock,
+                )
+                if deadline is not None and float(clock()) >= float(deadline):
+                    raise ExternalizationDeadlineExceeded(
+                        "externalized payload deadline expired before foreground rename"
+                    )
+                with self._lock:
+                    if self._state != "open":
+                        raise ExternalizationDeadlineExceeded(
+                            "externalized payload owner was cancelled before foreground rename"
+                        )
+                    # Track the destination before the one visibility syscall so
+                    # every post-rename failure is compensatable.
+                    self._created_paths.add(path)
+                prepared_path.replace(path)
+                if deadline is not None and float(clock()) >= float(deadline):
+                    raise ExternalizationDeadlineExceeded(
+                        "externalized payload deadline expired during foreground rename"
+                    )
+                _fsync_directory(path.parent)
+                if deadline is not None and float(clock()) >= float(deadline):
+                    raise ExternalizationDeadlineExceeded(
+                        "externalized payload deadline expired during foreground publication"
+                    )
+                with self._lock:
+                    if self._pending_payloads.get(path) == serialized_payload:
+                        self._pending_payloads.pop(path, None)
+                    if self._prepared_paths.get(path) == prepared_path:
+                        self._prepared_paths.pop(path, None)
+            except BaseException:
+                if not _unlink_partial_payload(
+                    prepared_path,
+                    invalidate_index=False,
+                    durable=True,
+                    attempts=2,
+                ):
+                    raise ExternalizationCleanupError((prepared_path,))
+                with self._lock:
+                    if self._prepared_paths.get(path) == prepared_path:
+                        self._prepared_paths.pop(path, None)
+                raise
+
+    def commit(self) -> None:
+        with self._lock:
+            if self._state == "aborted":
+                return
+            if self._prepared_paths or self._pending_payloads:
+                raise RuntimeError(
+                    "externalization ownership committed before pending files were published"
+                )
+            self._state = "committed"
+            self._created_paths.clear()
+
+    def rollback(self) -> None:
+        with self._lock:
+            if self._state == "committed":
+                return
+            self._state = "aborted"
+            created_paths = tuple(self._created_paths)
+            prepared_items = tuple(self._prepared_paths.items())
+            self._pending_payloads.clear()
+        failed: list[Path] = []
+        cleaned: set[Path] = set()
+        for path in dict.fromkeys(
+            created_paths + tuple(prepared for _final, prepared in prepared_items)
+        ):
+            if _unlink_partial_payload(
+                path,
+                invalidate_index=False,
+                durable=True,
+                attempts=2,
+            ):
+                cleaned.add(path)
+            else:
+                failed.append(path)
+        with self._lock:
+            self._created_paths.difference_update(cleaned)
+            for final_path, prepared_path in prepared_items:
+                if (
+                    prepared_path in cleaned
+                    and self._prepared_paths.get(final_path) == prepared_path
+                ):
+                    self._prepared_paths.pop(final_path, None)
+        if failed:
+            raise ExternalizationCleanupError(tuple(failed))
+
+
+def _externalization_guard_expired(
+    *,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+    now: Callable[[], float] | None,
+) -> bool:
+    clock = now or time.monotonic
+    return bool(
+        (cancel_event is not None and cancel_event.is_set())
+        or (deadline is not None and float(clock()) >= float(deadline))
+    )
+
+
+def _require_externalization_guard(
+    *,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+    now: Callable[[], float] | None,
+) -> None:
+    if _externalization_guard_expired(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    ):
+        raise ExternalizationDeadlineExceeded(
+            "externalized payload deadline expired before publication"
+        )
 
 
 def _tool_call_stub(tool_call_id: str) -> str:
@@ -142,16 +399,73 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
     return path
 
 
-def _unlink_partial_payload(path: Path) -> None:
-    try:
-        path.unlink(missing_ok=True)
-        _invalidate_payload_lookup_index(path.parent)
-    except OSError as exc:
-        logger.warning("Could not remove partial LCM externalized payload %s: %s", path, exc)
+def _unlink_partial_payload(
+    path: Path,
+    *,
+    invalidate_index: bool = True,
+    durable: bool = False,
+    attempts: int = 1,
+) -> bool:
+    """Remove a partial/owned payload with optionally durable compensation.
+
+    Deadline ownership uses two bounded attempts and a parent-directory fsync.
+    It deliberately skips eager cache invalidation: the directory mtime is the
+    cache generation, so the next lookup rebuilds without waiting on the index
+    lock held by an abandoned worker.
+    """
+    bounded_attempts = max(1, int(attempts))
+    last_error: OSError | None = None
+    for _attempt in range(bounded_attempts):
+        try:
+            path.unlink(missing_ok=True)
+            last_error = None
+            break
+        except OSError as exc:
+            last_error = exc
+    if last_error is not None:
+        logger.error(
+            "Could not remove partial LCM externalized payload %s after %d attempts: %s",
+            path,
+            bounded_attempts,
+            last_error,
+        )
+        return False
+
+    if durable:
+        for _attempt in range(bounded_attempts):
+            try:
+                _fsync_directory(path.parent)
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+        if last_error is not None:
+            logger.error(
+                "Could not durably record removal of LCM externalized payload "
+                "%s after %d attempts: %s",
+                path,
+                bounded_attempts,
+                last_error,
+            )
+            return False
+
+    if invalidate_index:
+        try:
+            _invalidate_payload_lookup_index(path.parent)
+        except OSError as exc:
+            # Directory generation invalidation remains authoritative, so an
+            # eager-cache invalidation failure does not make the unlink fail.
+            logger.warning(
+                "Could not eagerly invalidate LCM externalized payload index "
+                "for %s: %s",
+                path.parent,
+                exc,
+            )
+    return True
 
 
-def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
-    data = json.dumps(payload, ensure_ascii=False, indent=2)
+def _write_externalized_payload_direct(path: Path, payload: Dict[str, Any]) -> None:
+    data = _serialize_externalized_payload(payload)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -169,15 +483,259 @@ def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
             os.close(fd)
 
 
-def _replace_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
-    tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+def _serialize_externalized_payload(payload: Dict[str, Any]) -> str:
+    """Return the immutable representation queued by deadline-owned workers."""
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _write_serialized_payload_guarded(
+    path: Path,
+    serialized_payload: str,
+    *,
+    deadline: float | None,
+    now: Callable[[], float] | None,
+) -> None:
+    """Write one private payload with checkpoints around every filesystem step.
+
+    The foreground caller is the only user of this helper.  A syscall already
+    entered when the wall expires cannot be preempted by Python, but no later
+    write, fsync, or publication syscall is started after the next checkpoint.
+    """
+    clock = now or time.monotonic
+
+    def checkpoint() -> None:
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=None,
+            now=clock,
+        )
+
+    checkpoint()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        _write_externalized_payload(tmp_path, payload)
+        checkpoint()
+        data = serialized_payload.encode("utf-8")
+        view = memoryview(data)
+        offset = 0
+        chunk_size = 64 * 1024
+        while offset < len(view):
+            checkpoint()
+            written = os.write(fd, view[offset : offset + chunk_size])
+            if written <= 0:
+                raise OSError("externalized payload write made no progress")
+            offset += written
+            checkpoint()
+        checkpoint()
+        os.fsync(fd)
+        checkpoint()
+    finally:
+        os.close(fd)
+    checkpoint()
+    _fsync_directory(path.parent)
+    checkpoint()
+
+
+def _write_externalized_payload(
+    path: Path,
+    payload: Dict[str, Any],
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
+) -> None:
+    """Durably publish one payload or queue a foreground-only write intent."""
+    if ownership is not None and ownership.defers_publication:
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        serialized_payload = _serialize_externalized_payload(payload)
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        if not ownership.register_pending(path, serialized_payload):
+            raise ExternalizationDeadlineExceeded(
+                "externalized payload owner was cancelled before intent registration"
+            )
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        return
+
+    guarded = (
+        deadline is not None
+        or cancel_event is not None
+        or ownership is not None
+    )
+    if not guarded:
+        _write_externalized_payload_direct(path, payload)
+        return
+
+    _require_externalization_guard(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    )
+    tmp_path = path.with_name(f".{path.name}.{time.time_ns():x}.tmp")
+    published = False
+    try:
+        _write_externalized_payload_direct(tmp_path, payload)
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        if ownership is not None and not ownership.register_created(path):
+            raise ExternalizationDeadlineExceeded(
+                "externalized payload owner was cancelled before publication"
+            )
+        # Payload names are unique.  os.replace is the single visibility point;
+        # the private file is complete and durable before it can be referenced.
+        # Reserve that unique destination with its owner before the rename so
+        # caller rollback can remove it even if the worker is descheduled after
+        # the rename syscall becomes visible but before Path.replace returns.
         tmp_path.replace(path)
+        published = True
+        # Register immediately at the visibility point, before directory fsync
+        # or index invalidation can block. An already-aborted owner removes the
+        # file here; an owner aborted later can unlink it while this worker is
+        # still stuck in post-publication bookkeeping.
+        if ownership is not None and not ownership.register_created(path):
+            published = False
+            raise ExternalizationDeadlineExceeded(
+                "externalized payload owner was cancelled during publication"
+            )
         _fsync_directory(path.parent)
+        if _externalization_guard_expired(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        ):
+            _unlink_partial_payload(path)
+            published = False
+            raise ExternalizationDeadlineExceeded(
+                "externalized payload deadline expired during publication"
+            )
         _invalidate_payload_lookup_index(path.parent)
-    except OSError:
+    except BaseException:
         _unlink_partial_payload(tmp_path)
+        if published:
+            _unlink_partial_payload(path)
+        raise
+
+
+def _replace_externalized_payload(
+    path: Path,
+    payload: Dict[str, Any],
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+) -> None:
+    if deadline is None and cancel_event is None:
+        tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+        try:
+            _write_externalized_payload(tmp_path, payload)
+            tmp_path.replace(path)
+            _fsync_directory(path.parent)
+            _invalidate_payload_lookup_index(path.parent)
+        except OSError:
+            _unlink_partial_payload(tmp_path)
+            raise
+        return
+
+    tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+    backup_path = path.with_name(f".{path.name}.{time.time_ns():x}.rollback")
+    backup_created = False
+    published = False
+    try:
+        _write_externalized_payload(
+            tmp_path,
+            payload,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        if path.exists():
+            os.link(path, backup_path)
+            backup_created = True
+            # The hardlink is the rollback copy for the next atomic replace.
+            # Make its directory entry durable before the original name can be
+            # overwritten, otherwise a crash could lose both old-name entries.
+            _fsync_directory(path.parent)
+            _require_externalization_guard(
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+            )
+        tmp_path.replace(path)
+        published = True
+        _fsync_directory(path.parent)
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        if backup_created:
+            if not _unlink_partial_payload(
+                backup_path,
+                invalidate_index=False,
+                durable=True,
+                attempts=2,
+            ):
+                raise ExternalizationCleanupError((backup_path,))
+            backup_created = False
+        _invalidate_payload_lookup_index(path.parent)
+    except (OSError, ExternalizationDeadlineExceeded):
+        _unlink_partial_payload(tmp_path)
+        restore_failure: OSError | None = None
+        if published:
+            if backup_created:
+                try:
+                    backup_path.replace(path)
+                    backup_created = False
+                    _fsync_directory(path.parent)
+                    _invalidate_payload_lookup_index(path.parent)
+                except OSError as restore_exc:
+                    restore_failure = restore_exc
+                    logger.critical(
+                        "Could not restore LCM externalized payload %s after "
+                        "cancelled metadata replacement; original retained at "
+                        "%s: %s",
+                        path,
+                        backup_path,
+                        restore_exc,
+                    )
+            else:
+                _unlink_partial_payload(path)
+        if restore_failure is not None:
+            # The rollback hardlink is now the only guaranteed copy of the
+            # original bytes.  Keep it for operator recovery and surface an
+            # integrity error instead of reporting a harmless skipped update.
+            raise ExternalizationRollbackError(
+                path,
+                backup_path,
+                restore_failure,
+            ) from restore_failure
+        if backup_created:
+            if not _unlink_partial_payload(
+                backup_path,
+                invalidate_index=False,
+                durable=True,
+                attempts=2,
+            ):
+                raise ExternalizationCleanupError((backup_path,))
         raise
 
 
@@ -523,6 +1081,26 @@ def _merge_persisted_output_marker_metadata(payload: Dict[str, Any], metadata: D
 
 def resolve_large_output_storage_dir(config, hermes_home: str = "") -> Path:
     return get_large_output_storage_dir(config, hermes_home=hermes_home, create=True)
+
+
+def _externalization_storage_dir_for_write(
+    config,
+    hermes_home: str,
+    ownership: ExternalizationOwnership | None,
+) -> Path:
+    """Resolve a write target without letting deferred workers create it."""
+    if ownership is not None and ownership.defers_publication:
+        path = get_large_output_storage_dir(
+            config,
+            hermes_home=hermes_home,
+            create=False,
+        )
+        if not path.is_dir():
+            raise OSError(
+                "deferred externalization storage was not prepared by the foreground"
+            )
+        return path
+    return resolve_large_output_storage_dir(config, hermes_home=hermes_home)
 
 
 def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1194,12 +1772,30 @@ def externalize_ingest_payload(
     config,
     hermes_home: str = "",
     kind: str = "ingest_payload",
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> Dict[str, Any] | None:
     if not content:
         return None
     try:
-        storage_dir = resolve_large_output_storage_dir(config, hermes_home=hermes_home)
-    except OSError as exc:
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        storage_dir = _externalization_storage_dir_for_write(
+            config,
+            hermes_home,
+            ownership,
+        )
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+    except (OSError, ExternalizationDeadlineExceeded) as exc:
         logger.warning("LCM ingest payload externalization skipped (non-blocking): %s", exc)
         return None
 
@@ -1221,11 +1817,20 @@ def externalize_ingest_payload(
         "created_at": time.time(),
     }
     try:
-        _write_externalized_payload(path, payload)
-    except OSError as exc:
+        if deadline is None and cancel_event is None:
+            _write_externalized_payload(path, payload, ownership=ownership)
+        else:
+            _write_externalized_payload(
+                path,
+                payload,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
+            )
+    except (OSError, ExternalizationDeadlineExceeded) as exc:
         logger.warning("LCM ingest payload externalization skipped (non-blocking): %s", exc)
         return None
-
     summary = _externalized_summary(path, payload)
     placeholder = (
         f"[Externalized LCM ingest payload: kind={_placeholder_metadata(summary.get('kind') or kind)}; "
@@ -1236,6 +1841,7 @@ def externalize_ingest_payload(
         "placeholder": placeholder,
         "path": path,
         "payload": payload,
+        "created": True,
     }
 
 
@@ -1247,6 +1853,10 @@ def maybe_externalize_tool_output(
     config,
     hermes_home: str = "",
     force: bool = False,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> Dict[str, Any] | None:
     return maybe_externalize_payload(
         content,
@@ -1257,6 +1867,10 @@ def maybe_externalize_tool_output(
         config=config,
         hermes_home=hermes_home,
         force=force,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+        ownership=ownership,
     )
 
 
@@ -1271,6 +1885,10 @@ def maybe_externalize_payload(
     hermes_home: str = "",
     force: bool = False,
     metadata: Dict[str, Any] | None = None,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> Dict[str, Any] | None:
     """Externalize one normalized payload if configured.
 
@@ -1287,8 +1905,22 @@ def maybe_externalize_payload(
         return None
 
     try:
-        storage_dir = resolve_large_output_storage_dir(config, hermes_home=hermes_home)
-    except OSError as exc:
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+        storage_dir = _externalization_storage_dir_for_write(
+            config,
+            hermes_home,
+            ownership,
+        )
+        _require_externalization_guard(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        )
+    except (OSError, ExternalizationDeadlineExceeded) as exc:
         logger.warning("Large payload externalization skipped (non-blocking): %s", exc)
         return None
 
@@ -1301,25 +1933,61 @@ def maybe_externalize_payload(
         config=config,
         hermes_home=hermes_home,
     )
+    if _externalization_guard_expired(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    ):
+        return None
     if existing is not None:
         existing_path = storage_dir / existing["ref"]
         existing_payload = None
+        metadata_requires_copy = False
         if metadata:
             try:
                 existing_payload = json.loads(existing_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 existing_payload = None
             if existing_payload is not None and _merge_persisted_output_marker_metadata(existing_payload, metadata):
-                try:
-                    _replace_externalized_payload(existing_path, existing_payload)
-                    existing = _externalized_summary(existing_path, existing_payload)
-                except OSError as exc:
-                    logger.warning("Large payload metadata update skipped (non-blocking): %s", exc)
-        return {
-            "placeholder": _build_externalized_placeholder(existing),
-            "path": existing_path,
-            "payload": existing,
-        }
+                if ownership is not None:
+                    # A foreground batch cannot mutate a payload it does not
+                    # own and later compensate by deleting that shared ref.
+                    # Copy-on-write gives the new row its enriched payload while
+                    # leaving the reusable predecessor byte-for-byte intact.
+                    metadata_requires_copy = True
+                else:
+                    try:
+                        if deadline is None and cancel_event is None:
+                            _replace_externalized_payload(
+                                existing_path,
+                                existing_payload,
+                            )
+                        else:
+                            _replace_externalized_payload(
+                                existing_path,
+                                existing_payload,
+                                deadline=deadline,
+                                cancel_event=cancel_event,
+                                now=now,
+                            )
+                        existing = _externalized_summary(existing_path, existing_payload)
+                    except (OSError, ExternalizationDeadlineExceeded) as exc:
+                        logger.warning("Large payload metadata update skipped (non-blocking): %s", exc)
+        if metadata_requires_copy:
+            existing = None
+        else:
+            if _externalization_guard_expired(
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+            ):
+                return None
+            return {
+                "placeholder": _build_externalized_placeholder(existing),
+                "path": existing_path,
+                "payload": existing,
+                "created": False,
+            }
 
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
@@ -1349,11 +2017,20 @@ def maybe_externalize_payload(
         payload.update(_safe_persisted_output_metadata(metadata))
         _merge_persisted_output_marker_metadata(payload, metadata)
     try:
-        _write_externalized_payload(path, payload)
-    except OSError as exc:
+        if deadline is None and cancel_event is None:
+            _write_externalized_payload(path, payload, ownership=ownership)
+        else:
+            _write_externalized_payload(
+                path,
+                payload,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
+            )
+    except (OSError, ExternalizationDeadlineExceeded) as exc:
         logger.warning("Large payload externalization skipped (non-blocking): %s", exc)
         return None
-
     placeholder = _build_externalized_placeholder(
         {
             "kind": kind,
@@ -1368,4 +2045,5 @@ def maybe_externalize_payload(
         "placeholder": placeholder,
         "path": path,
         "payload": payload,
+        "created": True,
     }

@@ -384,6 +384,11 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
         int,
     ),
     _EnvFieldSpec(
+        "background_compaction_min_provider_source_tokens",
+        "LCM_BACKGROUND_COMPACTION_MIN_PROVIDER_SOURCE_TOKENS",
+        int,
+    ),
+    _EnvFieldSpec(
         "background_compaction_prepare_ratio",
         "LCM_BACKGROUND_COMPACTION_PREPARE_RATIO",
         float,
@@ -496,6 +501,7 @@ _BACKGROUND_COMPACTION_ENV_FIELDS = frozenset({
     "background_compaction_job_timeout_seconds",
     "background_compaction_lease_seconds",
     "background_compaction_backlog_tokens",
+    "background_compaction_min_provider_source_tokens",
     "background_compaction_prepare_ratio",
 })
 
@@ -586,6 +592,10 @@ class LCMConfig:
     background_compaction_job_timeout_seconds: int = 120
     background_compaction_lease_seconds: int = 300
     background_compaction_backlog_tokens: int = 32_000
+    # Smaller isolated ranges cost more provider prompt/output overhead than
+    # they can safely remove. They become deterministic lossless projections
+    # rather than provider jobs.
+    background_compaction_min_provider_source_tokens: int = 256
     background_compaction_prepare_ratio: float = 0.55
 
     # -- Escalation ---
@@ -905,6 +915,7 @@ class LCMConfig:
             "background_compaction_job_timeout_seconds": 120,
             "background_compaction_lease_seconds": 300,
             "background_compaction_backlog_tokens": 32_000,
+            "background_compaction_min_provider_source_tokens": 256,
         }
         for field_name, default in defaults.items():
             try:
@@ -915,6 +926,8 @@ class LCMConfig:
             value = max(minimum, value)
             if field_name == "background_compaction_workers":
                 value = min(1, value)
+            elif field_name == "background_compaction_global_limit":
+                value = min(2, value)
             setattr(self, field_name, value)
 
         try:

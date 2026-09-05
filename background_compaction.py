@@ -7,7 +7,9 @@ successfully compare-and-swaps the conversation frontier.
 
 from __future__ import annotations
 
+import _thread
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -49,6 +51,10 @@ BACKGROUND_COMPACTION_NODE_EDGES_MIGRATION_STEP = (
 BACKGROUND_COMPACTION_PROVIDER_OWNER_MIGRATION_STEP = (
     "background_compaction_provider_owner_v1"
 )
+BACKGROUND_COMPACTION_RANGE_DISPOSITIONS_MIGRATION_STEP = (
+    "background_compaction_range_dispositions_v1"
+)
+BACKGROUND_COMPACTION_TELEMETRY_MIGRATION_STEP = "background_compaction_telemetry_v1"
 BACKGROUND_PREPARATION_POLICY_VERSION = "background-preparation-v1"
 _ACTIVE_STATES = ("queued", "running", "prepared", "retry")
 _FINAL_STATES = ("published", "superseded", "failed")
@@ -59,6 +65,7 @@ _CAPTURE_GROUP_LOOKAHEAD = 256
 _CAPTURE_TAIL_ROW_LIMIT = 255
 _CANONICAL_PREFIX_ADOPTION_ROW_LIMIT = 512
 _PARTIAL_REPAIR_JOB_KIND = "partial_atomic_repair"
+_LOSSLESS_RAW_PROJECTION_JOB_KIND = "lossless_raw_projection"
 _PARTIAL_REPAIR_PRIORITY = 1_000_000
 _PARTIAL_REPAIR_MAX_GROUP_ROWS = 256
 _PARTIAL_REPAIR_MAX_OWNERS = 64
@@ -67,6 +74,7 @@ _PARTIAL_REPAIR_MAX_ANCESTRY = 512
 _PARTIAL_REPAIR_MAX_TOPOLOGY_EDGES = 32_768
 _PARTIAL_REPAIR_BACKFILL_BATCH = 128
 _RUNTIME_STOP_TIMEOUT_SECONDS = 5.0
+_MAX_GLOBAL_PROVIDER_PERMITS = 2
 _EVENT_REASON_CODES = frozenset(
     {
         "background_summary_prepared",
@@ -82,6 +90,38 @@ _EVENT_REASON_CODES = frozenset(
         "canonical_prefix_adopted",
         "partial_atomic_repair_pending",
         "partial_atomic_repair_published",
+        "insufficient_compressible_source",
+        "non_compressing_output",
+        "provider_connection_error",
+        "provider_auth_error",
+        "provider_quota",
+        "provider_rate_limit",
+        "invalid_provider_response",
+        "provider_circuit_open",
+        "provider_spend_guard",
+        "reasoning_only_output",
+        "foreground_deadline_exhausted",
+        "stale_lease",
+    }
+)
+_TRANSIENT_RANGE_DISPOSITION_REASONS = frozenset(
+    {
+        "provider_timeout",
+        "provider_error",
+        "provider_connection_error",
+        "provider_auth_error",
+        "provider_quota",
+        "provider_rate_limit",
+        "invalid_provider_response",
+        "provider_circuit_open",
+        "provider_spend_guard",
+    }
+)
+_EXTENDABLE_RANGE_DISPOSITION_REASONS = frozenset(
+    {
+        "non_compressing_output",
+        "reasoning_only_output",
+        *_TRANSIENT_RANGE_DISPOSITION_REASONS,
     }
 )
 
@@ -95,6 +135,11 @@ class PreparedSummaryNode:
     summary_token_count: int
     creation_model: str = ""
     creation_provider: str = ""
+    route_latency_ms: int = 0
+    attempt_number: int = 0
+    escalation_level: int = 0
+    attribution_available: bool = False
+    fallback_used: bool | None = None
     prepared_node_id: int = 0
     prepared_at: float = 0.0
 
@@ -362,6 +407,7 @@ def background_policy_fingerprint(config: LCMConfig | Any) -> str:
         "fresh_tail_count",
         "fresh_tail_max_tokens",
         "background_compaction_max_passes",
+        "background_compaction_min_provider_source_tokens",
         "cache_friendly_condensation_enabled",
         "summary_model",
         "summary_fallback_models",
@@ -1125,9 +1171,86 @@ def _ensure_background_schema(conn: sqlite3.Connection) -> None:
                 summary_token_count INTEGER NOT NULL DEFAULT 0,
                 creation_model TEXT NOT NULL DEFAULT '',
                 creation_provider TEXT NOT NULL DEFAULT '',
+                route_latency_ms INTEGER NOT NULL DEFAULT 0,
+                attempt_number INTEGER NOT NULL DEFAULT 0,
+                escalation_level INTEGER NOT NULL DEFAULT 0,
+                attribution_available INTEGER NOT NULL DEFAULT 0,
+                fallback_used INTEGER,
                 prepared_at REAL NOT NULL,
                 UNIQUE(job_id, ordinal),
                 FOREIGN KEY(job_id) REFERENCES lcm_compaction_jobs(job_id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS lcm_compaction_range_dispositions (
+                conversation_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                session_fence_generation INTEGER NOT NULL,
+                expected_frontier_store_id INTEGER NOT NULL,
+                captured_watermark_store_id INTEGER NOT NULL,
+                policy_fingerprint TEXT NOT NULL,
+                source_identity_hash TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                source_token_count INTEGER NOT NULL DEFAULT 0,
+                prepared_job_id TEXT NOT NULL DEFAULT '',
+                capture_started_at REAL NOT NULL DEFAULT 0,
+                first_seen_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL,
+                resolved_at REAL,
+                PRIMARY KEY(
+                    conversation_id, session_id, session_fence_generation,
+                    expected_frontier_store_id, captured_watermark_store_id,
+                    policy_fingerprint, source_identity_hash
+                )
+            ) WITHOUT ROWID
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS lcm_compaction_attempts (
+                attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                job_attempt INTEGER NOT NULL,
+                chunk_ordinal INTEGER NOT NULL,
+                escalation_level INTEGER NOT NULL,
+                logical_route_ordinal INTEGER NOT NULL DEFAULT 0,
+                actual_provider TEXT NOT NULL DEFAULT '',
+                actual_model TEXT NOT NULL DEFAULT '',
+                attribution_available INTEGER NOT NULL DEFAULT 0,
+                fallback_used INTEGER,
+                outcome TEXT NOT NULL,
+                failure_reason TEXT NOT NULL DEFAULT '',
+                source_token_count INTEGER NOT NULL DEFAULT 0,
+                summary_token_count INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                started_at REAL NOT NULL,
+                finished_at REAL NOT NULL,
+                UNIQUE(
+                    job_id, job_attempt, chunk_ordinal,
+                    escalation_level, logical_route_ordinal
+                ),
+                FOREIGN KEY(job_id) REFERENCES lcm_compaction_jobs(job_id)
+                    ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS lcm_compaction_publications (
+                job_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                publication_fence_generation INTEGER NOT NULL,
+                range_identity TEXT NOT NULL,
+                observed_active_tokens INTEGER,
+                effective_context_window INTEGER,
+                publication_trigger_tokens INTEGER,
+                emergency_trigger_tokens INTEGER,
+                trigger_policy TEXT NOT NULL DEFAULT '',
+                prepared_to_published_ms INTEGER,
+                source_token_count INTEGER NOT NULL DEFAULT 0,
+                summary_token_count INTEGER NOT NULL DEFAULT 0,
+                provider TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                published_at REAL NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES lcm_compaction_jobs(job_id)
+                    ON DELETE CASCADE
             )
             """,
             """
@@ -1218,6 +1341,22 @@ def _ensure_background_schema(conn: sqlite3.Connection) -> None:
                     job_kind, state
                 )
             """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_lcm_compaction_dispositions_scope
+                ON lcm_compaction_range_dispositions(
+                    conversation_id, session_id, last_seen_at
+                )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_lcm_compaction_attempts_outcome_time
+                ON lcm_compaction_attempts(finished_at, outcome)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_lcm_compaction_attempts_route_time
+                ON lcm_compaction_attempts(
+                    actual_provider, actual_model, finished_at
+                )
+            """,
         )
         conn.execute(statements[0])
         columns = {
@@ -1248,6 +1387,68 @@ def _ensure_background_schema(conn: sqlite3.Connection) -> None:
                 )
         for statement in statements[1:]:
             conn.execute(statement)
+        disposition_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(lcm_compaction_range_dispositions)"
+            ).fetchall()
+        }
+        if "capture_started_at" not in disposition_columns:
+            conn.execute(
+                "ALTER TABLE lcm_compaction_range_dispositions "
+                "ADD COLUMN capture_started_at REAL NOT NULL DEFAULT 0"
+            )
+            # Legacy rows did not persist the capture/failure interval separately.
+            # Recover the latest matching job's durable creation time when possible;
+            # falling back to first_seen_at retains prior conservative behavior.
+            conn.execute(
+                """
+                UPDATE lcm_compaction_range_dispositions
+                SET capture_started_at=COALESCE(
+                    (
+                        SELECT MAX(job.created_at)
+                        FROM lcm_compaction_jobs AS job
+                        WHERE job.conversation_id=
+                                  lcm_compaction_range_dispositions.conversation_id
+                          AND job.session_id=
+                                  lcm_compaction_range_dispositions.session_id
+                          AND job.session_fence_generation=
+                                  lcm_compaction_range_dispositions.session_fence_generation
+                          AND job.expected_frontier_store_id=
+                                  lcm_compaction_range_dispositions.expected_frontier_store_id
+                          AND job.captured_watermark_store_id=
+                                  lcm_compaction_range_dispositions.captured_watermark_store_id
+                          AND job.policy_fingerprint=
+                                  lcm_compaction_range_dispositions.policy_fingerprint
+                          AND job.source_identity_hash=
+                                  lcm_compaction_range_dispositions.source_identity_hash
+                          AND job.created_at<=
+                                  lcm_compaction_range_dispositions.first_seen_at
+                    ),
+                    first_seen_at
+                )
+                WHERE capture_started_at<=0
+                """
+            )
+        prepared_columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(lcm_compaction_prepared_nodes)"
+            ).fetchall()
+        }
+        prepared_additive_columns = {
+            "route_latency_ms": "INTEGER NOT NULL DEFAULT 0",
+            "attempt_number": "INTEGER NOT NULL DEFAULT 0",
+            "escalation_level": "INTEGER NOT NULL DEFAULT 0",
+            "attribution_available": "INTEGER NOT NULL DEFAULT 0",
+            "fallback_used": "INTEGER",
+        }
+        for column, declaration in prepared_additive_columns.items():
+            if column not in prepared_columns:
+                conn.execute(
+                    "ALTER TABLE lcm_compaction_prepared_nodes "
+                    f"ADD COLUMN {column} {declaration}"
+                )
         provider_columns = {
             str(row[1])
             for row in conn.execute(
@@ -1287,12 +1488,38 @@ def _ensure_background_schema(conn: sqlite3.Connection) -> None:
             conn,
             BACKGROUND_COMPACTION_PROVIDER_OWNER_MIGRATION_STEP,
         )
+        mark_migration_step_complete(
+            conn,
+            BACKGROUND_COMPACTION_RANGE_DISPOSITIONS_MIGRATION_STEP,
+        )
+        mark_migration_step_complete(
+            conn,
+            BACKGROUND_COMPACTION_TELEMETRY_MIGRATION_STEP,
+        )
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
     _ensure_source_coverage_backfill(conn)
     _ensure_node_edge_backfill(conn)
+
+
+@contextmanager
+def _bounded_thread_lock(
+    lock: threading.RLock,
+    timeout_seconds: float | None,
+) -> Iterator[None]:
+    """Acquire a process-local store lock without escaping a caller wall."""
+    if timeout_seconds is None:
+        acquired = bool(lock.acquire())
+    else:
+        acquired = bool(lock.acquire(timeout=max(0.0, float(timeout_seconds))))
+    if not acquired:
+        raise TimeoutError("background compaction store lock deadline exceeded")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class BackgroundCompactionStore:
@@ -1328,6 +1555,15 @@ class BackgroundCompactionStore:
             run_versioned_migrations(self._conn)
             self._conn.commit()
             _ensure_background_schema(self._conn)
+            message_columns = {
+                str(row[1])
+                for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            self._message_arrival_sql = (
+                "COALESCE(ingested_at, timestamp)"
+                if "ingested_at" in message_columns
+                else "timestamp"
+            )
         except BaseException:
             self._conn.close()
             self._conn = None
@@ -1342,23 +1578,66 @@ class BackgroundCompactionStore:
         self,
         *,
         busy_timeout_ms: int | None = None,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> Iterator[sqlite3.Connection]:
-        with self._lock:
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if write_deadline is None:
+                return None
+            return max(0.0, float(write_deadline) - float(clock()))
+
+        def check_deadline() -> None:
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(
+                    "background compaction write deadline exceeded"
+                )
+
+        effective_lock_timeout = lock_timeout_seconds
+        remaining = remaining_seconds()
+        if remaining is not None:
+            if remaining <= 0:
+                raise TimeoutError(
+                    "background compaction write deadline exceeded"
+                )
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+
+        with _bounded_thread_lock(self._lock, effective_lock_timeout):
+            check_deadline()
             conn = self._conn
             if conn is None:
                 raise RuntimeError("background compaction store is closed")
             prior_busy_timeout = None
-            if busy_timeout_ms is not None:
+            effective_busy_timeout_ms = busy_timeout_ms
+            remaining = remaining_seconds()
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            if effective_busy_timeout_ms is not None:
                 prior_busy_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
                 conn.execute(
-                    f"PRAGMA busy_timeout={max(0, int(busy_timeout_ms))}"
+                    f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
                 )
             primary_error: BaseException | None = None
             try:
                 try:
+                    check_deadline()
                     conn.execute("BEGIN IMMEDIATE")
                     try:
+                        check_deadline()
                         yield conn
+                        check_deadline()
                         conn.execute("COMMIT")
                     except BaseException as exc:
                         primary_error = exc
@@ -1386,6 +1665,67 @@ class BackgroundCompactionStore:
                             "write transaction",
                             exc_info=True,
                         )
+
+    @contextmanager
+    def _bounded_read_connection(
+        self,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Borrow the shared connection for a bounded foreground read."""
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, float(deadline) - float(clock()))
+
+        remaining = remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("background compaction read deadline exceeded")
+        effective_lock_timeout = lock_timeout_seconds
+        if remaining is not None:
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+        with _bounded_thread_lock(self._lock, effective_lock_timeout):
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("background compaction store is closed")
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("background compaction read deadline exceeded")
+            effective_busy_timeout_ms = busy_timeout_ms
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            prior_busy_timeout: int | None = None
+            try:
+                if effective_busy_timeout_ms is not None:
+                    prior_busy_timeout = int(
+                        conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                    )
+                    conn.execute(
+                        f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+                    )
+                yield conn
+                remaining = remaining_seconds()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError(
+                        "background compaction read deadline exceeded"
+                    )
+            finally:
+                if prior_busy_timeout is not None:
+                    conn.execute(f"PRAGMA busy_timeout={prior_busy_timeout}")
 
     def close(self) -> None:
         with self._lock:
@@ -1478,9 +1818,17 @@ class BackgroundCompactionStore:
         now: float | None = None,
         deduplicate_seconds: float = 0.0,
         write_timeout_ms: int | None = None,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> None:
         current = float(self._now() if now is None else now)
-        with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             self._record_event_under_tx(
                 conn,
                 reason_code,
@@ -1596,6 +1944,9 @@ class BackgroundCompactionStore:
         expected_lifecycle_reset_at: float | None = None,
         now: float | None = None,
         write_timeout_ms: int | None = 100,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> int | None:
         """Activate exactly the lifecycle binding observed by the caller.
 
@@ -1607,7 +1958,12 @@ class BackgroundCompactionStore:
         session = str(session_id or "").strip()
         if not conversation or not session:
             raise ValueError("conversation_id and session_id are required")
-        with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             current = float(self._now() if now is None else now)
             lifecycle = conn.execute(
                 """
@@ -1638,12 +1994,33 @@ class BackgroundCompactionStore:
             if (
                 row is not None
                 and str(row["session_id"] or "") == session
-                and float(row["lifecycle_bound_at"] or 0.0)
-                == lifecycle_bound_at
                 and float(row["lifecycle_reset_at"] or 0.0)
                 == lifecycle_reset_at
                 and int(row["publishable"] or 0) == 1
             ):
+                # ``current_bound_at`` proves that this caller observed the
+                # latest lifecycle bind, but it is not itself a semantic
+                # invalidation epoch.  Hermes routinely finalizes and rebinds
+                # the same conversation/session across ordinary turns.  Move
+                # the freshness watermark forward without fencing valid work.
+                if float(row["lifecycle_bound_at"] or 0.0) != lifecycle_bound_at:
+                    conn.execute(
+                        """
+                        UPDATE lcm_compaction_session_fences
+                        SET lifecycle_bound_at=?, updated_at=?
+                        WHERE conversation_id=? AND session_id=?
+                          AND generation=? AND publishable=1
+                          AND lifecycle_reset_at=?
+                        """,
+                        (
+                            lifecycle_bound_at,
+                            current,
+                            conversation,
+                            session,
+                            int(row["generation"] or 0),
+                            lifecycle_reset_at,
+                        ),
+                    )
                 return int(row["generation"] or 0)
             if (
                 row is not None
@@ -1712,6 +2089,25 @@ class BackgroundCompactionStore:
             )
             if row is not None and str(row["session_id"] or "") != session:
                 return None
+            if row is None:
+                lifecycle = conn.execute(
+                    """
+                    SELECT current_session_id, current_bound_at, last_reset_at
+                    FROM lcm_lifecycle_state WHERE conversation_id=?
+                    """,
+                    (conversation,),
+                ).fetchone()
+                if (
+                    lifecycle is None
+                    or str(lifecycle["current_session_id"] or "") != session
+                    or lifecycle["current_bound_at"] is None
+                ):
+                    return None
+                lifecycle_bound_at = float(lifecycle["current_bound_at"])
+                lifecycle_reset_at = float(lifecycle["last_reset_at"] or 0.0)
+            else:
+                lifecycle_bound_at = float(row["lifecycle_bound_at"] or 0.0)
+                lifecycle_reset_at = float(row["lifecycle_reset_at"] or 0.0)
             if row is not None and int(row["publishable"] or 0) == 0:
                 generation = int(row["generation"] or 0)
             else:
@@ -1719,15 +2115,25 @@ class BackgroundCompactionStore:
             conn.execute(
                 """
                 INSERT INTO lcm_compaction_session_fences(
-                    conversation_id, session_id, generation, publishable, updated_at
-                ) VALUES(?,?,?,0,?)
+                    conversation_id, session_id, lifecycle_bound_at,
+                    lifecycle_reset_at, generation, publishable, updated_at
+                ) VALUES(?,?,?,?,?,0,?)
                 ON CONFLICT(conversation_id) DO UPDATE SET
                     session_id=excluded.session_id,
+                    lifecycle_bound_at=excluded.lifecycle_bound_at,
+                    lifecycle_reset_at=excluded.lifecycle_reset_at,
                     generation=excluded.generation,
                     publishable=0,
                     updated_at=excluded.updated_at
                 """,
-                (conversation, session, generation, current),
+                (
+                    conversation,
+                    session,
+                    lifecycle_bound_at,
+                    lifecycle_reset_at,
+                    generation,
+                    current,
+                ),
             )
             fence_reason = _sanitize_error(reason or "session_reset")
             self._supersede_active_jobs_under_tx(
@@ -1834,11 +2240,22 @@ class BackgroundCompactionStore:
             prepared_node_ids=prepared_ids,
         )
 
-    def get_job(self, job_id: str) -> CompactionJob | None:
-        with self._lock:
-            if self._conn is None:
-                return None
-            row = self._conn.execute(
+    def get_job(
+        self,
+        job_id: str,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> CompactionJob | None:
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
                 "SELECT * FROM lcm_compaction_jobs WHERE job_id=?", (str(job_id),)
             ).fetchone()
             return self._job_from_row(row)
@@ -1849,12 +2266,18 @@ class BackgroundCompactionStore:
         conversation_id: str,
         session_id: str,
         expected_frontier_store_id: int,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> bool:
         """Return whether an exact live-frontier repair is durably active."""
-        with self._lock:
-            conn = self._conn
-            if conn is None:
-                return False
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
             row = conn.execute(
                 """
                 SELECT 1
@@ -1917,6 +2340,459 @@ class BackgroundCompactionStore:
         if cursor.rowcount != 1:
             raise RuntimeError("background compaction lifecycle frontier is unavailable")
 
+    @staticmethod
+    def _matching_range_disposition_under_tx(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        session_id: str,
+        session_fence_generation: int,
+        expected_frontier_store_id: int,
+        captured_watermark_store_id: int,
+        policy_fingerprint: str,
+        source_identity_hash: str,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT * FROM lcm_compaction_range_dispositions
+            WHERE conversation_id=? AND session_id=?
+              AND session_fence_generation=?
+              AND expected_frontier_store_id=?
+              AND captured_watermark_store_id=?
+              AND policy_fingerprint=? AND source_identity_hash=?
+              AND resolved_at IS NULL
+            """,
+            (
+                str(conversation_id),
+                str(session_id),
+                int(session_fence_generation),
+                max(0, int(expected_frontier_store_id or 0)),
+                max(0, int(captured_watermark_store_id or 0)),
+                str(policy_fingerprint or ""),
+                str(source_identity_hash or ""),
+            ),
+        ).fetchone()
+
+    def _range_disposition_blocks_requeue_under_tx(
+        self,
+        conn: sqlite3.Connection,
+        disposition: sqlite3.Row,
+        *,
+        current: float,
+    ) -> bool:
+        """Return whether an exact durable disposition still suppresses work.
+
+        Content verdicts are terminal for an unchanged source identity. Provider
+        failures are operational and therefore suppress only for the durable
+        circuit-breaker cooldown.  The cooldown is anchored to the terminal
+        failure time, not ``last_seen_at``, so frequent foreground captures
+        cannot postpone a retry forever.
+        """
+        reason = str(disposition["reason_code"] or "")
+        if reason not in _TRANSIENT_RANGE_DISPOSITION_REASONS:
+            return True
+        cooldown = max(
+            0.0,
+            float(
+                getattr(
+                    self.config,
+                    "summary_circuit_breaker_cooldown_seconds",
+                    300,
+                )
+                or 0
+            ),
+        )
+        if float(current) < float(disposition["first_seen_at"] or 0.0) + cooldown:
+            return True
+        conn.execute(
+            """
+            UPDATE lcm_compaction_range_dispositions
+            SET resolved_at=?, last_seen_at=?
+            WHERE conversation_id=? AND session_id=?
+              AND session_fence_generation=?
+              AND expected_frontier_store_id=?
+              AND captured_watermark_store_id=?
+              AND policy_fingerprint=? AND source_identity_hash=?
+              AND resolved_at IS NULL
+            """,
+            (
+                float(current),
+                float(current),
+                str(disposition["conversation_id"] or ""),
+                str(disposition["session_id"] or ""),
+                int(disposition["session_fence_generation"] or 0),
+                int(disposition["expected_frontier_store_id"] or 0),
+                int(disposition["captured_watermark_store_id"] or 0),
+                str(disposition["policy_fingerprint"] or ""),
+                str(disposition["source_identity_hash"] or ""),
+            ),
+        )
+        return False
+
+    @staticmethod
+    def _range_disposition_capture_started_at(disposition: sqlite3.Row) -> float:
+        """Return the schema-normalized durable source-capture boundary."""
+        return float(disposition["capture_started_at"])
+
+    @staticmethod
+    def _upsert_range_disposition_under_tx(
+        conn: sqlite3.Connection,
+        *,
+        row: Mapping[str, Any],
+        reason_code: str,
+        current: float,
+        prepared_job_id: str = "",
+    ) -> None:
+        try:
+            row_created_at = row["created_at"]
+        except (IndexError, KeyError):
+            row_created_at = None
+        capture_started_at = float(
+            current if row_created_at is None else row_created_at
+        )
+        conn.execute(
+            """
+            INSERT INTO lcm_compaction_range_dispositions(
+                conversation_id, session_id, session_fence_generation,
+                expected_frontier_store_id, captured_watermark_store_id,
+                policy_fingerprint, source_identity_hash, reason_code,
+                source_token_count, prepared_job_id, capture_started_at,
+                first_seen_at, last_seen_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(
+                conversation_id, session_id, session_fence_generation,
+                expected_frontier_store_id, captured_watermark_store_id,
+                policy_fingerprint, source_identity_hash
+            ) DO UPDATE SET
+                reason_code=excluded.reason_code,
+                source_token_count=excluded.source_token_count,
+                first_seen_at=CASE
+                    WHEN lcm_compaction_range_dispositions.resolved_at IS NOT NULL
+                    THEN excluded.first_seen_at
+                    ELSE lcm_compaction_range_dispositions.first_seen_at
+                END,
+                capture_started_at=CASE
+                    WHEN lcm_compaction_range_dispositions.resolved_at IS NOT NULL
+                    THEN excluded.capture_started_at
+                    ELSE lcm_compaction_range_dispositions.capture_started_at
+                END,
+                prepared_job_id=CASE
+                    WHEN excluded.prepared_job_id<>''
+                    THEN excluded.prepared_job_id
+                    WHEN lcm_compaction_range_dispositions.resolved_at IS NOT NULL
+                    THEN ''
+                    ELSE lcm_compaction_range_dispositions.prepared_job_id
+                END,
+                last_seen_at=excluded.last_seen_at,
+                resolved_at=NULL
+            """,
+            (
+                str(row["conversation_id"] or ""),
+                str(row["session_id"] or ""),
+                int(row["session_fence_generation"] or 0),
+                int(row["expected_frontier_store_id"] or 0),
+                int(row["captured_watermark_store_id"] or 0),
+                str(row["policy_fingerprint"] or ""),
+                str(row["source_identity_hash"] or ""),
+                str(reason_code or ""),
+                int(row["source_token_count"] or 0),
+                str(prepared_job_id or ""),
+                capture_started_at,
+                float(current),
+                float(current),
+            ),
+        )
+
+    def _prepare_lossless_projection(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        expected_frontier_store_id: int,
+        captured_watermark_store_id: int,
+        source_store_ids: Sequence[int],
+        expected_source_identity_hash: str,
+        policy_fingerprint: str,
+        projection: str,
+        priority: int,
+        write_timeout_ms: int | None = 100,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        replace_disposition_reason: str = "",
+        new_material_upper_store_id: int = 0,
+    ) -> CompactionJob | None:
+        """Durably prepare a tiny exact range without provider work.
+
+        The prepared node is a policy-redacted active projection only.  Its
+        exact raw lineage remains authoritative and publication still uses the
+        normal fixed-reserve CAS before coverage/frontier movement.
+        """
+        conversation = str(conversation_id or "").strip()
+        session = str(session_id or "").strip()
+        frontier = max(0, int(expected_frontier_store_id or 0))
+        ids = tuple(int(item) for item in source_store_ids)
+        watermark = max(frontier, int(captured_watermark_store_id or 0))
+        if (
+            not conversation
+            or not session
+            or not ids
+            or tuple(sorted(set(ids))) != ids
+            or ids[-1] != watermark
+        ):
+            return None
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
+            current = float(self._now())
+            fence = self._session_fence_under_tx(
+                conn,
+                conversation_id=conversation,
+                session_id=session,
+                current=current,
+                bootstrap=True,
+            )
+            if (
+                fence is None
+                or str(fence["session_id"] or "") != session
+                or int(fence["publishable"] or 0) != 1
+            ):
+                return None
+            generation = int(fence["generation"] or 0)
+            lifecycle = conn.execute(
+                """
+                SELECT current_session_id, current_frontier_store_id
+                FROM lcm_lifecycle_state WHERE conversation_id=?
+                """,
+                (conversation,),
+            ).fetchone()
+            if (
+                lifecycle is None
+                or str(lifecycle["current_session_id"] or "") != session
+                or int(lifecycle["current_frontier_store_id"] or 0) != frontier
+            ):
+                return None
+            raw_messages = self._load_source_range(
+                conn,
+                session_id=session,
+                conversation_id=conversation,
+                frontier=frontier,
+                watermark=watermark,
+            )
+            raw_ids = tuple(int(message["store_id"]) for message in raw_messages)
+            if raw_ids != ids or self._source_ids_already_canonical(conn, session, ids):
+                return None
+            identity_hash = self._source_identity_hash(raw_messages)
+            if identity_hash != str(expected_source_identity_hash or ""):
+                # The projection was serialized from the read-only capture.
+                # Never pair that stale representation with rows changed before
+                # the short preparation transaction acquired its writer lock.
+                return None
+            source_tokens = sum(self._message_tokens(item) for item in raw_messages)
+            disposition = self._matching_range_disposition_under_tx(
+                conn,
+                conversation_id=conversation,
+                session_id=session,
+                session_fence_generation=generation,
+                expected_frontier_store_id=frontier,
+                captured_watermark_store_id=watermark,
+                policy_fingerprint=policy_fingerprint,
+                source_identity_hash=identity_hash,
+            )
+            replacement_reason = str(replace_disposition_reason or "")
+            replacement_allowed = bool(
+                disposition is not None
+                and replacement_reason
+                and replacement_reason in _EXTENDABLE_RANGE_DISPOSITION_REASONS
+                and str(disposition["reason_code"] or "") == replacement_reason
+                and int(new_material_upper_store_id or 0) > watermark
+                and conn.execute(
+                    f"""
+                    SELECT 1 FROM messages
+                    WHERE session_id=? AND store_id>? AND store_id<=?
+                      AND (conversation_id=? OR conversation_id=''
+                           OR conversation_id IS NULL)
+                      AND {self._message_arrival_sql}>?
+                    ORDER BY store_id
+                    LIMIT 1
+                    """,
+                    (
+                        session,
+                        watermark,
+                        int(new_material_upper_store_id),
+                        conversation,
+                        self._range_disposition_capture_started_at(disposition),
+                    ),
+                ).fetchone()
+                is not None
+            )
+            if replacement_reason and not replacement_allowed:
+                # A local terminal-prefix replacement must be authorized by
+                # the same still-active exact disposition and a still-durable
+                # post-capture row.  Fail before touching any concurrent job.
+                return None
+            active = conn.execute(
+                """
+                SELECT * FROM lcm_compaction_jobs
+                WHERE conversation_id=?
+                  AND state IN ('queued','running','prepared','retry')
+                LIMIT 1
+                """,
+                (conversation,),
+            ).fetchone()
+            if active is not None:
+                same_capture_scope = (
+                    str(active["session_id"] or "") == session
+                    and int(active["session_fence_generation"] or 0) == generation
+                    and int(active["expected_frontier_store_id"] or 0) == frontier
+                    and str(active["policy_fingerprint"] or "")
+                    == str(policy_fingerprint or "")
+                )
+                if same_capture_scope:
+                    active_ids = _load_ids(active["source_store_ids"])
+                    active_watermark = int(
+                        active["captured_watermark_store_id"] or 0
+                    )
+                    active_messages = self._load_source_range(
+                        conn,
+                        session_id=session,
+                        conversation_id=conversation,
+                        frontier=frontier,
+                        watermark=active_watermark,
+                    )
+                    active_source_is_current = (
+                        str(active["job_kind"] or "standard")
+                        == _LOSSLESS_RAW_PROJECTION_JOB_KIND
+                        and bool(active_ids)
+                        and active_ids[-1] == active_watermark
+                        and tuple(
+                            int(message["store_id"])
+                            for message in active_messages
+                        )
+                        == active_ids
+                        and self._source_identity_hash(active_messages)
+                        == str(active["source_identity_hash"] or "")
+                        and not self._source_ids_already_canonical(
+                            conn,
+                            session,
+                            active_ids,
+                        )
+                    )
+                    if active_source_is_current:
+                        # Keep an immutable prepared prefix when later rows were
+                        # merely appended above its watermark. Publication of
+                        # that valid prefix must not be churned by ordinary turns.
+                        return self._job_from_row(active)
+                    reason = (
+                        "special_job_kind_mismatch"
+                        if str(active["job_kind"] or "standard")
+                        != _LOSSLESS_RAW_PROJECTION_JOB_KIND
+                        else "source_identity_mismatch"
+                    )
+                else:
+                    reason = "session_or_policy_changed_before_claim"
+                self._supersede_active_jobs_under_tx(
+                    conn,
+                    conversation_id=conversation,
+                    reason=reason,
+                    current=current,
+                )
+            if disposition is not None:
+                if not replacement_allowed and self._range_disposition_blocks_requeue_under_tx(
+                    conn,
+                    disposition,
+                    current=current,
+                ):
+                    return None
+
+            job_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO lcm_compaction_jobs(
+                    job_id, conversation_id, session_id,
+                    session_fence_generation, expected_frontier_store_id,
+                    captured_watermark_store_id, source_store_ids,
+                    source_token_count, source_identity_hash, state, priority,
+                    created_at, updated_at, policy_fingerprint,
+                    expected_node_count, prepared_node_count,
+                    completion_reason, prepared_at, job_kind
+                ) VALUES(?,?,?,?,?,?,?,?,?,'prepared',?,?,?,?,1,1,?,?,?)
+                """,
+                (
+                    job_id,
+                    conversation,
+                    session,
+                    generation,
+                    frontier,
+                    watermark,
+                    _json_ids(ids),
+                    source_tokens,
+                    identity_hash,
+                    int(priority or 0),
+                    current,
+                    current,
+                    str(policy_fingerprint or ""),
+                    "insufficient_compressible_source",
+                    current,
+                    _LOSSLESS_RAW_PROJECTION_JOB_KIND,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO lcm_compaction_prepared_nodes(
+                    job_id, ordinal, summary, source_store_ids,
+                    source_token_count, summary_token_count,
+                    creation_model, creation_provider, route_latency_ms,
+                    attempt_number, escalation_level,
+                    attribution_available, fallback_used, prepared_at
+                ) VALUES(?,?,?,?,?,?,?,?,0,0,0,1,0,?)
+                """,
+                (
+                    job_id,
+                    0,
+                    str(projection or ""),
+                    _json_ids(ids),
+                    source_tokens,
+                    max(1, int(count_tokens(str(projection or "")))),
+                    "deterministic/lossless-raw-v1",
+                    "local",
+                    current,
+                ),
+            )
+            job_row = conn.execute(
+                "SELECT * FROM lcm_compaction_jobs WHERE job_id=?",
+                (job_id,),
+            ).fetchone()
+            assert job_row is not None
+            self._upsert_range_disposition_under_tx(
+                conn,
+                row=job_row,
+                reason_code="insufficient_compressible_source",
+                current=current,
+                prepared_job_id=job_id,
+            )
+            self._record_lifecycle_debt_under_tx(
+                conn,
+                conversation_id=conversation,
+                session_id=session,
+                expected_frontier_store_id=frontier,
+                debt_tokens=source_tokens,
+                current=current,
+            )
+            self._record_event_under_tx(
+                conn,
+                "insufficient_compressible_source",
+                conversation_id=conversation,
+                session_id=session,
+                job_id=job_id,
+                detail="lossless_raw_projection_prepared",
+                created_at=current,
+            )
+            return self._job_from_row(job_row)
+
     def enqueue_or_coalesce(
         self,
         *,
@@ -1933,6 +2809,9 @@ class BackgroundCompactionStore:
         transaction_hook: Callable[[], None] | None = None,
         write_timeout_ms: int | None = None,
         reject_canonical_coverage: bool = True,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> CompactionJob | None:
         """Insert one active conversation job or extend an unclaimed request."""
         current = float(self._now() if now is None else now)
@@ -1946,7 +2825,12 @@ class BackgroundCompactionStore:
         if not ids:
             raise ValueError("source_store_ids must contain a durable range above the frontier")
         watermark = max(ids)
-        with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             if transaction_hook is not None:
                 transaction_hook()
             fence = self._session_fence_under_tx(
@@ -1988,6 +2872,47 @@ class BackgroundCompactionStore:
                 """,
                 (conversation_id,),
             ).fetchone()
+            if row is None:
+                disposition = self._matching_range_disposition_under_tx(
+                    conn,
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    session_fence_generation=session_fence_generation,
+                    expected_frontier_store_id=frontier,
+                    captured_watermark_store_id=watermark,
+                    policy_fingerprint=policy_fingerprint,
+                    source_identity_hash=source_identity_hash,
+                )
+                if disposition is not None:
+                    if not self._range_disposition_blocks_requeue_under_tx(
+                        conn,
+                        disposition,
+                        current=current,
+                    ):
+                        disposition = None
+                if disposition is not None:
+                    conn.execute(
+                        """
+                        UPDATE lcm_compaction_range_dispositions
+                        SET last_seen_at=?
+                        WHERE conversation_id=? AND session_id=?
+                          AND session_fence_generation=?
+                          AND expected_frontier_store_id=?
+                          AND captured_watermark_store_id=?
+                          AND policy_fingerprint=? AND source_identity_hash=?
+                        """,
+                        (
+                            current,
+                            conversation_id,
+                            session_id,
+                            session_fence_generation,
+                            frontier,
+                            watermark,
+                            str(policy_fingerprint or ""),
+                            source_identity_hash,
+                        ),
+                    )
+                    return None
             if reject_canonical_coverage and self._source_ids_already_canonical(
                 conn,
                 session_id,
@@ -2298,15 +3223,21 @@ class BackgroundCompactionStore:
         expected_frontier_store_id: int,
         captured_watermark_store_id: int,
         expected_source_store_ids: Sequence[int],
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> tuple[dict[str, Any], ...] | None:
         """Capture the exact bounded durable interval before provider I/O."""
         expected_ids = tuple(int(item) for item in expected_source_store_ids)
         if not expected_ids:
             return None
-        with self._lock:
-            conn = self._conn
-            if conn is None:
-                return None
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
             messages = self._load_source_range(
                 conn,
                 session_id=str(session_id),
@@ -2926,6 +3857,9 @@ class BackgroundCompactionStore:
         policy_fingerprint: str,
         priority: int,
         write_timeout_ms: int | None = 100,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> CompactionJob | None:
         """Atomically revalidate and enqueue one mixed-ownership atomic group."""
         conversation = str(conversation_id or "").strip()
@@ -2940,7 +3874,12 @@ class BackgroundCompactionStore:
             or tuple(sorted(set(captured_ids))) != captured_ids
         ):
             return None
-        with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             current = float(self._now())
             fence = self._session_fence_under_tx(
                 conn,
@@ -3053,10 +3992,32 @@ class BackgroundCompactionStore:
                 (conversation,),
             ).fetchone()
             if existing is not None:
+                same_capture_scope = (
+                    str(existing["session_id"] or "") == session
+                    and int(existing["session_fence_generation"] or 0)
+                    == int(fence["generation"] or 0)
+                    and int(existing["expected_frontier_store_id"] or 0) == frontier
+                    and str(existing["policy_fingerprint"] or "")
+                    == str(policy_fingerprint or "")
+                )
+                if not same_capture_scope:
+                    self._supersede_active_jobs_under_tx(
+                        conn,
+                        conversation_id=conversation,
+                        reason="session_or_policy_changed_before_claim",
+                        current=current,
+                    )
+                    existing = None
+            if existing is not None:
                 exact_existing = (
                     str(existing["job_kind"] or "") == _PARTIAL_REPAIR_JOB_KIND
                     and str(existing["session_id"] or "") == session
                     and int(existing["expected_frontier_store_id"] or 0) == frontier
+                    and int(existing["captured_watermark_store_id"] or 0)
+                    == captured_ids[-1]
+                    and _load_ids(existing["source_store_ids"]) == captured_ids
+                    and str(existing["source_identity_hash"] or "")
+                    == identity_hash
                     and _load_ids(existing["repair_group_store_ids"]) == captured_ids
                     and str(existing["repair_group_identity_hash"] or "")
                     == identity_hash
@@ -3070,19 +4031,54 @@ class BackgroundCompactionStore:
                 )
                 if exact_existing:
                     return self._job_from_row(existing)
-                if str(existing["state"] or "") in {"running", "prepared"}:
-                    return self._job_from_row(existing)
+                self._supersede_active_jobs_under_tx(
+                    conn,
+                    conversation_id=conversation,
+                    reason="partial_repair_source_range_changed",
+                    current=current,
+                )
+                existing = None
+
+            disposition = self._matching_range_disposition_under_tx(
+                conn,
+                conversation_id=conversation,
+                session_id=session,
+                session_fence_generation=int(fence["generation"] or 0),
+                expected_frontier_store_id=frontier,
+                captured_watermark_store_id=captured_ids[-1],
+                policy_fingerprint=policy_fingerprint,
+                source_identity_hash=identity_hash,
+            )
+            if disposition is not None:
+                if not self._range_disposition_blocks_requeue_under_tx(
+                    conn,
+                    disposition,
+                    current=current,
+                ):
+                    disposition = None
+            if disposition is not None:
                 conn.execute(
                     """
-                    UPDATE lcm_compaction_jobs
-                    SET state='superseded',
-                        completion_reason='partial_atomic_repair_pending',
-                        updated_at=?, lease_owner=NULL,
-                        lease_expires_at=NULL, heartbeat_at=NULL
-                    WHERE job_id=? AND state IN ('queued','retry')
+                    UPDATE lcm_compaction_range_dispositions
+                    SET last_seen_at=?
+                    WHERE conversation_id=? AND session_id=?
+                      AND session_fence_generation=?
+                      AND expected_frontier_store_id=?
+                      AND captured_watermark_store_id=?
+                      AND policy_fingerprint=? AND source_identity_hash=?
                     """,
-                    (current, str(existing["job_id"])),
+                    (
+                        current,
+                        conversation,
+                        session,
+                        int(fence["generation"] or 0),
+                        frontier,
+                        captured_ids[-1],
+                        str(policy_fingerprint or ""),
+                        identity_hash,
+                    ),
                 )
+                return None
 
             source_tokens = sum(
                 self._message_tokens(message) for message in raw_messages
@@ -3207,6 +4203,138 @@ class BackgroundCompactionStore:
             )
         return chunks
 
+    def _coalesce_disposition_extension_chunks(
+        self,
+        chunks: Sequence[SourceChunk],
+        *,
+        max_chunks: int,
+    ) -> list[SourceChunk] | None:
+        """Fit one changed terminal range into its durable provider-pass budget.
+
+        ``leaf_chunk_tokens`` remains the ordinary target.  A terminal prefix
+        may consume every configured pass, though, so one newly eligible
+        adjacent group would otherwise be hidden behind the exact disposition
+        forever.  Merge only adjacent chunks, choose the smallest merge first,
+        and never create a provider input larger than twice the configured
+        target.  Atomic groups and exact source order therefore remain intact.
+        """
+        budget = max(1, int(max_chunks or 0))
+        token_ceiling = max(
+            1,
+            int(getattr(self.config, "leaf_chunk_tokens", 20_000) or 20_000),
+        ) * 2
+        merged = list(chunks)
+        while len(merged) > budget:
+            choices = [
+                (
+                    int(left.source_token_count) + int(right.source_token_count),
+                    index,
+                )
+                for index, (left, right) in enumerate(zip(merged, merged[1:]))
+                if int(left.source_token_count) + int(right.source_token_count)
+                <= token_ceiling
+            ]
+            if not choices:
+                return None
+            _combined_tokens, index = min(choices)
+            left = merged[index]
+            right = merged[index + 1]
+            merged[index : index + 2] = [
+                SourceChunk(
+                    ordinal=0,
+                    source_store_ids=(
+                        *left.source_store_ids,
+                        *right.source_store_ids,
+                    ),
+                    source_token_count=(
+                        int(left.source_token_count)
+                        + int(right.source_token_count)
+                    ),
+                    messages=(*left.messages, *right.messages),
+                )
+            ]
+        return [
+            SourceChunk(
+                ordinal=index,
+                source_store_ids=chunk.source_store_ids,
+                source_token_count=chunk.source_token_count,
+                messages=chunk.messages,
+                serialized_text=chunk.serialized_text,
+            )
+            for index, chunk in enumerate(merged)
+        ]
+
+    def _job_extends_terminal_disposition_under_tx(
+        self,
+        conn: sqlite3.Connection,
+        job: CompactionJob,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        """Verify the durable terminal-prefix proof used for bounded replay."""
+        extendable_reasons = tuple(sorted(_EXTENDABLE_RANGE_DISPOSITION_REASONS))
+        reason_placeholders = ",".join("?" for _ in extendable_reasons)
+        dispositions = conn.execute(
+            f"""
+            SELECT * FROM lcm_compaction_range_dispositions
+            WHERE conversation_id=? AND session_id=?
+              AND session_fence_generation=?
+              AND expected_frontier_store_id=?
+              AND captured_watermark_store_id<?
+              AND policy_fingerprint=?
+              AND resolved_at IS NULL
+              AND reason_code IN ({reason_placeholders})
+            ORDER BY captured_watermark_store_id DESC
+            LIMIT 1
+            """,
+            (
+                job.conversation_id,
+                job.session_id,
+                job.session_fence_generation,
+                job.expected_frontier_store_id,
+                job.captured_watermark_store_id,
+                job.policy_fingerprint,
+                *extendable_reasons,
+            ),
+        ).fetchall()
+        if not dispositions:
+            return False
+        disposition = dispositions[0]
+        watermark = int(disposition["captured_watermark_store_id"] or 0)
+        prefix = [
+            message
+            for message in messages
+            if int(message.get("store_id") or 0) <= watermark
+        ]
+        prefix_matches = (
+            bool(prefix)
+            and int(prefix[-1].get("store_id") or 0) == watermark
+            and self._source_identity_hash(prefix)
+            == str(disposition["source_identity_hash"] or "")
+        )
+        if not prefix_matches:
+            return False
+        return (
+            conn.execute(
+                f"""
+                SELECT 1 FROM messages
+                WHERE session_id=? AND store_id>? AND store_id<=?
+                  AND (conversation_id=? OR conversation_id=''
+                       OR conversation_id IS NULL)
+                  AND {self._message_arrival_sql}>?
+                ORDER BY store_id
+                LIMIT 1
+                """,
+                (
+                    job.session_id,
+                    watermark,
+                    job.captured_watermark_store_id,
+                    job.conversation_id,
+                    self._range_disposition_capture_started_at(disposition),
+                ),
+            ).fetchone()
+            is not None
+        )
+
     def _summary_candidate_messages(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -3240,6 +4368,9 @@ class BackgroundCompactionStore:
         max_rows: int = _CANONICAL_PREFIX_ADOPTION_ROW_LIMIT,
         now: float | None = None,
         write_timeout_ms: int | None = 100,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> int:
         """Advance across only the oldest already-canonical raw prefix.
 
@@ -3273,7 +4404,12 @@ class BackgroundCompactionStore:
             ),
         )
 
-        with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             current = float(self._now() if now is None else now)
             lifecycle = conn.execute(
                 """
@@ -3440,6 +4576,10 @@ class BackgroundCompactionStore:
         effective_context_window: int,
         policy_fingerprint: str,
         priority: int = 0,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> CompactionJob | None:
         """Capture a bounded immutable raw prefix and enqueue it.
 
@@ -3449,6 +4589,13 @@ class BackgroundCompactionStore:
         resolved here; durable marker rows are the source of truth captured by
         the job.
         """
+        clock = deadline_clock or time.monotonic
+
+        def check_deadline() -> None:
+            if deadline is not None and float(clock()) >= float(deadline):
+                raise TimeoutError("background compaction capture deadline exceeded")
+
+        check_deadline()
         frontier = max(0, int(expected_frontier_store_id or 0))
         fresh_tail_count = max(
             0, int(getattr(self.config, "fresh_tail_count", 0) or 0)
@@ -3487,10 +4634,12 @@ class BackgroundCompactionStore:
             "AND (m.conversation_id=? OR m.conversation_id='' "
             "OR m.conversation_id IS NULL)"
         )
-        with self._lock:
-            conn = self._conn
-            if conn is None:
-                return None
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
             active = conn.execute(
                 """
                 SELECT * FROM lcm_compaction_jobs
@@ -3512,7 +4661,7 @@ class BackgroundCompactionStore:
                 or int(fence["publishable"] or 0) != 1
             ):
                 return None
-            if (
+            same_active_scope = (
                 active is not None
                 and str(active["state"] or "") in {"running", "prepared"}
                 and str(active["session_id"] or "") == str(session_id)
@@ -3524,8 +4673,65 @@ class BackgroundCompactionStore:
                 and int(active["expected_frontier_store_id"] or 0) == frontier
                 and str(active["policy_fingerprint"] or "")
                 == str(policy_fingerprint or "")
-            ):
-                return self._job_from_row(active)
+            )
+            if same_active_scope:
+                active_kind = str(active["job_kind"] or "standard")
+                active_ids = _load_ids(active["source_store_ids"])
+                reuse_active = False
+                if active_kind == _LOSSLESS_RAW_PROJECTION_JOB_KIND:
+                    active_watermark = int(
+                        active["captured_watermark_store_id"] or 0
+                    )
+                    active_messages = self._load_source_range(
+                        conn,
+                        session_id=str(session_id),
+                        conversation_id=str(conversation_id),
+                        frontier=frontier,
+                        watermark=active_watermark,
+                    )
+                    reuse_active = (
+                        bool(active_ids)
+                        and active_ids[-1] == active_watermark
+                        and tuple(
+                            int(message["store_id"])
+                            for message in active_messages
+                        )
+                        == active_ids
+                        and self._source_identity_hash(active_messages)
+                        == str(active["source_identity_hash"] or "")
+                        and not self._source_ids_already_canonical(
+                            conn,
+                            str(session_id),
+                            active_ids,
+                        )
+                    )
+                elif active_kind == "standard":
+                    minimum_provider_tokens = max(
+                        1,
+                        int(
+                            getattr(
+                                self.config,
+                                "background_compaction_min_provider_source_tokens",
+                                256,
+                            )
+                            or 256
+                        ),
+                    )
+                    reuse_active = (
+                        bool(active_ids)
+                        and int(active["source_token_count"] or 0)
+                        >= minimum_provider_tokens
+                        and not self._source_ids_already_canonical(
+                            conn,
+                            str(session_id),
+                            active_ids,
+                        )
+                    )
+                # Partial repair jobs are deliberately re-derived from their
+                # small atomic group.  Its source identity and canonical-owner
+                # topology can change without changing the outer capture scope.
+                if reuse_active:
+                    return self._job_from_row(active)
 
             snapshot_row = conn.execute(
                 """
@@ -3662,6 +4868,7 @@ class BackgroundCompactionStore:
                     prefix_query_limit,
                 ),
             ).fetchall()
+        check_deadline()
         if not rows:
             return None
 
@@ -3704,6 +4911,7 @@ class BackgroundCompactionStore:
             and self._atomic_group_is_complete(first_group)
             and not first_group_extends_sentinel
         ):
+            check_deadline()
             return self._enqueue_partial_atomic_repair(
                 conversation_id=conversation_id,
                 session_id=session_id,
@@ -3713,6 +4921,9 @@ class BackgroundCompactionStore:
                 policy_fingerprint=policy_fingerprint,
                 priority=priority,
                 write_timeout_ms=100,
+                lock_timeout_seconds=lock_timeout_seconds,
+                write_deadline=deadline,
+                deadline_clock=clock,
             )
         candidates: list[dict[str, Any]] = []
         offset = 0
@@ -3764,23 +4975,24 @@ class BackgroundCompactionStore:
             candidates.extend(group)
         if not candidates:
             return None
+        check_deadline()
         summary_candidates = self._summary_candidate_messages(
             candidates,
             session_id=str(session_id),
             preserve_leading_system=frontier == 0,
             resolve_externalized=False,
         )
-        chunks = self._chunk_messages(summary_candidates)
+        available_chunks = self._chunk_messages(summary_candidates)
         max_passes = max(
             1, int(getattr(self.config, "background_compaction_max_passes", 4) or 4)
         )
         combine_prepared_leaves = bool(
             getattr(self.config, "cache_friendly_condensation_enabled", False)
-            and len(chunks) > 1
+            and len(available_chunks) > 1
             and max_passes >= 2
         )
         leaf_pass_budget = max_passes - 1 if combine_prepared_leaves else max_passes
-        chunks = chunks[:leaf_pass_budget]
+        chunks = available_chunks[:leaf_pass_budget]
         if not chunks:
             return None
         selected = [message for chunk in chunks for message in chunk.messages]
@@ -3794,11 +5006,208 @@ class BackgroundCompactionStore:
         selected_by_id = {
             int(message["store_id"]): message for message in candidates
         }
+        selected_identity_hash = self._source_identity_hash(
+            [selected_by_id[store_id] for store_id in selected_ids]
+        )
+
+        # A bounded prefix can consume every provider pass or end immediately
+        # before a canonical island.  If that exact prefix has a terminal
+        # disposition, an ordinary slice would keep selecting it forever even
+        # after genuinely new eligible material was appended farther ahead.
+        # Extend only through the first post-disposition chunk and fit it by a
+        # bounded adjacent merge; an unchanged range still reaches
+        # enqueue_or_coalesce and is suppressed by its exact durable key.
+        terminal_projection: tuple[str, int] | None = None
+        if eligible_upper > watermark:
+            check_deadline()
+            disposition = None
+            has_new_durable_material = False
+            first_new_store_id = 0
+            with self._bounded_read_connection(
+                lock_timeout_seconds=lock_timeout_seconds,
+                deadline=deadline,
+                deadline_clock=clock,
+                busy_timeout_ms=busy_timeout_ms,
+            ) as disposition_conn:
+                current_fence = disposition_conn.execute(
+                    """
+                    SELECT session_id, generation, publishable
+                    FROM lcm_compaction_session_fences
+                    WHERE conversation_id=?
+                    """,
+                    (str(conversation_id),),
+                ).fetchone()
+                if (
+                    current_fence is not None
+                    and str(current_fence["session_id"] or "") == str(session_id)
+                    and int(current_fence["publishable"] or 0) == 1
+                ):
+                    disposition = self._matching_range_disposition_under_tx(
+                        disposition_conn,
+                        conversation_id=str(conversation_id),
+                        session_id=str(session_id),
+                        session_fence_generation=int(
+                            current_fence["generation"] or 0
+                        ),
+                        expected_frontier_store_id=frontier,
+                        captured_watermark_store_id=watermark,
+                        policy_fingerprint=policy_fingerprint,
+                        source_identity_hash=selected_identity_hash,
+                    )
+                    if (
+                        disposition is not None
+                        and str(disposition["reason_code"] or "")
+                        in _EXTENDABLE_RANGE_DISPOSITION_REASONS
+                    ):
+                        new_material = disposition_conn.execute(
+                            f"""
+                            SELECT store_id FROM messages
+                            WHERE session_id=? AND store_id>? AND store_id<=?
+                              AND (conversation_id=? OR conversation_id=''
+                                   OR conversation_id IS NULL)
+                              AND {self._message_arrival_sql}>?
+                            ORDER BY store_id
+                            LIMIT 1
+                            """,
+                            (
+                                str(session_id),
+                                watermark,
+                                eligible_upper,
+                                str(conversation_id),
+                                self._range_disposition_capture_started_at(
+                                    disposition
+                                ),
+                            ),
+                        ).fetchone()
+                        if new_material is not None:
+                            has_new_durable_material = True
+                            first_new_store_id = int(new_material["store_id"] or 0)
+            if disposition is not None:
+                extension_end = next(
+                    (
+                        index
+                        for index in range(
+                            leaf_pass_budget,
+                            len(available_chunks),
+                        )
+                        if first_new_store_id
+                        in available_chunks[index].source_store_ids
+                    ),
+                    None,
+                )
+                coalesced = None
+                if extension_end is not None:
+                    coalesced = self._coalesce_disposition_extension_chunks(
+                        available_chunks[: extension_end + 1],
+                        max_chunks=leaf_pass_budget,
+                    )
+                    if coalesced is not None:
+                        chunks = coalesced
+                        selected = [
+                            message
+                            for chunk in chunks
+                            for message in chunk.messages
+                        ]
+                        selected_lineage_ids = tuple(
+                            int(message["store_id"]) for message in selected
+                        )
+                        watermark = selected_lineage_ids[-1]
+                        selected_ids = tuple(
+                            int(message["store_id"])
+                            for message in candidates
+                            if int(message["store_id"]) <= watermark
+                        )
+                        selected_identity_hash = self._source_identity_hash(
+                            [selected_by_id[store_id] for store_id in selected_ids]
+                        )
+                if has_new_durable_material and coalesced is None:
+                    # The new row can be beyond the bounded capture or too far
+                    # behind pre-existing chunks to fit a provider pass safely.
+                    # Publish one exact terminal prefix as a local raw-reference
+                    # node; its CAS publication advances contiguously and keeps
+                    # every source row available for exact expansion.
+                    terminal_projection = (
+                        str(disposition["reason_code"] or ""),
+                        eligible_upper,
+                    )
+        if terminal_projection is not None:
+            disposition_reason, new_material_upper = terminal_projection
+            projection = (
+                "[Lossless retained source; provider summarization was skipped "
+                "after an exact terminal result for this prefix.]\n"
+                f"Raw source rows {selected_ids[0]}-{selected_ids[-1]} remain "
+                "verbatim and expandable.\n"
+                "Expand for details: exact retained raw source rows"
+            )
+            check_deadline()
+            return self._prepare_lossless_projection(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                expected_frontier_store_id=frontier,
+                captured_watermark_store_id=selected_ids[-1],
+                source_store_ids=selected_ids,
+                expected_source_identity_hash=selected_identity_hash,
+                policy_fingerprint=policy_fingerprint,
+                projection=projection,
+                priority=priority,
+                write_timeout_ms=100,
+                lock_timeout_seconds=lock_timeout_seconds,
+                write_deadline=deadline,
+                deadline_clock=clock,
+                replace_disposition_reason=disposition_reason,
+                new_material_upper_store_id=new_material_upper,
+            )
         source_tokens = sum(
             self._message_tokens(selected_by_id[store_id])
             for store_id in selected_ids
         )
+        minimum_provider_tokens = max(
+            1,
+            int(
+                getattr(
+                    self.config,
+                    "background_compaction_min_provider_source_tokens",
+                    256,
+                )
+                or 256
+            ),
+        )
+        if source_tokens < minimum_provider_tokens:
+            visible_projection = serialize_summary_messages(
+                summary_candidates,
+                config=self.config,
+                session_id=str(session_id),
+                hermes_home=self._hermes_home,
+            )
+            if not visible_projection:
+                visible_projection = (
+                    "[Source content is omitted from active replay by policy; "
+                    "the exact raw rows remain expandable.]"
+                )
+            projection = (
+                "[Lossless retained source; provider summarization was skipped "
+                "because this isolated range is too small to compress safely.]\n"
+                f"{visible_projection}\n"
+                "Expand for details: exact retained raw source rows"
+            )
+            check_deadline()
+            return self._prepare_lossless_projection(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                expected_frontier_store_id=frontier,
+                captured_watermark_store_id=selected_ids[-1],
+                source_store_ids=selected_ids,
+                expected_source_identity_hash=selected_identity_hash,
+                policy_fingerprint=policy_fingerprint,
+                projection=projection,
+                priority=priority,
+                write_timeout_ms=100,
+                lock_timeout_seconds=lock_timeout_seconds,
+                write_deadline=deadline,
+                deadline_clock=clock,
+            )
         try:
+            check_deadline()
             return self.enqueue_or_coalesce(
                 conversation_id=conversation_id,
                 session_id=session_id,
@@ -3811,6 +5220,9 @@ class BackgroundCompactionStore:
                 priority=priority,
                 write_timeout_ms=100,
                 reject_canonical_coverage=True,
+                lock_timeout_seconds=lock_timeout_seconds,
+                write_deadline=deadline,
+                deadline_clock=clock,
             )
         except RuntimeError as exc:
             if str(exc) in {
@@ -3865,6 +5277,44 @@ class BackgroundCompactionStore:
         provider_chunks = self._chunk_messages(summary_messages)
         if not provider_chunks:
             return []
+        max_passes = max(
+            1,
+            int(
+                getattr(
+                    self.config,
+                    "background_compaction_max_passes",
+                    4,
+                )
+                or 4
+            ),
+        )
+        combine_prepared_leaves = bool(
+            getattr(self.config, "cache_friendly_condensation_enabled", False)
+            and len(provider_chunks) > 1
+            and max_passes >= 2
+        )
+        leaf_pass_budget = (
+            max_passes - 1 if combine_prepared_leaves else max_passes
+        )
+        if len(provider_chunks) > leaf_pass_budget:
+            with self._lock:
+                conn = self._conn
+                extends_terminal_range = bool(
+                    conn is not None
+                    and self._job_extends_terminal_disposition_under_tx(
+                        conn,
+                        job,
+                        messages,
+                    )
+                )
+            if extends_terminal_range:
+                coalesced = self._coalesce_disposition_extension_chunks(
+                    provider_chunks,
+                    max_chunks=leaf_pass_budget,
+                )
+                if coalesced is None:
+                    return []
+                provider_chunks = coalesced
 
         positions = {
             int(message["store_id"]): index for index, message in enumerate(messages)
@@ -4185,6 +5635,9 @@ class BackgroundCompactionStore:
         lease_seconds: float | None = None,
         global_limit: int | None = None,
         now: float | None = None,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> ProviderPermit | None:
         """Atomically reserve provider capacity for one foreground emergency.
 
@@ -4205,12 +5658,19 @@ class BackgroundCompactionStore:
                 else getattr(self.config, "background_compaction_lease_seconds", 300)
             ),
         )
-        limit = max(
-            0,
-            int(
-                global_limit
-                if global_limit is not None
-                else getattr(self.config, "background_compaction_global_limit", 2)
+        limit = min(
+            _MAX_GLOBAL_PROVIDER_PERMITS,
+            max(
+                0,
+                int(
+                    global_limit
+                    if global_limit is not None
+                    else getattr(
+                        self.config,
+                        "background_compaction_global_limit",
+                        _MAX_GLOBAL_PROVIDER_PERMITS,
+                    )
+                ),
             ),
         )
         if limit <= 0:
@@ -4223,7 +5683,12 @@ class BackgroundCompactionStore:
         owner_pid, owner_start_ticks, owner_boot_id = (
             process_identity if process_identity is not None else (None, None, None)
         )
-        with self._write_transaction(busy_timeout_ms=0) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=0,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             current = float(self._now() if now is None else now)
             self._recover_expired_under_tx(conn, current)
             session_fence_generation = 0
@@ -4324,12 +5789,19 @@ class BackgroundCompactionStore:
                 else getattr(self.config, "background_compaction_lease_seconds", 300)
             ),
         )
-        limit = max(
-            0,
-            int(
-                global_limit
-                if global_limit is not None
-                else getattr(self.config, "background_compaction_global_limit", 2)
+        limit = min(
+            _MAX_GLOBAL_PROVIDER_PERMITS,
+            max(
+                0,
+                int(
+                    global_limit
+                    if global_limit is not None
+                    else getattr(
+                        self.config,
+                        "background_compaction_global_limit",
+                        _MAX_GLOBAL_PROVIDER_PERMITS,
+                    )
+                ),
             ),
         )
         if limit <= 0:
@@ -4519,6 +5991,7 @@ class BackgroundCompactionStore:
         error: BaseException | str,
         keep_provider_permit: bool = False,
         completion_reason: str = "provider_error",
+        terminal: bool = False,
         now: float | None = None,
     ) -> CompactionJob | bool:
         with self._write_transaction() as conn:
@@ -4547,7 +6020,7 @@ class BackgroundCompactionStore:
             attempts = max(1, int(row["attempt_count"] or 1))
             delay = min(300.0, float(5 * (2 ** min(attempts - 1, 6))))
             sanitized = _sanitize_error(error)
-            terminal = attempts >= 5
+            terminal = bool(terminal) or attempts >= 5
             conn.execute(
                 """
                 UPDATE lcm_compaction_jobs
@@ -4596,6 +6069,16 @@ class BackgroundCompactionStore:
                     WHERE job_id=? AND lease_owner=? AND lease_generation=?
                     """,
                     (str(job_id), str(owner), int(generation)),
+                )
+            if terminal and str(completion_reason or "") in (
+                set(_EVENT_REASON_CODES)
+                | {"provider_error", "no_eligible_raw_range"}
+            ):
+                self._upsert_range_disposition_under_tx(
+                    conn,
+                    row=row,
+                    reason_code=str(completion_reason),
+                    current=current,
                 )
             if str(completion_reason or "") in _EVENT_REASON_CODES:
                 self._record_event_under_tx(
@@ -4675,8 +6158,16 @@ class BackgroundCompactionStore:
         owner: str,
         generation: int,
         busy_timeout_ms: int | None = None,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> bool:
-        with self._write_transaction(busy_timeout_ms=busy_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=busy_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             cursor = conn.execute(
                 """
                 DELETE FROM lcm_compaction_provider_leases
@@ -4698,6 +6189,15 @@ class BackgroundCompactionStore:
             summary_token_count=max(0, int(value.get("summary_token_count") or 0)),
             creation_model=str(value.get("creation_model") or ""),
             creation_provider=str(value.get("creation_provider") or ""),
+            route_latency_ms=max(0, int(value.get("route_latency_ms") or 0)),
+            attempt_number=max(0, int(value.get("attempt_number") or 0)),
+            escalation_level=max(0, int(value.get("escalation_level") or 0)),
+            attribution_available=bool(value.get("attribution_available", False)),
+            fallback_used=(
+                None
+                if value.get("fallback_used") is None
+                else bool(value.get("fallback_used"))
+            ),
         )
 
     def mark_prepared(
@@ -4765,8 +6265,10 @@ class BackgroundCompactionStore:
                     INSERT INTO lcm_compaction_prepared_nodes(
                         job_id, ordinal, summary, source_store_ids,
                         source_token_count, summary_token_count,
-                        creation_model, creation_provider, prepared_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                        creation_model, creation_provider, route_latency_ms,
+                        attempt_number, escalation_level,
+                        attribution_available, fallback_used, prepared_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         str(job_id),
@@ -4777,6 +6279,15 @@ class BackgroundCompactionStore:
                         node.summary_token_count,
                         node.creation_model,
                         node.creation_provider,
+                        node.route_latency_ms,
+                        node.attempt_number,
+                        node.escalation_level,
+                        int(node.attribution_available),
+                        (
+                            None
+                            if node.fallback_used is None
+                            else int(node.fallback_used)
+                        ),
                         current,
                     ),
                 )
@@ -4857,8 +6368,10 @@ class BackgroundCompactionStore:
                 INSERT INTO lcm_compaction_prepared_nodes(
                     job_id, ordinal, summary, source_store_ids,
                     source_token_count, summary_token_count,
-                    creation_model, creation_provider, prepared_at
-                ) VALUES(?,?,?,?,?,?,?,?,?)
+                    creation_model, creation_provider, route_latency_ms,
+                    attempt_number, escalation_level,
+                    attribution_available, fallback_used, prepared_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(job_id, ordinal) DO UPDATE SET
                     summary=excluded.summary,
                     source_store_ids=excluded.source_store_ids,
@@ -4866,6 +6379,11 @@ class BackgroundCompactionStore:
                     summary_token_count=excluded.summary_token_count,
                     creation_model=excluded.creation_model,
                     creation_provider=excluded.creation_provider,
+                    route_latency_ms=excluded.route_latency_ms,
+                    attempt_number=excluded.attempt_number,
+                    escalation_level=excluded.escalation_level,
+                    attribution_available=excluded.attribution_available,
+                    fallback_used=excluded.fallback_used,
                     prepared_at=excluded.prepared_at
                 """,
                 (
@@ -4877,6 +6395,15 @@ class BackgroundCompactionStore:
                     node.summary_token_count,
                     node.creation_model,
                     node.creation_provider,
+                    node.route_latency_ms,
+                    node.attempt_number,
+                    node.escalation_level,
+                    int(node.attribution_available),
+                    (
+                        None
+                        if node.fallback_used is None
+                        else int(node.fallback_used)
+                    ),
                     current,
                 ),
             )
@@ -4980,6 +6507,15 @@ class BackgroundCompactionStore:
                 summary_token_count=int(row["summary_token_count"] or 0),
                 creation_model=str(row["creation_model"] or ""),
                 creation_provider=str(row["creation_provider"] or ""),
+                route_latency_ms=int(row["route_latency_ms"] or 0),
+                attempt_number=int(row["attempt_number"] or 0),
+                escalation_level=int(row["escalation_level"] or 0),
+                attribution_available=bool(row["attribution_available"]),
+                fallback_used=(
+                    None
+                    if row["fallback_used"] is None
+                    else bool(row["fallback_used"])
+                ),
                 prepared_at=float(row["prepared_at"] or 0.0),
             )
             for row in rows
@@ -4993,6 +6529,9 @@ class BackgroundCompactionStore:
         lease_seconds: float | None = None,
         write_timeout_ms: int | None = 100,
         now: float | None = None,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> CompactionJob | None:
         duration = max(
             1.0,
@@ -5002,8 +6541,26 @@ class BackgroundCompactionStore:
                 else getattr(self.config, "background_compaction_lease_seconds", 300)
             ),
         )
-        with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             current = float(self._now() if now is None else now)
+            effective_duration = duration
+            if write_deadline is not None:
+                clock = deadline_clock or time.monotonic
+                remaining = float(write_deadline) - float(clock())
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "background compaction publication lease deadline exceeded"
+                    )
+                # A foreground publisher may fail after this short lease CAS.
+                # Bound the durable lease itself to the same wall so timeout
+                # leaves no active 300-second blocker and another caller can
+                # reclaim it immediately without post-deadline cleanup.
+                effective_duration = min(duration, remaining)
             row = conn.execute(
                 "SELECT * FROM lcm_compaction_jobs WHERE job_id=?", (str(job_id),)
             ).fetchone()
@@ -5046,7 +6603,13 @@ class BackgroundCompactionStore:
                     SET lease_expires_at=?, heartbeat_at=?, updated_at=?
                     WHERE job_id=? AND state='prepared' AND lease_owner=?
                     """,
-                    (current + duration, current, current, str(job_id), str(owner)),
+                    (
+                        current + effective_duration,
+                        current,
+                        current,
+                        str(job_id),
+                        str(owner),
+                    ),
                 )
             else:
                 conn.execute(
@@ -5056,7 +6619,13 @@ class BackgroundCompactionStore:
                         lease_generation=lease_generation+1, updated_at=?
                     WHERE job_id=? AND state='prepared'
                     """,
-                    (str(owner), current + duration, current, current, str(job_id)),
+                    (
+                        str(owner),
+                        current + effective_duration,
+                        current,
+                        current,
+                        str(job_id),
+                    ),
                 )
             updated = conn.execute(
                 "SELECT * FROM lcm_compaction_jobs WHERE job_id=?", (str(job_id),)
@@ -5071,8 +6640,16 @@ class BackgroundCompactionStore:
         generation: int,
         write_timeout_ms: int | None = 100,
         now: float | None = None,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> bool:
-        with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             current = float(self._now() if now is None else now)
             cursor = conn.execute(
                 """
@@ -5094,9 +6671,17 @@ class BackgroundCompactionStore:
         owner: str,
         generation: int,
         write_timeout_ms: int | None,
+        lock_timeout_seconds: float | None,
+        write_deadline: float | None,
+        deadline_clock: Callable[[], float] | None,
     ) -> Iterator[sqlite3.Connection]:
         try:
-            with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+            with self._write_transaction(
+                busy_timeout_ms=write_timeout_ms,
+                lock_timeout_seconds=lock_timeout_seconds,
+                write_deadline=write_deadline,
+                deadline_clock=deadline_clock,
+            ) as conn:
                 yield conn
         except BaseException as exc:
             try:
@@ -5109,6 +6694,9 @@ class BackgroundCompactionStore:
                         if write_timeout_ms is None
                         else min(100, max(0, int(write_timeout_ms)))
                     ),
+                    lock_timeout_seconds=lock_timeout_seconds,
+                    write_deadline=write_deadline,
+                    deadline_clock=deadline_clock,
                 )
             except BaseException:
                 logger.warning(
@@ -5119,7 +6707,13 @@ class BackgroundCompactionStore:
                 marker in str(exc).lower() for marker in ("locked", "busy")
             ):
                 try:
-                    job = self.get_job(job_id)
+                    job = self.get_job(
+                        job_id,
+                        lock_timeout_seconds=lock_timeout_seconds,
+                        deadline=write_deadline,
+                        deadline_clock=deadline_clock,
+                        busy_timeout_ms=0,
+                    )
                     self.record_diagnostic_event(
                         "sqlite_lock_contention",
                         conversation_id=job.conversation_id if job else "",
@@ -5132,6 +6726,9 @@ class BackgroundCompactionStore:
                             if write_timeout_ms is None
                             else min(100, max(0, int(write_timeout_ms)))
                         ),
+                        lock_timeout_seconds=lock_timeout_seconds,
+                        write_deadline=write_deadline,
+                        deadline_clock=deadline_clock,
                     )
                 except BaseException:
                     logger.debug(
@@ -5325,6 +6922,191 @@ class BackgroundCompactionStore:
         )
         return cursor.rowcount == 1
 
+    @staticmethod
+    def _publication_lifecycle_status_under_tx(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        session_id: str,
+        expected_frontier_store_id: int,
+    ) -> str:
+        """Classify an active, ordinary-unbound, or stale publication scope.
+
+        Hermes finalizes the lifecycle row between ordinary API/tool turns.  In
+        that narrow gap ``current_session_id`` is NULL, while the same durable
+        session and frontier are retained in the last-finalized columns.  That
+        state is not an invalidation; publication must wait for the next bind.
+        A different session or frontier is still stale and fails closed.
+        """
+        lifecycle = conn.execute(
+            """
+            SELECT current_session_id, current_frontier_store_id,
+                   last_finalized_session_id,
+                   last_finalized_frontier_store_id
+            FROM lcm_lifecycle_state WHERE conversation_id=?
+            """,
+            (str(conversation_id),),
+        ).fetchone()
+        if lifecycle is None:
+            return "stale"
+        session = str(session_id or "")
+        frontier = max(0, int(expected_frontier_store_id or 0))
+        current_session = str(lifecycle["current_session_id"] or "")
+        if current_session:
+            if (
+                current_session == session
+                and int(lifecycle["current_frontier_store_id"] or 0) == frontier
+            ):
+                return "active"
+            return "stale"
+        if (
+            str(lifecycle["last_finalized_session_id"] or "") == session
+            and int(lifecycle["last_finalized_frontier_store_id"] or 0) == frontier
+        ):
+            return "temporarily_unbound"
+        return "stale"
+
+    @staticmethod
+    def _defer_prepared_publication_under_tx(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        owner: str,
+        generation: int,
+        current: float,
+    ) -> PromotionResult:
+        """Keep prepared work intact while atomically yielding its lease."""
+        job_id = str(row["job_id"])
+        released = conn.execute(
+            """
+            UPDATE lcm_compaction_jobs
+            SET lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL,
+                lease_generation=lease_generation+1, updated_at=?
+            WHERE job_id=? AND state='prepared' AND lease_owner=?
+              AND lease_generation=?
+            """,
+            (float(current), job_id, str(owner), int(generation)),
+        )
+        if released.rowcount != 1:
+            return PromotionResult(False, "lease_lost", job_id)
+        return PromotionResult(
+            False,
+            "lifecycle_temporarily_unbound",
+            job_id,
+            int(row["captured_watermark_store_id"] or 0),
+        )
+
+    @staticmethod
+    def _record_publication_telemetry_under_tx(
+        conn: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        prepared_rows: Sequence[sqlite3.Row],
+        published_at: float,
+        observed_active_tokens: int | None,
+        effective_context_window: int | None,
+        publication_trigger_tokens: int | None,
+        emergency_trigger_tokens: int | None,
+        trigger_policy: str,
+    ) -> None:
+        """Persist the exact successful publication boundary in the same tx."""
+
+        def optional_nonnegative(value: int | None) -> int | None:
+            if value is None:
+                return None
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        observed = optional_nonnegative(observed_active_tokens)
+        effective = optional_nonnegative(effective_context_window)
+        publication_trigger = optional_nonnegative(publication_trigger_tokens)
+        emergency_trigger = optional_nonnegative(emergency_trigger_tokens)
+        policy = str(trigger_policy or "")[:64]
+        if (
+            not policy
+            and effective is not None
+            and publication_trigger is not None
+            and effective - publication_trigger == 100_000
+        ):
+            policy = "fixed_reserve"
+        providers = {
+            str(item["creation_provider"] or "")
+            for item in prepared_rows
+            if str(item["creation_provider"] or "")
+        }
+        models = {
+            str(item["creation_model"] or "")
+            for item in prepared_rows
+            if str(item["creation_model"] or "")
+        }
+        provider = next(iter(providers)) if len(providers) == 1 else (
+            "mixed" if providers else ""
+        )
+        model = next(iter(models)) if len(models) == 1 else (
+            "mixed" if models else ""
+        )
+        prepared_at = row["prepared_at"]
+        wait_ms = (
+            max(0, int((float(published_at) - float(prepared_at)) * 1_000.0))
+            if prepared_at is not None
+            else None
+        )
+        conn.execute(
+            """
+            INSERT INTO lcm_compaction_publications(
+                job_id, conversation_id, session_id,
+                publication_fence_generation, range_identity,
+                observed_active_tokens, effective_context_window,
+                publication_trigger_tokens, emergency_trigger_tokens,
+                trigger_policy, prepared_to_published_ms,
+                source_token_count, summary_token_count,
+                provider, model, published_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                str(row["job_id"] or ""),
+                str(row["conversation_id"] or ""),
+                str(row["session_id"] or ""),
+                int(row["session_fence_generation"] or 0),
+                str(row["source_identity_hash"] or ""),
+                observed,
+                effective,
+                publication_trigger,
+                emergency_trigger,
+                policy,
+                wait_ms,
+                int(row["source_token_count"] or 0),
+                sum(int(item["summary_token_count"] or 0) for item in prepared_rows),
+                provider,
+                model,
+                float(published_at),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE lcm_compaction_range_dispositions
+            SET resolved_at=?, last_seen_at=?
+            WHERE conversation_id=? AND session_id=?
+              AND session_fence_generation=?
+              AND expected_frontier_store_id=?
+              AND captured_watermark_store_id=?
+              AND policy_fingerprint=? AND source_identity_hash=?
+            """,
+            (
+                float(published_at),
+                float(published_at),
+                str(row["conversation_id"] or ""),
+                str(row["session_id"] or ""),
+                int(row["session_fence_generation"] or 0),
+                int(row["expected_frontier_store_id"] or 0),
+                int(row["captured_watermark_store_id"] or 0),
+                str(row["policy_fingerprint"] or ""),
+                str(row["source_identity_hash"] or ""),
+            ),
+        )
+
     def _publish_partial_atomic_repair_under_tx(
         self,
         conn: sqlite3.Connection,
@@ -5334,6 +7116,11 @@ class BackgroundCompactionStore:
         generation: int,
         policy_fingerprint: str,
         failure_hook: str | Callable[[str], None] | None,
+        observed_active_tokens: int | None,
+        effective_context_window: int | None,
+        publication_trigger_tokens: int | None,
+        emergency_trigger_tokens: int | None,
+        trigger_policy: str,
         now: float | None,
     ) -> PromotionResult:
         """Publish one provenance bridge and its semantic parent atomically."""
@@ -5391,19 +7178,6 @@ class BackgroundCompactionStore:
             or not uncovered_ids
         ):
             return supersede("partial_repair_metadata_invalid")
-        lifecycle = conn.execute(
-            """
-            SELECT current_session_id, current_frontier_store_id
-            FROM lcm_lifecycle_state WHERE conversation_id=?
-            """,
-            (conversation,),
-        ).fetchone()
-        if (
-            lifecycle is None
-            or str(lifecycle["current_session_id"] or "") != session
-            or int(lifecycle["current_frontier_store_id"] or 0) != frontier
-        ):
-            return supersede("frontier_mismatch")
         fence = self._session_fence_under_tx(
             conn,
             conversation_id=conversation,
@@ -5419,6 +7193,22 @@ class BackgroundCompactionStore:
             != int(row["session_fence_generation"] or 0)
         ):
             return supersede("session_reset_or_rebound")
+        lifecycle_status = self._publication_lifecycle_status_under_tx(
+            conn,
+            conversation_id=conversation,
+            session_id=session,
+            expected_frontier_store_id=frontier,
+        )
+        if lifecycle_status == "temporarily_unbound":
+            return self._defer_prepared_publication_under_tx(
+                conn,
+                row,
+                owner=owner,
+                generation=generation,
+                current=current,
+            )
+        if lifecycle_status != "active":
+            return supersede("frontier_mismatch")
         raw_messages = self._load_source_range(
             conn,
             session_id=session,
@@ -5605,6 +7395,17 @@ class BackgroundCompactionStore:
         )
         if completed.rowcount != 1:
             raise RuntimeError("repair publication lease CAS changed inside transaction")
+        self._record_publication_telemetry_under_tx(
+            conn,
+            row=row,
+            prepared_rows=prepared_rows,
+            published_at=commit_current,
+            observed_active_tokens=observed_active_tokens,
+            effective_context_window=effective_context_window,
+            publication_trigger_tokens=publication_trigger_tokens,
+            emergency_trigger_tokens=emergency_trigger_tokens,
+            trigger_policy=trigger_policy,
+        )
         self._record_event_under_tx(
             conn,
             "partial_atomic_repair_published",
@@ -5631,7 +7432,15 @@ class BackgroundCompactionStore:
         policy_fingerprint: str,
         failure_hook: str | Callable[[str], None] | None = None,
         write_timeout_ms: int | None = 100,
+        observed_active_tokens: int | None = None,
+        effective_context_window: int | None = None,
+        publication_trigger_tokens: int | None = None,
+        emergency_trigger_tokens: int | None = None,
+        trigger_policy: str = "",
         now: float | None = None,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> PromotionResult:
         """Promote prepared nodes and the frontier in one strict CAS transaction."""
         with self._publication_transaction(
@@ -5639,6 +7448,9 @@ class BackgroundCompactionStore:
             owner=str(owner),
             generation=int(generation),
             write_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
         ) as conn:
             current = float(self._now() if now is None else now)
             row = conn.execute(
@@ -5670,6 +7482,11 @@ class BackgroundCompactionStore:
                     generation=int(generation),
                     policy_fingerprint=str(policy_fingerprint or ""),
                     failure_hook=failure_hook,
+                    observed_active_tokens=observed_active_tokens,
+                    effective_context_window=effective_context_window,
+                    publication_trigger_tokens=publication_trigger_tokens,
+                    emergency_trigger_tokens=emergency_trigger_tokens,
+                    trigger_policy=trigger_policy,
                     now=now,
                 )
 
@@ -5701,20 +7518,6 @@ class BackgroundCompactionStore:
 
             if str(row["policy_fingerprint"] or "") != str(policy_fingerprint or ""):
                 return supersede("policy_mismatch")
-            lifecycle = conn.execute(
-                """
-                SELECT current_session_id, current_frontier_store_id
-                FROM lcm_lifecycle_state WHERE conversation_id=?
-                """,
-                (row["conversation_id"],),
-            ).fetchone()
-            if (
-                lifecycle is None
-                or lifecycle["current_session_id"] != row["session_id"]
-                or int(lifecycle["current_frontier_store_id"] or 0)
-                != int(row["expected_frontier_store_id"] or 0)
-            ):
-                return supersede("frontier_mismatch")
             fence = self._session_fence_under_tx(
                 conn,
                 conversation_id=str(row["conversation_id"]),
@@ -5730,6 +7533,24 @@ class BackgroundCompactionStore:
                 != int(row["session_fence_generation"] or 0)
             ):
                 return supersede("session_reset_or_rebound")
+            lifecycle_status = self._publication_lifecycle_status_under_tx(
+                conn,
+                conversation_id=str(row["conversation_id"]),
+                session_id=str(row["session_id"]),
+                expected_frontier_store_id=int(
+                    row["expected_frontier_store_id"] or 0
+                ),
+            )
+            if lifecycle_status == "temporarily_unbound":
+                return self._defer_prepared_publication_under_tx(
+                    conn,
+                    row,
+                    owner=str(owner),
+                    generation=int(generation),
+                    current=current,
+                )
+            if lifecycle_status != "active":
+                return supersede("frontier_mismatch")
             source_ids = _load_ids(row["source_store_ids"])
             raw_messages = self._load_source_range(
                 conn,
@@ -5828,6 +7649,31 @@ class BackgroundCompactionStore:
             )
             if completed.rowcount != 1:
                 raise RuntimeError("background publication lease CAS changed inside transaction")
+            if str(row["job_kind"] or "") == _LOSSLESS_RAW_PROJECTION_JOB_KIND:
+                placeholders = ",".join("?" for _ in source_ids)
+                conn.execute(
+                    f"""
+                    UPDATE lcm_compaction_source_coverage
+                    SET publication_kind=?
+                    WHERE session_id=? AND store_id IN ({placeholders})
+                    """,
+                    (
+                        _LOSSLESS_RAW_PROJECTION_JOB_KIND,
+                        str(row["session_id"] or ""),
+                        *source_ids,
+                    ),
+                )
+            self._record_publication_telemetry_under_tx(
+                conn,
+                row=row,
+                prepared_rows=prepared_rows,
+                published_at=commit_current,
+                observed_active_tokens=observed_active_tokens,
+                effective_context_window=effective_context_window,
+                publication_trigger_tokens=publication_trigger_tokens,
+                emergency_trigger_tokens=emergency_trigger_tokens,
+                trigger_policy=trigger_policy,
+            )
             self._record_event_under_tx(
                 conn,
                 "prepared_summary_published",
@@ -5852,6 +7698,10 @@ class BackgroundCompactionStore:
         session_id: str | None = None,
         expected_frontier_store_id: int | None = None,
         policy_fingerprint: str | None = None,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> CompactionJob | None:
         where = ["job.conversation_id=?", "job.state='prepared'", "fence.publishable=1",
                  "fence.session_id=job.session_id",
@@ -5866,10 +7716,13 @@ class BackgroundCompactionStore:
         if policy_fingerprint is not None:
             where.append("job.policy_fingerprint=?")
             args.append(str(policy_fingerprint))
-        with self._lock:
-            if self._conn is None:
-                return None
-            row = self._conn.execute(
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
                 f"""SELECT job.* FROM lcm_compaction_jobs AS job
                 JOIN lcm_compaction_session_fences AS fence
                   ON fence.conversation_id=job.conversation_id
@@ -5949,6 +7802,9 @@ class BackgroundCompactionStore:
         debt_tokens: int = 0,
         reason: str = "foreground_emergency_compaction",
         write_timeout_ms: int | None = 100,
+        lock_timeout_seconds: float | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
         now: float | None = None,
     ) -> PromotionResult:
         """Publish an emergency foreground node with the same frontier fence."""
@@ -5956,7 +7812,12 @@ class BackgroundCompactionStore:
         source_ids = tuple(
             int(item) for item in (self._node_value(node, "source_ids", ()) or ())
         )
-        with self._write_transaction(busy_timeout_ms=write_timeout_ms) as conn:
+        with self._write_transaction(
+            busy_timeout_ms=write_timeout_ms,
+            lock_timeout_seconds=lock_timeout_seconds,
+            write_deadline=write_deadline,
+            deadline_clock=deadline_clock,
+        ) as conn:
             fence = self._session_fence_under_tx(
                 conn,
                 conversation_id=str(conversation_id),
@@ -6115,6 +7976,221 @@ class BackgroundCompactionStore:
             hermes_home=self._hermes_home,
         )
 
+    @staticmethod
+    def _callable_accepts_keyword(function: Callable[..., Any], name: str) -> bool:
+        """Return whether an injected callable explicitly accepts a safe kwarg."""
+        try:
+            parameters = inspect.signature(function).parameters
+        except (TypeError, ValueError):
+            return False
+        parameter = parameters.get(str(name))
+        return bool(
+            parameter is not None
+            and parameter.kind
+            in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+        ) or any(
+            item.kind == inspect.Parameter.VAR_KEYWORD
+            for item in parameters.values()
+        )
+
+    @staticmethod
+    def _provider_failure_reason(error: BaseException | str) -> str:
+        """Classify an error without retaining its potentially sensitive text."""
+        if isinstance(error, TimeoutError):
+            return "provider_timeout"
+        status = getattr(error, "status_code", None)
+        if status is None:
+            response = getattr(error, "response", None)
+            status = getattr(response, "status_code", None)
+        try:
+            status_code = int(status) if status is not None else 0
+        except (TypeError, ValueError, OverflowError):
+            status_code = 0
+        if status_code in {401, 403}:
+            return "provider_auth_error"
+        if status_code == 402:
+            return "provider_quota"
+        if status_code == 429:
+            return "provider_rate_limit"
+        lowered_type = type(error).__name__.lower()
+        lowered = str(error or "").lower()[:500]
+        if "timeout" in lowered_type or "timed out" in lowered or "deadline" in lowered:
+            return "provider_timeout"
+        if any(marker in lowered_type for marker in ("connection", "network")) or any(
+            marker in lowered
+            for marker in (
+                "connection refused",
+                "connection reset",
+                "connection error",
+                "network unreachable",
+                "name resolution",
+                "dns",
+            )
+        ):
+            return "provider_connection_error"
+        return "provider_error"
+
+    def _record_compaction_attempts(
+        self,
+        *,
+        job: CompactionJob,
+        chunk_ordinal: int,
+        source_token_count: int,
+        trace: Mapping[str, Any] | None,
+        fallback_reason: str = "",
+        fallback_latency_ms: int = 0,
+    ) -> None:
+        """Persist allowlisted logical route outcomes; never provider content."""
+        current = float(self._now())
+        allowed_outcomes = {"success", "failure", "rejected", "skipped"}
+        allowed_reasons = set(_EVENT_REASON_CODES) | {"provider_error"}
+        terminal_reason = str(fallback_reason or "")
+        if terminal_reason and terminal_reason not in allowed_reasons:
+            terminal_reason = "provider_error"
+        raw_attempts = (
+            list(trace.get("attempts") or [])
+            if isinstance(trace, Mapping)
+            else []
+        )
+        attempts = [dict(item) for item in raw_attempts if isinstance(item, Mapping)]
+        if attempts and terminal_reason:
+            # The runner's terminal observation wins over an incomplete trace
+            # snapshot or a provider success that arrived after the absolute
+            # deadline / durable lease loss.  Reclassifying the final logical
+            # route keeps doctor from reporting that unusable result as the
+            # latest success without inventing an extra provider call.
+            terminal_attempt = attempts[-1]
+            terminal_attempt.update(
+                {
+                    "outcome": "failure",
+                    "failure_reason": terminal_reason,
+                    "summary_token_count": 0,
+                    "latency_ms": max(0, int(fallback_latency_ms or 0)),
+                    "finished_at": current,
+                }
+            )
+            terminal_attempt.setdefault(
+                "started_at",
+                current - (max(0, int(fallback_latency_ms or 0)) / 1_000.0),
+            )
+        elif not attempts and terminal_reason:
+            attempts = [
+                {
+                    "escalation_level": 0,
+                    "logical_route_ordinal": 0,
+                    "actual_provider": "",
+                    "actual_model": "",
+                    "attribution_available": False,
+                    "fallback_used": None,
+                    "outcome": "failure",
+                    "failure_reason": terminal_reason,
+                    "source_token_count": source_token_count,
+                    "summary_token_count": 0,
+                    "latency_ms": fallback_latency_ms,
+                    "started_at": current - (max(0, fallback_latency_ms) / 1_000.0),
+                    "finished_at": current,
+                }
+            ]
+        if not attempts:
+            return
+        with self._write_transaction() as conn:
+            if conn.execute(
+                "SELECT 1 FROM lcm_compaction_jobs WHERE job_id=?",
+                (str(job.job_id),),
+            ).fetchone() is None:
+                return
+            for fallback_ordinal, attempt in enumerate(attempts):
+                outcome = str(attempt.get("outcome") or "provider_error")
+                failure_reason = str(attempt.get("failure_reason") or "")
+                if outcome not in allowed_outcomes:
+                    outcome = "failure"
+                if failure_reason not in allowed_reasons:
+                    failure_reason = "" if outcome == "success" else outcome
+                started_at = attempt.get("started_at")
+                finished_at = attempt.get("finished_at")
+                try:
+                    started_at = float(started_at)
+                except (TypeError, ValueError, OverflowError):
+                    started_at = current
+                try:
+                    finished_at = float(finished_at)
+                except (TypeError, ValueError, OverflowError):
+                    finished_at = current
+                if started_at <= 0 or started_at > current + 86_400:
+                    started_at = current
+                if finished_at <= 0 or finished_at > current + 86_400:
+                    finished_at = current
+                finished_at = max(started_at, finished_at)
+                fallback_used = attempt.get("fallback_used")
+                conn.execute(
+                    """
+                    INSERT INTO lcm_compaction_attempts(
+                        job_id, job_attempt, chunk_ordinal, escalation_level,
+                        logical_route_ordinal, actual_provider, actual_model,
+                        attribution_available, fallback_used, outcome,
+                        failure_reason, source_token_count, summary_token_count,
+                        latency_ms, started_at, finished_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(
+                        job_id, job_attempt, chunk_ordinal,
+                        escalation_level, logical_route_ordinal
+                    ) DO UPDATE SET
+                        actual_provider=excluded.actual_provider,
+                        actual_model=excluded.actual_model,
+                        attribution_available=excluded.attribution_available,
+                        fallback_used=excluded.fallback_used,
+                        outcome=excluded.outcome,
+                        failure_reason=excluded.failure_reason,
+                        source_token_count=excluded.source_token_count,
+                        summary_token_count=excluded.summary_token_count,
+                        latency_ms=excluded.latency_ms,
+                        started_at=excluded.started_at,
+                        finished_at=excluded.finished_at
+                    """,
+                    (
+                        str(job.job_id),
+                        max(1, int(job.attempt_count or 1)),
+                        max(0, int(chunk_ordinal)),
+                        max(0, int(attempt.get("escalation_level") or 0)),
+                        max(
+                            0,
+                            int(
+                                attempt.get("logical_route_ordinal")
+                                if attempt.get("logical_route_ordinal") is not None
+                                else fallback_ordinal
+                            ),
+                        ),
+                        str(attempt.get("actual_provider") or "")[:64],
+                        str(attempt.get("actual_model") or "")[:160],
+                        int(bool(attempt.get("attribution_available"))),
+                        None if fallback_used is None else int(bool(fallback_used)),
+                        outcome,
+                        failure_reason,
+                        max(
+                            0,
+                            int(
+                                attempt.get("source_token_count")
+                                or source_token_count
+                                or 0
+                            ),
+                        ),
+                        max(0, int(attempt.get("summary_token_count") or 0)),
+                        max(0, int(attempt.get("latency_ms") or 0)),
+                        started_at,
+                        finished_at,
+                    ),
+                )
+
+    def _try_record_compaction_attempts(self, **kwargs: Any) -> None:
+        """Persist optional attempt telemetry without owning job correctness."""
+        try:
+            self._record_compaction_attempts(**kwargs)
+        except BaseException as exc:
+            logger.warning(
+                "LCM compaction attempt telemetry persistence failed; error=%s",
+                _sanitize_error(exc),
+            )
+
     def run_next_job(
         self,
         owner: str,
@@ -6123,7 +8199,12 @@ class BackgroundCompactionStore:
         spend_guard: Any = None,
         cancel_event: threading.Event | None = None,
     ) -> CompactionJob | None:
-        """Claim and prepare one job while keeping all model I/O outside SQL."""
+        """Claim and prepare one job while keeping all model I/O outside SQL.
+
+        ``cancel_event`` is a caller-owned shutdown signal.  This method
+        observes it but never sets it; provider calls receive a distinct
+        job-local event that also carries deadlines and lease loss.
+        """
         current_policy = background_policy_fingerprint(self.config)
         claimed = self.claim_next_job(
             owner=owner,
@@ -6131,6 +8212,69 @@ class BackgroundCompactionStore:
         )
         if claimed is None:
             return None
+        permit_cleanup: dict[str, Any] = {
+            "guardian_owned": False,
+            "provider_completed": None,
+            "release": None,
+            "start_guardian": None,
+        }
+        try:
+            return self._run_claimed_job(
+                claimed,
+                owner=owner,
+                summarizer=summarizer,
+                circuit_breaker=circuit_breaker,
+                spend_guard=spend_guard,
+                cancel_event=cancel_event,
+                permit_cleanup=permit_cleanup,
+            )
+        finally:
+            if not bool(permit_cleanup.get("guardian_owned")):
+                completed = permit_cleanup.get("provider_completed")
+                start_guardian = permit_cleanup.get("start_guardian")
+                if (
+                    isinstance(completed, threading.Event)
+                    and not completed.is_set()
+                    and callable(start_guardian)
+                ):
+                    start_guardian()
+                else:
+                    release = permit_cleanup.get("release")
+                    if callable(release):
+                        release()
+                    else:
+                        try:
+                            self.release_provider_permit(
+                                claimed.job_id,
+                                owner=owner,
+                                generation=claimed.lease_generation,
+                            )
+                        except BaseException as exc:
+                            logger.warning(
+                                "LCM provider-permit cleanup failed; error=%s",
+                                _sanitize_error(exc),
+                            )
+                            provider_completed = threading.Event()
+                            provider_completed.set()
+                            self._start_provider_permit_guardian(
+                                provider_completed,
+                                job_id=claimed.job_id,
+                                owner=owner,
+                                generation=claimed.lease_generation,
+                            )
+
+    def _run_claimed_job(
+        self,
+        claimed: CompactionJob,
+        *,
+        owner: str,
+        summarizer: Callable[..., Any] | None,
+        circuit_breaker: Any,
+        spend_guard: Any,
+        cancel_event: threading.Event | None,
+        permit_cleanup: dict[str, Any],
+    ) -> CompactionJob | None:
+        """Run one durable claim under ``run_next_job``'s cleanup invariant."""
         deadline_seconds = max(
             1.0,
             float(
@@ -6141,6 +8285,21 @@ class BackgroundCompactionStore:
         # The durable claim starts the wall-clock budget.  Source validation is
         # part of the job, not free work before the advertised timeout.
         deadline = time.monotonic() + deadline_seconds
+        # A job deadline is a cancellation boundary for this provider call,
+        # not a shutdown request for the persistent runtime that owns it.
+        # Keep the provider-facing event local and only observe the caller's
+        # event as an upstream stop signal; job timeout/lease-loss paths must
+        # never mutate that caller-owned state.
+        shutdown_event = cancel_event
+        provider_cancel_event = threading.Event()
+
+        def cancellation_requested() -> bool:
+            if provider_cancel_event.is_set():
+                return True
+            if shutdown_event is not None and shutdown_event.is_set():
+                provider_cancel_event.set()
+                return True
+            return False
 
         def release_unused_permit() -> None:
             try:
@@ -6149,10 +8308,10 @@ class BackgroundCompactionStore:
                     owner=owner,
                     generation=claimed.lease_generation,
                 )
-            except BaseException:
+            except BaseException as exc:
                 logger.warning(
-                    "LCM could not release an unused provider permit",
-                    exc_info=True,
+                    "LCM could not release an unused provider permit; error=%s",
+                    _sanitize_error(exc),
                 )
                 provider_completed = threading.Event()
                 provider_completed.set()
@@ -6162,6 +8321,9 @@ class BackgroundCompactionStore:
                     owner=owner,
                     generation=claimed.lease_generation,
                 )
+                permit_cleanup["guardian_owned"] = True
+
+        permit_cleanup["release"] = release_unused_permit
 
         def heartbeat_before_provider(*, activate_provider: bool = False) -> bool:
             try:
@@ -6240,7 +8402,6 @@ class BackgroundCompactionStore:
         )
         heartbeat_interval = max(0.25, min(lease_seconds / 3.0, 30.0))
         model = str(getattr(self.config, "summary_model", "") or "")
-        provider = model.split("/", 1)[0] if "/" in model else ""
         try:
             existing_by_ordinal = {
                 node.ordinal: node
@@ -6296,7 +8457,8 @@ class BackgroundCompactionStore:
                 continue
 
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or (cancel_event is not None and cancel_event.is_set()):
+            if remaining <= 0 or cancellation_requested():
+                provider_cancel_event.set()
                 try:
                     retry = self.mark_retry(
                         claimed.job_id,
@@ -6316,6 +8478,8 @@ class BackgroundCompactionStore:
 
             completed = threading.Event()
             result_box: dict[str, Any] = {}
+            route_trace: dict[str, Any] = {"attempts": []}
+            provider_started = time.monotonic()
             source_tokens = max(1, int(chunk.source_token_count or 0))
             token_budget = min(12_000, max(2_000, int(source_tokens * 0.20)))
             configured_timeout = max(
@@ -6323,36 +8487,110 @@ class BackgroundCompactionStore:
                 float(getattr(self.config, "summary_timeout_ms", 30_000) or 30_000)
                 / 1000.0,
             )
+            completion_owner_lock = threading.Lock()
+            completion_owner: dict[str, Any] = {
+                "provider_finished": False,
+                "finalizer": None,
+                "finalizer_claimed": False,
+            }
 
-            def summarize_one() -> None:
+            def arm_provider_completion_finalizer(
+                finalizer: Callable[[], None],
+                *,
+                _owner: dict[str, Any] = completion_owner,
+                _lock: threading.Lock = completion_owner_lock,
+            ) -> None:
+                """Transfer failed guardian ownership exactly once."""
+                run_finalizer: Callable[[], None] | None = None
+                with _lock:
+                    if _owner["finalizer"] is not None or _owner["finalizer_claimed"]:
+                        return
+                    _owner["finalizer"] = finalizer
+                    if _owner["provider_finished"]:
+                        _owner["finalizer_claimed"] = True
+                        run_finalizer = finalizer
+                if run_finalizer is not None:
+                    run_finalizer()
+
+            def notify_provider_finished(
+                *,
+                _owner: dict[str, Any] = completion_owner,
+                _lock: threading.Lock = completion_owner_lock,
+            ) -> None:
+                run_finalizer: Callable[[], None] | None = None
+                with _lock:
+                    _owner["provider_finished"] = True
+                    if (
+                        _owner["finalizer"] is not None
+                        and not _owner["finalizer_claimed"]
+                    ):
+                        _owner["finalizer_claimed"] = True
+                        run_finalizer = _owner["finalizer"]
+                if run_finalizer is not None:
+                    run_finalizer()
+
+            def start_provider_permit_guardian() -> bool:
+                if bool(permit_cleanup.get("guardian_owned")):
+                    return True
                 try:
-                    result_box["value"] = summarizer(
-                        text=self._serialize_chunk(chunk),
-                        source_tokens=source_tokens,
-                        token_budget=token_budget,
-                        depth=1 if aggregation_pass else 0,
-                        model=model,
-                        fallback_models=getattr(
+                    started = self._start_provider_permit_guardian(
+                        completed,
+                        job_id=claimed.job_id,
+                        owner=owner,
+                        generation=claimed.lease_generation,
+                        on_start_failure=arm_provider_completion_finalizer,
+                    )
+                except BaseException:
+                    permit_cleanup["guardian_owned"] = False
+                    raise
+                permit_cleanup["guardian_owned"] = True
+                return started
+
+            permit_cleanup["provider_completed"] = completed
+            permit_cleanup["start_guardian"] = start_provider_permit_guardian
+
+            def summarize_one(
+                _notify_provider_finished: Callable[[], None] = (
+                    notify_provider_finished
+                ),
+            ) -> None:
+                try:
+                    provider_remaining = max(0.001, deadline - time.monotonic())
+                    summarize_kwargs: dict[str, Any] = {
+                        "text": self._serialize_chunk(chunk),
+                        "source_tokens": source_tokens,
+                        "token_budget": token_budget,
+                        "depth": 1 if aggregation_pass else 0,
+                        "model": model,
+                        "fallback_models": getattr(
                             self.config, "summary_fallback_models", None
                         ),
-                        circuit_breaker=circuit_breaker,
-                        spend_guard=spend_guard,
-                        timeout=min(configured_timeout, max(0.001, remaining)),
-                        l2_budget_ratio=float(
+                        "circuit_breaker": circuit_breaker,
+                        "spend_guard": spend_guard,
+                        "timeout": min(configured_timeout, provider_remaining),
+                        "l2_budget_ratio": float(
                             getattr(self.config, "l2_budget_ratio", 0.5) or 0.5
                         ),
-                        l3_truncate_tokens=int(
+                        "l3_truncate_tokens": int(
                             getattr(self.config, "l3_truncate_tokens", 512) or 512
                         ),
-                        custom_instructions=str(
+                        "custom_instructions": str(
                             getattr(self.config, "custom_instructions", "") or ""
                         ),
-                    )
+                    }
+                    if self._callable_accepts_keyword(summarizer, "trace"):
+                        summarize_kwargs["trace"] = route_trace
+                    if self._callable_accepts_keyword(summarizer, "deadline"):
+                        summarize_kwargs["deadline"] = deadline
+                    if self._callable_accepts_keyword(summarizer, "cancel_event"):
+                        summarize_kwargs["cancel_event"] = provider_cancel_event
+                    result_box["value"] = summarizer(**summarize_kwargs)
                 except BaseException as exc:
                     result_box["error"] = exc
                 finally:
                     result_box["completed_at"] = time.monotonic()
                     completed.set()
+                    _notify_provider_finished()
 
             if not heartbeat_before_provider(activate_provider=True):
                 return self.get_job(claimed.job_id)
@@ -6373,8 +8611,9 @@ class BackgroundCompactionStore:
                     monotonic_now = time.monotonic()
                     if (
                         monotonic_now >= deadline
-                        or (cancel_event is not None and cancel_event.is_set())
+                        or cancellation_requested()
                     ):
+                        provider_cancel_event.set()
                         break
                     completed.wait(timeout=min(0.25, deadline - monotonic_now))
                     if completed.is_set():
@@ -6386,35 +8625,56 @@ class BackgroundCompactionStore:
                             generation=claimed.lease_generation,
                         )
                         if not lease_valid:
+                            provider_cancel_event.set()
                             break
                         next_heartbeat = time.monotonic() + heartbeat_interval
             except BaseException:
+                provider_cancel_event.set()
                 if completed.is_set():
                     release_unused_permit()
                 else:
-                    self._start_provider_permit_guardian(
-                        completed,
-                        job_id=claimed.job_id,
-                        owner=owner,
-                        generation=claimed.lease_generation,
-                    )
+                    start_provider_permit_guardian()
                 raise
 
             completed_at = float(result_box.get("completed_at") or 0.0)
-            timed_out = not completed.is_set() or completed_at > deadline
+            timed_out = (
+                cancellation_requested()
+                or not completed.is_set()
+                or completed_at > deadline
+            )
             if not lease_valid:
+                provider_cancel_event.set()
+                self._try_record_compaction_attempts(
+                    job=claimed,
+                    chunk_ordinal=chunk.ordinal,
+                    source_token_count=source_tokens,
+                    trace=route_trace,
+                    fallback_reason="stale_lease",
+                    fallback_latency_ms=max(
+                        0,
+                        int((time.monotonic() - provider_started) * 1_000.0),
+                    ),
+                )
                 if not completed.is_set():
-                    self._start_provider_permit_guardian(
-                        completed,
-                        job_id=claimed.job_id,
-                        owner=owner,
-                        generation=claimed.lease_generation,
-                    )
+                    start_provider_permit_guardian()
                 else:
                     release_unused_permit()
                 return self.get_job(claimed.job_id)
             if timed_out:
+                provider_cancel_event.set()
                 provider_still_running = not completed.is_set()
+                elapsed_ms = max(
+                    0,
+                    int((time.monotonic() - provider_started) * 1_000.0),
+                )
+                self._try_record_compaction_attempts(
+                    job=claimed,
+                    chunk_ordinal=chunk.ordinal,
+                    source_token_count=source_tokens,
+                    trace=route_trace,
+                    fallback_reason="provider_timeout",
+                    fallback_latency_ms=elapsed_ms,
+                )
                 try:
                     retry = self.mark_retry(
                         claimed.job_id,
@@ -6428,30 +8688,34 @@ class BackgroundCompactionStore:
                     )
                 except BaseException:
                     if provider_still_running:
-                        self._start_provider_permit_guardian(
-                            completed,
-                            job_id=claimed.job_id,
-                            owner=owner,
-                            generation=claimed.lease_generation,
-                        )
+                        start_provider_permit_guardian()
                     else:
                         release_unused_permit()
                     raise
                 if provider_still_running:
-                    self._start_provider_permit_guardian(
-                        completed,
-                        job_id=claimed.job_id,
-                        owner=owner,
-                        generation=claimed.lease_generation,
-                    )
+                    start_provider_permit_guardian()
                 return retry if isinstance(retry, CompactionJob) else self.get_job(claimed.job_id)
             if "error" in result_box:
+                failure_reason = self._provider_failure_reason(result_box["error"])
+                elapsed_ms = max(
+                    0,
+                    int((time.monotonic() - provider_started) * 1_000.0),
+                )
+                self._try_record_compaction_attempts(
+                    job=claimed,
+                    chunk_ordinal=chunk.ordinal,
+                    source_token_count=source_tokens,
+                    trace=route_trace,
+                    fallback_reason=failure_reason,
+                    fallback_latency_ms=elapsed_ms,
+                )
                 try:
                     retry = self.mark_retry(
                         claimed.job_id,
                         owner=owner,
                         generation=claimed.lease_generation,
                         error=result_box["error"],
+                        completion_reason=failure_reason,
                     )
                 except BaseException:
                     release_unused_permit()
@@ -6467,6 +8731,25 @@ class BackgroundCompactionStore:
             else:
                 summary = str(value or "")
                 level = 0
+            elapsed_ms = max(
+                0,
+                int((time.monotonic() - provider_started) * 1_000.0),
+            )
+            terminal_reason = str(route_trace.get("terminal_reason") or "")
+            if terminal_reason not in _EVENT_REASON_CODES:
+                terminal_reason = ""
+            self._try_record_compaction_attempts(
+                job=claimed,
+                chunk_ordinal=chunk.ordinal,
+                source_token_count=source_tokens,
+                trace=route_trace,
+                fallback_reason=(
+                    terminal_reason
+                    if terminal_reason
+                    else ("non_compressing_output" if not summary or level == 3 else "")
+                ),
+                fallback_latency_ms=elapsed_ms,
+            )
             if not summary or level == 3:
                 error = RuntimeError(
                     "background summarizer returned no publishable provider summary"
@@ -6477,6 +8760,12 @@ class BackgroundCompactionStore:
                         owner=owner,
                         generation=claimed.lease_generation,
                         error=error,
+                        completion_reason=(terminal_reason or "non_compressing_output"),
+                        terminal=(
+                            not terminal_reason
+                            or terminal_reason
+                            in {"non_compressing_output", "reasoning_only_output"}
+                        ),
                     )
                 except BaseException:
                     release_unused_permit()
@@ -6484,14 +8773,59 @@ class BackgroundCompactionStore:
                 if not isinstance(retry, CompactionJob):
                     release_unused_permit()
                 return retry if isinstance(retry, CompactionJob) else self.get_job(claimed.job_id)
+            successful_attempt = next(
+                (
+                    item
+                    for item in reversed(list(route_trace.get("attempts") or []))
+                    if isinstance(item, Mapping)
+                    and str(item.get("outcome") or "") == "success"
+                ),
+                None,
+            )
+            creation_provider = (
+                str(successful_attempt.get("actual_provider") or "")
+                if successful_attempt is not None
+                else ""
+            )
+            creation_model = (
+                str(successful_attempt.get("actual_model") or "")
+                if successful_attempt is not None
+                else ""
+            )
+            attribution_available = bool(
+                successful_attempt is not None
+                and successful_attempt.get("attribution_available")
+                and creation_provider
+                and creation_model
+            )
+            fallback_used = (
+                successful_attempt.get("fallback_used")
+                if successful_attempt is not None
+                else None
+            )
             node = PreparedSummaryNode(
                 ordinal=chunk.ordinal,
                 summary=summary,
                 source_store_ids=chunk.source_store_ids,
                 source_token_count=source_tokens,
                 summary_token_count=max(1, int(count_tokens(summary))),
-                creation_model=model,
-                creation_provider=provider,
+                creation_model=creation_model,
+                creation_provider=creation_provider,
+                route_latency_ms=(
+                    max(0, int(successful_attempt.get("latency_ms") or 0))
+                    if successful_attempt is not None
+                    else elapsed_ms
+                ),
+                attempt_number=max(1, int(claimed.attempt_count or 1)),
+                escalation_level=(
+                    max(0, int(successful_attempt.get("escalation_level") or level))
+                    if successful_attempt is not None
+                    else max(0, level)
+                ),
+                attribution_available=attribution_available,
+                fallback_used=(
+                    None if fallback_used is None else bool(fallback_used)
+                ),
             )
             try:
                 saved = self.save_prepared_progress(
@@ -6547,6 +8881,11 @@ class BackgroundCompactionStore:
                     summary_token_count=aggregate.summary_token_count,
                     creation_model=aggregate.creation_model,
                     creation_provider=aggregate.creation_provider,
+                    route_latency_ms=aggregate.route_latency_ms,
+                    attempt_number=aggregate.attempt_number,
+                    escalation_level=aggregate.escalation_level,
+                    attribution_available=aggregate.attribution_available,
+                    fallback_used=aggregate.fallback_used,
                 )
             ]
 
@@ -6572,8 +8911,15 @@ class BackgroundCompactionStore:
         job_id: str,
         owner: str,
         generation: int,
-    ) -> None:
-        """Fence a timeout-ignoring provider until it physically returns."""
+        on_start_failure: Callable[[Callable[[], None]], None] | None = None,
+    ) -> bool:
+        """Fence a timeout-ignoring provider until it physically returns.
+
+        ``on_start_failure`` transfers the one-shot finalizer to the physical
+        provider thread when this helper thread cannot start.  Callers that
+        own such a thread must arrange to invoke the supplied finalizer only
+        after the provider has actually returned.
+        """
         db_path = str(self.db_path)
         config = self.config
         lease_seconds = max(
@@ -6583,28 +8929,62 @@ class BackgroundCompactionStore:
             ),
         )
         heartbeat_interval = max(0.25, min(lease_seconds / 3.0, 30.0))
-        retry_interval = max(0.05, min(0.1, heartbeat_interval))
+        retry_initial = 0.25
+        retry_maximum = max(
+            retry_initial,
+            min(5.0, max(1.0, heartbeat_interval)),
+        )
+        log_interval = max(5.0, min(60.0, heartbeat_interval))
 
         def guard() -> None:
             guardian: BackgroundCompactionStore | None = None
+            retry_interval = retry_initial
+            last_log_at: float | None = None
+            suppressed_logs = 0
 
-            def wait_before_retry() -> None:
+            def wait_before_retry() -> float:
+                nonlocal retry_interval
+                delay = retry_interval
+                retry_interval = min(retry_maximum, retry_interval * 2.0)
                 if completed.is_set():
-                    time.sleep(retry_interval)
+                    time.sleep(delay)
                 else:
-                    completed.wait(timeout=retry_interval)
+                    completed.wait(timeout=delay)
+                return delay
+
+            def reset_retry_interval() -> None:
+                nonlocal retry_interval
+                retry_interval = retry_initial
+
+            def log_retry(phase: str, error: BaseException, delay: float) -> None:
+                nonlocal last_log_at, suppressed_logs
+                current = time.monotonic()
+                if last_log_at is not None and current - last_log_at < log_interval:
+                    suppressed_logs += 1
+                    return
+                logger.warning(
+                    "LCM provider-permit guardian %s failed; retrying in %.2fs; "
+                    "error=%s; suppressed=%d",
+                    phase,
+                    delay,
+                    _sanitize_error(error),
+                    suppressed_logs,
+                )
+                last_log_at = current
+                suppressed_logs = 0
 
             def open_guardian() -> BackgroundCompactionStore:
                 nonlocal guardian
+                if guardian is not None:
+                    return guardian
                 while guardian is None:
                     try:
                         guardian = BackgroundCompactionStore(db_path, config=config)
-                    except BaseException:
-                        logger.warning(
-                            "LCM provider-permit guardian open failed; retrying",
-                            exc_info=True,
-                        )
+                    except BaseException as exc:
+                        delay = retry_interval
+                        log_retry("open", exc, delay)
                         wait_before_retry()
+                reset_retry_interval()
                 return guardian
 
             try:
@@ -6619,13 +8999,12 @@ class BackgroundCompactionStore:
                             generation=generation,
                             lease_seconds=lease_seconds,
                         )
-                    except BaseException:
-                        logger.warning(
-                            "LCM provider-permit guardian heartbeat failed; retrying",
-                            exc_info=True,
-                        )
+                    except BaseException as exc:
+                        delay = retry_interval
+                        log_retry("heartbeat", exc, delay)
                         wait_before_retry()
                         continue
+                    reset_retry_interval()
                     if not held:
                         return
 
@@ -6641,22 +9020,47 @@ class BackgroundCompactionStore:
                             generation=generation,
                         )
                         return
-                    except BaseException:
-                        logger.warning(
-                            "LCM provider-permit guardian release failed; retrying",
-                            exc_info=True,
-                        )
+                    except BaseException as exc:
+                        delay = retry_interval
+                        log_retry("release", exc, delay)
                         wait_before_retry()
             finally:
                 if guardian is not None:
                     guardian.close()
                 _notify_background_runtime(db_path)
 
-        threading.Thread(
-            target=guard,
-            name=f"lcm-bg-permit-guardian-{str(job_id)[:8]}",
-            daemon=True,
-        ).start()
+        try:
+            guardian_thread = threading.Thread(
+                target=guard,
+                name=f"lcm-bg-permit-guardian-{str(job_id)[:8]}",
+                daemon=True,
+            )
+            guardian_thread.start()
+        except BaseException as exc:
+            logger.error(
+                "LCM provider-permit guardian thread start failed; error=%s",
+                _sanitize_error(exc),
+            )
+
+            def start_fallback_guardian() -> None:
+                """Start the retrying guardian without blocking its caller."""
+                try:
+                    _thread.start_new_thread(guard, ())
+                except BaseException as fallback_exc:
+                    logger.error(
+                        "LCM provider-permit fallback guardian start failed; error=%s",
+                        _sanitize_error(fallback_exc),
+                    )
+
+            if on_start_failure is not None:
+                on_start_failure(start_fallback_guardian)
+            elif completed.is_set():
+                # No live provider owns this permit, so cleanup can begin
+                # immediately, but its durable retry loop must still run away
+                # from the foreground/provider caller.
+                start_fallback_guardian()
+            return False
+        return True
 
     def status(
         self,
@@ -6789,11 +9193,104 @@ class BackgroundCompactionStore:
                 """,
                 permit_args,
             ).fetchone()
+            publication_where = ""
+            publication_args: tuple[Any, ...] = ()
+            if conversation_id:
+                publication_where = "WHERE conversation_id=?"
+                publication_args = (str(conversation_id),)
+            publication_telemetry_row = conn.execute(
+                f"""
+                SELECT * FROM lcm_compaction_publications
+                {publication_where}
+                ORDER BY published_at DESC LIMIT 1
+                """,
+                publication_args,
+            ).fetchone()
+            attempt_where = ""
+            attempt_args: list[Any] = []
+            if conversation_id:
+                attempt_where = "WHERE job.conversation_id=?"
+                attempt_args.append(str(conversation_id))
+            last_attempt_row = conn.execute(
+                f"""
+                SELECT attempt.*
+                FROM lcm_compaction_attempts AS attempt
+                JOIN lcm_compaction_jobs AS job ON job.job_id=attempt.job_id
+                {attempt_where}
+                ORDER BY attempt.finished_at DESC, attempt.attempt_id DESC
+                LIMIT 1
+                """,
+                attempt_args,
+            ).fetchone()
+            recent_where = "attempt.finished_at>=?"
+            recent_args: list[Any] = [current - 86_400.0]
+            if conversation_id:
+                recent_where += " AND job.conversation_id=?"
+                recent_args.append(str(conversation_id))
+            recent_provider_outcomes = {
+                str(result["reason"]): int(result["count"] or 0)
+                for result in conn.execute(
+                    f"""
+                    SELECT CASE
+                             WHEN attempt.outcome='success' THEN 'success'
+                             ELSE COALESCE(
+                                 NULLIF(attempt.failure_reason,''),
+                                 attempt.outcome
+                             )
+                           END AS reason,
+                           COUNT(*) AS count
+                    FROM lcm_compaction_attempts AS attempt
+                    JOIN lcm_compaction_jobs AS job
+                      ON job.job_id=attempt.job_id
+                    WHERE {recent_where}
+                    GROUP BY reason
+                    """,
+                    recent_args,
+                ).fetchall()
+            }
+            attribution_where = ""
+            attribution_args: tuple[Any, ...] = ()
+            if conversation_id:
+                attribution_where = "WHERE job.conversation_id=?"
+                attribution_args = (str(conversation_id),)
+            attribution_row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS prepared_nodes,
+                       COALESCE(SUM(node.attribution_available),0)
+                           AS attributed_nodes
+                FROM lcm_compaction_prepared_nodes AS node
+                JOIN lcm_compaction_jobs AS job ON job.job_id=node.job_id
+                {attribution_where}
+                """,
+                attribution_args,
+            ).fetchone()
+            disposition_where = "WHERE resolved_at IS NULL"
+            disposition_args: list[Any] = []
+            if conversation_id:
+                disposition_where += " AND conversation_id=?"
+                disposition_args.append(str(conversation_id))
+            range_dispositions = {
+                str(result["reason_code"]): int(result["count"] or 0)
+                for result in conn.execute(
+                    f"""
+                    SELECT reason_code, COUNT(*) AS count
+                    FROM lcm_compaction_range_dispositions
+                    {disposition_where}
+                    GROUP BY reason_code
+                    """,
+                    disposition_args,
+                ).fetchall()
+            }
 
         current_job = None
         if current_row is not None:
+            lease_active = bool(
+                current_row["lease_owner"]
+                and current_row["lease_expires_at"] is not None
+                and float(current_row["lease_expires_at"]) > current
+            )
             remaining = None
-            if current_row["lease_expires_at"] is not None:
+            if lease_active:
                 remaining = max(0.0, float(current_row["lease_expires_at"]) - current)
             current_job = {
                 "job_id": str(current_row["job_id"]),
@@ -6802,7 +9299,9 @@ class BackgroundCompactionStore:
                 "captured_watermark_store_id": int(current_row["captured_watermark_store_id"] or 0),
                 "debt_tokens": int(current_row["source_token_count"] or 0),
                 "attempt_count": int(current_row["attempt_count"] or 0),
-                "lease_owner_hint": _owner_hint(current_row["lease_owner"]),
+                "lease_owner_hint": (
+                    _owner_hint(current_row["lease_owner"]) if lease_active else None
+                ),
                 "lease_remaining_seconds": remaining,
                 "next_retry_at": current_row["next_retry_at"],
                 "last_error": _sanitize_error(current_row["last_error"]),
@@ -6868,13 +9367,101 @@ class BackgroundCompactionStore:
                 lease_seconds,
                 max(0.0, float(permit_row["minimum_lease_expires_at"]) - current),
             )
+
+        last_publication_telemetry = None
+        if publication_telemetry_row is not None:
+            wait_ms = publication_telemetry_row["prepared_to_published_ms"]
+            last_publication_telemetry = {
+                "job_id": str(publication_telemetry_row["job_id"] or ""),
+                "range_identity": str(
+                    publication_telemetry_row["range_identity"] or ""
+                ),
+                "publication_fence_generation": int(
+                    publication_telemetry_row["publication_fence_generation"] or 0
+                ),
+                "observed_active_tokens": publication_telemetry_row[
+                    "observed_active_tokens"
+                ],
+                "effective_context_window": publication_telemetry_row[
+                    "effective_context_window"
+                ],
+                "publication_trigger_tokens": publication_telemetry_row[
+                    "publication_trigger_tokens"
+                ],
+                "emergency_trigger_tokens": publication_telemetry_row[
+                    "emergency_trigger_tokens"
+                ],
+                "trigger_policy": str(
+                    publication_telemetry_row["trigger_policy"] or ""
+                ),
+                "prepared_to_published_seconds": (
+                    max(0.0, float(wait_ms) / 1_000.0)
+                    if wait_ms is not None
+                    else None
+                ),
+                "source_token_count": int(
+                    publication_telemetry_row["source_token_count"] or 0
+                ),
+                "summary_token_count": int(
+                    publication_telemetry_row["summary_token_count"] or 0
+                ),
+                "provider": str(publication_telemetry_row["provider"] or ""),
+                "model": str(publication_telemetry_row["model"] or ""),
+                "published_at": float(
+                    publication_telemetry_row["published_at"] or 0.0
+                ),
+            }
+        last_provider_attempt = None
+        if last_attempt_row is not None:
+            last_provider_attempt = {
+                "job_id": str(last_attempt_row["job_id"] or ""),
+                "attempt_number": int(last_attempt_row["job_attempt"] or 0),
+                "chunk_ordinal": int(last_attempt_row["chunk_ordinal"] or 0),
+                "escalation_level": int(
+                    last_attempt_row["escalation_level"] or 0
+                ),
+                "logical_route_ordinal": int(
+                    last_attempt_row["logical_route_ordinal"] or 0
+                ),
+                "provider": str(last_attempt_row["actual_provider"] or ""),
+                "model": str(last_attempt_row["actual_model"] or ""),
+                "attribution_available": bool(
+                    last_attempt_row["attribution_available"]
+                ),
+                "fallback_used": (
+                    None
+                    if last_attempt_row["fallback_used"] is None
+                    else bool(last_attempt_row["fallback_used"])
+                ),
+                "outcome": str(last_attempt_row["outcome"] or ""),
+                "failure_reason": str(last_attempt_row["failure_reason"] or ""),
+                "source_token_count": int(
+                    last_attempt_row["source_token_count"] or 0
+                ),
+                "summary_token_count": int(
+                    last_attempt_row["summary_token_count"] or 0
+                ),
+                "latency_ms": int(last_attempt_row["latency_ms"] or 0),
+                "finished_at": float(last_attempt_row["finished_at"] or 0.0),
+            }
         return {
             "enabled": enabled,
             "worker_count": max(
                 0, int(getattr(self.config, "background_compaction_workers", 1) or 0)
             ),
-            "global_limit": max(
-                0, int(getattr(self.config, "background_compaction_global_limit", 2) or 0)
+            "global_limit": min(
+                _MAX_GLOBAL_PROVIDER_PERMITS,
+                max(
+                    0,
+                    int(
+                        getattr(
+                            self.config,
+                            "background_compaction_global_limit",
+                            _MAX_GLOBAL_PROVIDER_PERMITS,
+                        )
+                        or 0
+                    ),
+                ),
             ),
             "worker_available": available,
             "queued_jobs": counts.get("queued", 0),
@@ -6907,6 +9494,14 @@ class BackgroundCompactionStore:
             "current_debt_tokens": max(0, debt),
             "last_preparation_result": result_payload(last_prepared),
             "last_publication_result": result_payload(last_published),
+            "last_publication_telemetry": last_publication_telemetry,
+            "last_provider_attempt": last_provider_attempt,
+            "recent_provider_outcomes": recent_provider_outcomes,
+            "provider_attribution": {
+                "prepared_nodes": int(attribution_row["prepared_nodes"] or 0),
+                "attributed_nodes": int(attribution_row["attributed_nodes"] or 0),
+            },
+            "range_dispositions": range_dispositions,
             "durable_event_counts": event_counts,
             "durable_event_reasons": sorted(event_counts),
             "backlog_trigger_tokens": max(
@@ -6918,6 +9513,17 @@ class BackgroundCompactionStore:
                         32_000,
                     )
                     or 0
+                ),
+            ),
+            "minimum_provider_source_tokens": max(
+                1,
+                int(
+                    getattr(
+                        self.config,
+                        "background_compaction_min_provider_source_tokens",
+                        256,
+                    )
+                    or 256
                 ),
             ),
             "prepare_ratio": max(

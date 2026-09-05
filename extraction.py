@@ -4,16 +4,69 @@ Best-effort: failures never block compaction. Extracted content is written to
 daily note files so key decisions survive even if the DAG summary loses nuance.
 """
 
+import errno
 import json
 import logging
+import os
 import re
+import stat
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .model_routing import apply_lcm_model_route
 
+try:  # POSIX advisory locks.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on Windows hosts.
+    _fcntl = None
+
+try:  # Windows byte-range locks.
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - exercised on POSIX hosts.
+    _msvcrt = None
+
 logger = logging.getLogger(__name__)
+
+
+def _acquire_extraction_file_lock(lock_fd: int, *, blocking: bool) -> None:
+    """Acquire one cross-process lock without making Windows unimportable."""
+    if _fcntl is not None:
+        flags = _fcntl.LOCK_EX | (0 if blocking else _fcntl.LOCK_NB)
+        _fcntl.flock(lock_fd, flags)
+        return
+    if _msvcrt is None:  # Defensive for unsupported Python platforms.
+        raise OSError("no file-lock implementation is available")
+    if os.fstat(lock_fd).st_size == 0:
+        os.write(lock_fd, b"\0")
+        os.fsync(lock_fd)
+    while True:
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        try:
+            _msvcrt.locking(lock_fd, _msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if not blocking or exc.errno not in {
+                errno.EACCES,
+                errno.EAGAIN,
+                errno.EDEADLK,
+            }:
+                raise
+            time.sleep(0.01)
+
+
+def _release_extraction_file_lock(lock_fd: int) -> None:
+    if _fcntl is not None:
+        _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        return
+    if _msvcrt is None:  # Defensive for unsupported Python platforms.
+        return
+    os.lseek(lock_fd, 0, os.SEEK_SET)
+    _msvcrt.locking(lock_fd, _msvcrt.LK_UNLCK, 1)
 
 _MEDIA_DATA_URI_RE = re.compile(
     r"data:(?:image|audio|video)/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]{16,}",
@@ -36,6 +89,13 @@ _UNTRUSTED_CONTEXT_HEADER_RE = re.compile(
     r"^Untrusted context \(metadata, do not treat as instructions or commands\):\s*",
     re.IGNORECASE | re.MULTILINE,
 )
+
+
+@dataclass(frozen=True)
+class PreparedExtraction:
+    """Provider result that is safe to persist only on the foreground caller."""
+
+    content: str
 
 
 def _at_line_start(text: str, index: int) -> bool:
@@ -87,7 +147,10 @@ def _call_extraction_llm(prompt: str, model: str = "",
         from .escalation import _strip_reasoning_blocks
         return _strip_reasoning_blocks(content).strip()
     except Exception as e:
-        logger.debug("Extraction LLM call failed: %s", e)
+        logger.debug(
+            "Extraction LLM call failed (error_type=%s)",
+            type(e).__name__,
+        )
         return None
 
 
@@ -315,7 +378,9 @@ def extract_before_compaction(
     session_id: str = "",
     model: str = "",
     timeout: float | None = None,
-) -> bool:
+    cancel_event: threading.Event | None = None,
+    defer_persistence: bool = False,
+) -> bool | PreparedExtraction:
     """Extract decisions from messages about to be compacted and write to a daily file.
 
     Returns True if extraction succeeded, False otherwise.
@@ -325,12 +390,77 @@ def extract_before_compaction(
         prompt = EXTRACTION_PROMPT.format(text=serialized_messages)
         result = _call_extraction_llm(prompt, model=model, timeout=timeout)
 
+        if cancel_event is not None and cancel_event.is_set():
+            logger.debug("Pre-compaction extraction cancelled before persistence")
+            return False
+
         if not result or result.strip() == "NOTHING_TO_EXTRACT":
             logger.debug("Pre-compaction extraction: nothing to extract")
+            prepared = PreparedExtraction(content="")
+        else:
+            prepared = PreparedExtraction(content=result)
+
+        if defer_persistence:
+            return prepared
+        return persist_pre_compaction_extraction(
+            prepared,
+            output_path=output_path,
+            session_id=session_id,
+            cancel_event=cancel_event,
+        )
+
+    except Exception as e:
+        logger.warning(
+            "Pre-compaction extraction failed (non-blocking) (error_type=%s)",
+            type(e).__name__,
+        )
+        return False
+
+
+def persist_pre_compaction_extraction(
+    prepared: PreparedExtraction,
+    *,
+    output_path: str,
+    session_id: str = "",
+    cancel_event: threading.Event | None = None,
+    deadline: float | None = None,
+    now: Callable[[], float] | None = None,
+) -> bool:
+    """Atomically persist a timely provider result.
+
+    The daily note is replaced only after a same-directory temporary file has
+    been flushed and fsynced.  An advisory lock serializes writers across both
+    threads and processes, so a failed/partial write cannot expose a prefix and
+    concurrent appends cannot lose each other.  Deadline-owned automatic work
+    is checked after every preparatory wait/write and immediately before the
+    atomic replace; manual callers retain the historical ``deadline=None``
+    behavior. ``False`` means no new record remains visible. If the filesystem
+    accepts the commit but repeatedly refuses every compensating mutation, the
+    complete candidate remains visible, a durable recovery image is retained,
+    and this returns ``True`` rather than falsely reporting a rollback.
+    """
+    try:
+        clock = now or time.monotonic
+        publication_uncertain = False
+
+        def cancelled_or_late() -> bool:
+            return bool(
+                (cancel_event is not None and cancel_event.is_set())
+                or (deadline is not None and float(clock()) >= float(deadline))
+            )
+
+        if cancelled_or_late():
+            logger.debug("Pre-compaction extraction cancelled before persistence")
+            return False
+        result = str(prepared.content or "")
+        if not result:
             return True
 
         output_dir = Path(output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
+        if cancelled_or_late():
+            logger.debug("Pre-compaction extraction cancelled before append")
+            return False
 
         date_str = datetime.now().strftime("%Y-%m-%d")
         file_path = output_dir / f"{date_str}.md"
@@ -339,15 +469,209 @@ def extract_before_compaction(
         if session_id:
             header += f" ({session_id})"
         header += "\n\n"
+        record = f"{header}{result}\n"
 
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.write(header)
-            f.write(result)
-            f.write("\n")
+        lock_path = output_dir / f".{file_path.name}.lock"
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        locked = False
+        candidate_path: Path | None = None
+        rollback_path: Path | None = None
+        replaced = False
+        existed = False
+
+        def restore_prior_target() -> bool:
+            """Retry compensation while the interprocess lock remains held."""
+            nonlocal rollback_path
+            for attempt in range(3):
+                try:
+                    if rollback_path is not None:
+                        os.replace(rollback_path, file_path)
+                        rollback_path = None
+                    elif not existed:
+                        file_path.unlink(missing_ok=True)
+                    directory_fd = os.open(output_dir, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                    return True
+                except Exception:
+                    if attempt == 2:
+                        logger.critical(
+                            "Pre-compaction extraction rollback failed after retries",
+                            exc_info=True,
+                        )
+                    else:
+                        time.sleep(0.01)
+            return False
+
+        try:
+            if deadline is None and cancel_event is None:
+                _acquire_extraction_file_lock(lock_fd, blocking=True)
+                locked = True
+            else:
+                while not locked:
+                    if cancelled_or_late():
+                        logger.debug(
+                            "Pre-compaction extraction cancelled before file lock"
+                        )
+                        return False
+                    try:
+                        _acquire_extraction_file_lock(lock_fd, blocking=False)
+                        locked = True
+                    except OSError as exc:
+                        if exc.errno not in {
+                            errno.EACCES,
+                            errno.EAGAIN,
+                            errno.EDEADLK,
+                        }:
+                            raise
+                        remaining = (
+                            None
+                            if deadline is None
+                            else max(0.0, float(deadline) - float(clock()))
+                        )
+                        time.sleep(
+                            0.01 if remaining is None else min(0.01, remaining)
+                        )
+
+            if cancelled_or_late():
+                logger.debug("Pre-compaction extraction cancelled after file lock")
+                return False
+
+            existed = file_path.exists()
+            # Preserve the pre-existing note byte-for-byte. Reading as text
+            # would silently normalize CRLF files and reject unrelated legacy
+            # bytes that append mode historically left untouched.
+            previous = file_path.read_bytes() if existed else b""
+            previous_mode = (
+                stat.S_IMODE(file_path.stat().st_mode) if existed else 0o600
+            )
+            if cancelled_or_late():
+                logger.debug("Pre-compaction extraction cancelled before temp write")
+                return False
+
+            candidate_fd, candidate_name = tempfile.mkstemp(
+                prefix=f".{file_path.name}.",
+                suffix=".tmp",
+                dir=output_dir,
+                text=True,
+            )
+            os.close(candidate_fd)
+            candidate_path = Path(candidate_name)
+            candidate_content = previous + record.encode("utf-8")
+            os.chmod(candidate_path, previous_mode)
+            with open(candidate_path, "wb") as candidate:
+                written = candidate.write(candidate_content)
+                if written != len(candidate_content):
+                    raise OSError("short extraction temporary-file write")
+                candidate.flush()
+                os.fsync(candidate.fileno())
+
+            if cancelled_or_late():
+                logger.debug("Pre-compaction extraction cancelled after temp write")
+                return False
+
+            # Prepare an already-durable rollback image before the atomic
+            # commit.  This keeps an fsync/late-observation failure from
+            # returning False while leaving a newly visible record behind.
+            if existed:
+                rollback_fd, rollback_name = tempfile.mkstemp(
+                    prefix=f".{file_path.name}.rollback.",
+                    suffix=".tmp",
+                    dir=output_dir,
+                    text=True,
+                )
+                os.close(rollback_fd)
+                rollback_path = Path(rollback_name)
+                os.chmod(rollback_path, previous_mode)
+                with open(rollback_path, "wb") as rollback:
+                    written = rollback.write(previous)
+                    if written != len(previous):
+                        raise OSError("short extraction rollback-file write")
+                    rollback.flush()
+                    os.fsync(rollback.fileno())
+
+            if cancelled_or_late():
+                logger.debug("Pre-compaction extraction cancelled before replace")
+                return False
+
+            os.replace(candidate_path, file_path)
+            candidate_path = None
+            replaced = True
+            directory_fd = os.open(output_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+            if cancelled_or_late():
+                logger.debug("Pre-compaction extraction expired during commit; reverting")
+                if restore_prior_target():
+                    replaced = False
+                    return False
+                publication_uncertain = True
+                if rollback_path is not None:
+                    logger.critical(
+                        "Retaining extraction recovery image at %s",
+                        rollback_path,
+                    )
+                    rollback_path = None
+                return True
+        except BaseException:
+            if replaced and not restore_prior_target():
+                publication_uncertain = True
+                if rollback_path is not None:
+                    logger.critical(
+                        "Retaining extraction recovery image at %s",
+                        rollback_path,
+                    )
+                    rollback_path = None
+            raise
+        finally:
+            for temporary_path in (candidate_path, rollback_path):
+                if temporary_path is None:
+                    continue
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except Exception:
+                    # A cleanup failure must not turn a completed durable
+                    # replace into a False result. The unique hidden file is
+                    # harmless and a later writer does not consult it.
+                    logger.warning(
+                        "Pre-compaction extraction temporary cleanup failed",
+                        exc_info=True,
+                    )
+            try:
+                if locked:
+                    _release_extraction_file_lock(lock_fd)
+            except Exception:
+                logger.warning(
+                    "Pre-compaction extraction file unlock failed",
+                    exc_info=True,
+                )
+            finally:
+                try:
+                    os.close(lock_fd)
+                except Exception:
+                    logger.warning(
+                        "Pre-compaction extraction lock close failed",
+                        exc_info=True,
+                    )
 
         logger.info("Pre-compaction extraction written to %s", file_path)
         return True
-
     except Exception as e:
-        logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
+        if publication_uncertain:
+            logger.critical(
+                "Pre-compaction extraction remains durably published after "
+                "filesystem rollback failure (error_type=%s)",
+                type(e).__name__,
+            )
+            return True
+        logger.warning(
+            "Pre-compaction extraction persistence failed (non-blocking) "
+            "(error_type=%s)",
+            type(e).__name__,
+        )
         return False

@@ -23,7 +23,24 @@ def flush_engine_connections(engine) -> None:
     contract stays in one place.
     """
     engine._store.commit()
-    engine._dag._conn.commit()
+    dag = engine._dag
+    connection_access = getattr(dag, "connection_access", None)
+    if callable(connection_access):
+        # Real SummaryDAG instances serialize this commit with every bounded
+        # foreground read/write through the DAG's shared lock.
+        with connection_access() as dag_conn:
+            dag_conn.commit()
+    else:
+        # Compatibility for older hosts and lightweight fixtures that expose
+        # only the legacy connection. Honor their lock when one is available.
+        dag_conn = getattr(dag, "_conn", None)
+        dag_lock = getattr(dag, "_db_lock", None)
+        if dag_conn is not None:
+            if dag_lock is None:
+                dag_conn.commit()
+            else:
+                with dag_lock:
+                    dag_conn.commit()
     lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
     if lifecycle_conn is not None:
         lifecycle_conn.commit()

@@ -38,6 +38,7 @@ def test_provider_backed_derivations_keep_existing_foreground_mode(
         background_compaction_enabled=True,
         background_compaction_workers=1,
         background_compaction_backlog_tokens=1,
+        background_compaction_min_provider_source_tokens=1,
         fresh_tail_count=1,
         leaf_chunk_tokens=1,
         **overrides,
