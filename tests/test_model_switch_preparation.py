@@ -55,7 +55,7 @@ def test_summary_checks_both_prompts_all_routes_and_reuses_policy(engine, monkey
     event = threading.Event()
     result = preparation.prepare_model_switch_summary(
         engine, [{'role':'user', 'content':'task context ' * 100}], 256,
-        time.monotonic() + 30, event,
+        time.monotonic() + 30, event, custom_providers=[],
         admit_request=lambda prompt, output, route: checks.append((prompt, output, route)) or True,
     )
     assert result == ('verified summary', 1)
@@ -76,7 +76,7 @@ def test_rejected_auxiliary_budget_makes_no_provider_call(engine, monkeypatch):
     with pytest.raises(ValueError, match='auxiliary route budget'):
         preparation.prepare_model_switch_summary(
             engine, [{'role':'user', 'content':'source'}], 256,
-            time.monotonic() + 30, threading.Event(), admit_request=lambda *args: False)
+            time.monotonic() + 30, threading.Event(), admit_request=lambda *args: False, custom_providers=[])
 
 
 def test_truncation_fallback_is_not_a_success(engine, monkeypatch):
@@ -84,7 +84,7 @@ def test_truncation_fallback_is_not_a_success(engine, monkeypatch):
     with pytest.raises(ValueError, match='truncation fallback refused'):
         preparation.prepare_model_switch_summary(
             engine, [{'role':'user', 'content':'source'}], 256,
-            time.monotonic() + 30, threading.Event(), admit_request=lambda *args: True)
+            time.monotonic() + 30, threading.Event(), admit_request=lambda *args: True, custom_providers=[])
 
 
 def test_cancelled_provider_result_cannot_escape(engine, monkeypatch):
@@ -96,4 +96,26 @@ def test_cancelled_provider_result_cannot_escape(engine, monkeypatch):
     with pytest.raises(InterruptedError):
         preparation.prepare_model_switch_summary(
             engine, [{'role':'user', 'content':'source'}], 256,
-            time.monotonic() + 30, event, admit_request=lambda *args: True)
+            time.monotonic() + 30, event, admit_request=lambda *args: True, custom_providers=[])
+
+
+def test_host_fallback_is_guarded_inside_lcm_preparation(engine, monkeypatch):
+    from agent import auxiliary_client, context_admission
+    monkeypatch.setattr(context_admission, 'resolve_context_budget',
+                        lambda **kw: SimpleNamespace(metadata_known=False))
+    sent = []
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kw: sent.append(kw))))
+
+    def summarize(**kwargs):
+        return auxiliary_client._relay_sync_completion(
+            client, {'model': 'host-fallback', 'messages': [{'role': 'user', 'content': 'source'}]},
+            provider='zai')
+
+    monkeypatch.setattr(preparation, 'summarize_with_escalation', summarize)
+    with pytest.raises(ValueError, match='not admitted'):
+        preparation.prepare_model_switch_summary(
+            engine, [{'role': 'user', 'content': 'source'}], 256,
+            time.monotonic() + 30, threading.Event(),
+            admit_request=lambda *args: True, custom_providers=[])
+    assert sent == []

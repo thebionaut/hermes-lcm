@@ -8,7 +8,7 @@ from .tokens import count_tokens
 
 
 def prepare_model_switch_summary(engine, messages, token_budget, deadline,
-                                 cancel_event, *, admit_request):
+                                 cancel_event, *, admit_request, custom_providers):
     """Summarize detached text under existing LCM spend/provider policy.
 
     The host must validate every configured auxiliary route's complete L1/L2
@@ -54,17 +54,24 @@ def prepare_model_switch_summary(engine, messages, token_budget, deadline,
             if admit_request(prompt, max_output, route) is not True:
                 raise ValueError('model switch summary exceeds an auxiliary route budget')
     checkpoint()
-    result = summarize_with_escalation(
-        text=text, source_tokens=source_tokens, token_budget=token_budget,
-        model=model, fallback_models=fallbacks,
-        circuit_breaker=engine._summary_circuit_breaker,
-        spend_guard=engine._summary_spend_guard,
-        timeout=min(config.summary_timeout_ms / 1000, deadline - time.monotonic()),
-        l2_budget_ratio=config.l2_budget_ratio,
-        l3_truncate_tokens=config.l3_truncate_tokens,
-        custom_instructions=custom_instructions,
-        deadline=deadline, cancel_event=cancel_event,
-    )
+    from agent.model_switch_auxiliary import budget_validator, preparation_request_admission
+
+    # Host auxiliary fallback policy may choose a route absent from the LCM
+    # list above. Guard the concrete request at the shared provider boundary.
+    validate = budget_validator(custom_providers=custom_providers,
+                                deadline=deadline, cancel_event=cancel_event)
+    with preparation_request_admission(validate):
+        result = summarize_with_escalation(
+            text=text, source_tokens=source_tokens, token_budget=token_budget,
+            model=model, fallback_models=fallbacks,
+            circuit_breaker=engine._summary_circuit_breaker,
+            spend_guard=engine._summary_spend_guard,
+            timeout=min(config.summary_timeout_ms / 1000, deadline - time.monotonic()),
+            l2_budget_ratio=config.l2_budget_ratio,
+            l3_truncate_tokens=config.l3_truncate_tokens,
+            custom_instructions=custom_instructions,
+            deadline=deadline, cancel_event=cancel_event,
+        )
     checkpoint()
     if result[1] not in (1, 2):
         raise ValueError('model switch summary failed; truncation fallback refused')
