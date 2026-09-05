@@ -1270,9 +1270,21 @@ class ReconcileMixin:
                 break
             candidates.extend(page)
             next_candidate_after = page[-1]["store_id"]
+        # Identity construction may decode large tool payloads. Keep it once
+        # per active object for this operation, never across mutable turns.
+        active_identities: dict[int, tuple[Any, ...]] = {}
+
+        def active_identity(message):
+            key = id(message)
+            if key not in active_identities:
+                active_identities[key] = self._message_replay_identity(message)
+            return active_identities[key]
+
         active_identity_counts: dict[tuple[Any, ...], int] = {}
-        for msg in messages:
-            identity = self._message_replay_identity(msg)
+        for message_index, msg in enumerate(messages):
+            if message_index % 32 == 0:
+                checkpoint("active source identities")
+            identity = active_identity(msg)
             active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
         stored_identity_counts: dict[tuple[Any, ...], int] = {}
         stored_cleanup_identity_counts: dict[tuple[Any, ...], int] = {}
@@ -1287,7 +1299,9 @@ class ReconcileMixin:
         # the memo below) since most rows never need them.
         stored_identities: list[tuple[Any, ...]] = []
         stored_cleanup_identities: list[Optional[tuple[Any, ...]]] = []
-        for stored in candidates:
+        for stored_index, stored in enumerate(candidates):
+            if stored_index % 32 == 0:
+                checkpoint("stored source identities")
             identity = self._message_replay_identity(stored, stored_row=True)
             stored_identities.append(identity)
             cleanup_identity = self._active_cleanup_replay_identity(identity)
@@ -1330,7 +1344,7 @@ class ReconcileMixin:
                         break
                     if id(msg) not in generated_placeholder_message_ids:
                         continue
-                    if self._message_replay_identity(msg) != identity:
+                    if active_identity(msg) != identity:
                         continue
                     generated_surplus_skip_message_ids.add(id(msg))
                     surplus_count -= 1
@@ -1364,7 +1378,7 @@ class ReconcileMixin:
                 if raw_match_idx is not None:
                     return raw_match_idx
 
-            message_identity = self._message_replay_identity(msg)
+            message_identity = active_identity(msg)
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = start_idx
             while probe_idx < len(candidates):
@@ -1399,7 +1413,7 @@ class ReconcileMixin:
                         matched_message_ids.add(id(remaining_msg))
                         probe_idx = raw_match_idx + 1
                         continue
-                message_identity = self._message_replay_identity(remaining_msg)
+                message_identity = active_identity(remaining_msg)
                 if id(remaining_msg) in generated_surplus_skip_message_ids:
                     continue
                 surplus = local_surplus_skips.get(message_identity, 0)
@@ -1416,6 +1430,8 @@ class ReconcileMixin:
         ids_by_message_id: dict[int, int] = {}
         store_idx = 0
         for msg_idx, msg in enumerate(messages):
+            if msg_idx % 32 == 0:
+                checkpoint("active source matching")
             msg_content = normalize_content_value(msg.get("content")) or ""
             if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
                 raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
@@ -1454,7 +1470,7 @@ class ReconcileMixin:
                         probe_idx -= 1
                 if id(msg) in ids_by_message_id:
                     continue
-            message_identity = self._message_replay_identity(msg)
+            message_identity = active_identity(msg)
             if id(msg) in generated_surplus_skip_message_ids:
                 continue
             surplus = active_surplus_skips.get(message_identity, 0)
