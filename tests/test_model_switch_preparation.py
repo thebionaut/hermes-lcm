@@ -119,3 +119,28 @@ def test_host_fallback_is_guarded_inside_lcm_preparation(engine, monkeypatch):
             time.monotonic() + 30, threading.Event(),
             admit_request=lambda *args: True, custom_providers=[])
     assert sent == []
+
+
+def test_summary_policy_resolves_runtime_and_checks_complete_prompts(engine, monkeypatch):
+    from agent import auxiliary_client as auxiliary, context_admission, model_metadata
+    calls = []
+    client = SimpleNamespace(base_url='https://configured.invalid/v1')
+    monkeypatch.setattr(auxiliary, '_resolve_task_provider_model',
+                        lambda task, **kw: ('zai', kw.get('model'), None, None, None))
+    monkeypatch.setattr(auxiliary, '_get_cached_client', lambda provider, model, **kw: (client, model))
+    monkeypatch.setattr(auxiliary, '_effective_provider_for_client', lambda client, provider: provider)
+    monkeypatch.setattr(auxiliary, '_get_task_extra_body', lambda task: {})
+    def build(provider, model, messages, **kw):
+        calls.append((provider, model, messages, kw['max_tokens']))
+        return {'model': model, 'messages': messages, 'max_tokens': kw['max_tokens']}
+    monkeypatch.setattr(auxiliary, '_build_call_kwargs', build)
+    monkeypatch.setattr(context_admission, 'resolve_context_budget', lambda **kw:
+                        SimpleNamespace(metadata_known=True, safe_input_tokens=80000, context_window=100000))
+    monkeypatch.setattr(model_metadata, 'estimate_request_tokens_rough', lambda *a, **kw: 1000)
+    policy = preparation.model_switch_summary_policy(
+        engine, custom_providers=[], deadline=time.monotonic() + 30, cancel_event=threading.Event())
+    assert policy.source_limit == 80000
+    assert policy.admit_chunk([{'role': 'user', 'content': 'original details'}])
+    assert len(calls) == 4
+    assert all('original details' in row[2][0]['content'] for row in calls)
+    assert {row[3] for row in calls} == {24000, int(12000 * engine._config.l2_budget_ratio) * 2}

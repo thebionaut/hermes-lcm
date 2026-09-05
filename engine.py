@@ -8446,6 +8446,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         from .model_switch_binding import finish_model_switch
         return finish_model_switch(self, receipt)
 
+    def model_switch_summary_policy(self, *, custom_providers, deadline, cancel_event):
+        from .model_switch_preparation import model_switch_summary_policy
+        return model_switch_summary_policy(self, custom_providers=custom_providers,
+                                           deadline=deadline, cancel_event=cancel_event)
+
     def prepare_model_switch_summary(
         self, messages, token_budget, deadline, cancel_event, *, admit_request, custom_providers
     ):
