@@ -3,9 +3,20 @@
 import time
 from types import SimpleNamespace
 
-from .escalation import _build_l1_prompt, _build_l2_prompt, summarize_with_escalation
+from .escalation import _build_l1_prompt, _build_l2_prompt, summarize_with_escalation, summary_task
 from .summary_serialization import serialize_summary_messages
 from .tokens import count_tokens
+
+
+def _summary_route_config(config):
+    from agent import auxiliary_client as auxiliary
+    task = 'model_switch_preparation'
+    configured = auxiliary._get_auxiliary_task_config(task)
+    if configured.get('model') or configured.get('provider') not in (None, '', 'auto'):
+        if not configured.get('provider') or not configured.get('model'):
+            raise ValueError('model-switch preparation requires an explicit provider and model')
+        return task, '', [], auxiliary._get_task_timeout(task)
+    return 'compression', config.summary_model, config.summary_fallback_models, config.summary_timeout_ms / 1000
 
 
 def _preparation_instructions(config):
@@ -22,20 +33,22 @@ def model_switch_summary_policy(engine, *, custom_providers, deadline, cancel_ev
     from agent.context_admission import resolve_context_budget
     from agent.model_switch_auxiliary import budget_validator
     from .model_routing import apply_lcm_model_route
+    from .model_switch_binding import prepare_model_switch_sources
 
     config = engine._config
+    task, primary, fallbacks, _ = _summary_route_config(config)
     routes = {}
     limits = []
     validate = budget_validator(custom_providers=custom_providers,
                                 deadline=deadline, cancel_event=cancel_event)
-    for route in dict.fromkeys([config.summary_model, *(config.summary_fallback_models or [])]):
+    for route in dict.fromkeys([primary, *(fallbacks or [])]):
         if cancel_event.is_set() or time.monotonic() >= deadline:
             raise TimeoutError('summary route resolution deadline expired')
         override = {}
         apply_lcm_model_route(override, route)
-        provider, model, base, key, mode = auxiliary._resolve_task_provider_model('compression', **override)
+        provider, model, base, key, mode = auxiliary._resolve_task_provider_model(task, **override)
         client, model = auxiliary._get_cached_client(
-            provider, model, base_url=base, api_key=key, api_mode=mode, task='compression')
+            provider, model, base_url=base, api_key=key, api_mode=mode, task=task)
         if client is None:
             raise ValueError('configured compression route is unavailable; verify its credentials')
         provider = auxiliary._effective_provider_for_client(client, provider)
@@ -54,8 +67,8 @@ def model_switch_summary_policy(engine, *, custom_providers, deadline, cancel_ev
         client, provider, model, base, mode = routes[route]
         request = auxiliary._build_call_kwargs(
             provider, model, [{'role': 'user', 'content': prompt}],
-            temperature=0.3, max_tokens=output, base_url=base, task='compression',
-            extra_body=auxiliary._get_task_extra_body('compression'))
+            temperature=0.3, max_tokens=output, base_url=base, task=task,
+            extra_body=auxiliary._get_task_extra_body(task))
         return validate(client=client, request=request, provider=provider, api_mode=mode)
 
     def serialize(messages):
@@ -74,7 +87,10 @@ def model_switch_summary_policy(engine, *, custom_providers, deadline, cancel_ev
                    for route in routes for prompt, output in prompts)
 
     return SimpleNamespace(source_limit=min(limits), admit_request=admit_request,
+                           preferred_chunk_tokens=config.leaf_chunk_tokens,
                            admit_chunk=admit_chunk,
+                           prepare_sources=lambda prefix, tail: prepare_model_switch_sources(
+                               engine, prefix, tail, deadline=deadline),
                            count_messages=lambda messages: count_tokens(serialize(messages)))
 
 
@@ -105,8 +121,7 @@ def prepare_model_switch_summary(engine, messages, token_budget, deadline,
     source_tokens = count_tokens(text)
     if source_tokens <= 0 or token_budget <= 0:
         raise ValueError('model switch summary has no usable source or budget')
-    model = config.summary_model
-    fallbacks = config.summary_fallback_models
+    task, model, fallbacks, timeout = _summary_route_config(config)
     custom_instructions = _preparation_instructions(config)
     l2_budget = int(token_budget * config.l2_budget_ratio)
     prompts = (
@@ -125,13 +140,13 @@ def prepare_model_switch_summary(engine, messages, token_budget, deadline,
     # list above. Guard the concrete request at the shared provider boundary.
     validate = budget_validator(custom_providers=custom_providers,
                                 deadline=deadline, cancel_event=cancel_event)
-    with preparation_request_admission(validate):
+    with preparation_request_admission(validate), summary_task(task):
         result = summarize_with_escalation(
             text=text, source_tokens=source_tokens, token_budget=token_budget,
             model=model, fallback_models=fallbacks,
             circuit_breaker=engine._summary_circuit_breaker,
             spend_guard=engine._summary_spend_guard,
-            timeout=min(config.summary_timeout_ms / 1000, deadline - time.monotonic()),
+            timeout=min(timeout, deadline - time.monotonic()),
             l2_budget_ratio=config.l2_budget_ratio,
             l3_truncate_tokens=config.l3_truncate_tokens,
             custom_instructions=custom_instructions,

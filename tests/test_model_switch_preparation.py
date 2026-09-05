@@ -9,6 +9,40 @@ from hermes_lcm import model_switch_preparation as preparation
 from hermes_lcm import summary_serialization as serialization
 
 
+def test_dedicated_preparation_task_is_scoped_and_keeps_global_policy(engine, monkeypatch):
+    from agent import auxiliary_client as auxiliary
+    from hermes_lcm import escalation
+    monkeypatch.setattr(auxiliary, '_get_auxiliary_task_config', lambda task: {
+        'provider': 'openai-codex', 'model': 'gpt-5.6-luna', 'timeout': 90,
+    } if task == 'model_switch_preparation' else {})
+    calls = []
+    def summarize(**kwargs):
+        calls.append((escalation._SUMMARY_TASK.get(), kwargs))
+        return 'prepared summary', 1
+    monkeypatch.setattr(preparation, 'summarize_with_escalation', summarize)
+    preparation.prepare_model_switch_summary(
+        engine, [{'role': 'user', 'content': 'source ' * 100}], 256,
+        time.monotonic() + 120, threading.Event(), custom_providers=[],
+        admit_request=lambda *args: True,
+    )
+    task, call = calls[0]
+    assert task == 'model_switch_preparation'
+    assert call['model'] == ''
+    assert call['fallback_models'] == []
+    assert 89 <= call['timeout'] <= 90
+    assert escalation._SUMMARY_TASK.get() == 'compression'
+    assert engine._config.summary_model == 'primary/model'
+
+
+def test_summary_task_restores_after_exception():
+    from hermes_lcm.escalation import _SUMMARY_TASK, summary_task
+    with pytest.raises(RuntimeError):
+        with summary_task('model_switch_preparation'):
+            assert _SUMMARY_TASK.get() == 'model_switch_preparation'
+            raise RuntimeError('test')
+    assert _SUMMARY_TASK.get() == 'compression'
+
+
 @pytest.fixture
 def engine():
     config = LCMConfig()

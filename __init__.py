@@ -312,6 +312,13 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
 
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
+    register_auxiliary_task = getattr(ctx, 'register_auxiliary_task', None)
+    if callable(register_auxiliary_task):
+        register_auxiliary_task(
+            'model_switch_preparation',
+            display_name='Model-switch preparation',
+            description='Summarizes context for confirmed model switches; unconfigured uses normal LCM compression.',
+        )
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
     from .schemas import (
