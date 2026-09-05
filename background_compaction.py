@@ -1982,6 +1982,17 @@ class BackgroundCompactionStore:
                 != float(expected_lifecycle_reset_at or 0.0)
             ):
                 return None
+            # A newer process binding must not reopen a host-switch fence.
+            # Only a durable host outcome can release it or adopt the summary.
+            switch_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_host_model_switches'"
+            ).fetchone()
+            if switch_table and conn.execute(
+                "SELECT 1 FROM lcm_host_model_switches WHERE conversation_id=? "
+                "AND session_id=? AND state='reserved'",
+                (conversation, session),
+            ).fetchone():
+                return None
             lifecycle_bound_at = float(lifecycle["current_bound_at"])
             lifecycle_reset_at = float(lifecycle["last_reset_at"] or 0.0)
             row = self._session_fence_under_tx(
