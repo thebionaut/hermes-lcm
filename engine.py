@@ -5933,7 +5933,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def bind_context_budget(self, budget: Any) -> None:
         super().bind_context_budget(budget)
-        self._set_context_length(self.raw_context_length, source=self._context_length_source)
+        self._set_context_length(
+            budget.context_window,
+            source="host_context_budget",
+            model=self.model,
+            provider=self.provider,
+        )
 
     def update_model(self, model: str, context_length: int,
                      base_url: str = "", api_key: str = "",
@@ -8448,13 +8453,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         from .model_switch_binding import finish_model_switch
         return finish_model_switch(self, receipt)
 
-    def model_switch_summary_policy(self, *, custom_providers, deadline, cancel_event):
+    def model_switch_summary_policy(self, *, custom_providers, deadline, cancel_event,
+                                    registry_version=None):
         from .model_switch_preparation import model_switch_summary_policy
-        return model_switch_summary_policy(self, custom_providers=custom_providers,
-                                           deadline=deadline, cancel_event=cancel_event)
+        return model_switch_summary_policy(
+            self, custom_providers=custom_providers, deadline=deadline,
+            cancel_event=cancel_event, registry_version=registry_version)
 
     def prepare_model_switch_summary(
-        self, messages, token_budget, deadline, cancel_event, *, admit_request, custom_providers
+        self, messages, token_budget, deadline, cancel_event, *, admit_request,
+        custom_providers, registry_version=None
     ):
         """Prepare a detached summary without changing LCM or host history."""
         from .model_switch_preparation import prepare_model_switch_summary
@@ -8462,6 +8470,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return prepare_model_switch_summary(
             self, messages, token_budget, deadline, cancel_event,
             admit_request=admit_request, custom_providers=custom_providers,
+            registry_version=registry_version,
         )
 
     def _serialize_messages(

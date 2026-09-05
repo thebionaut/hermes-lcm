@@ -1,3 +1,4 @@
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -144,3 +145,135 @@ def test_summary_policy_resolves_runtime_and_checks_complete_prompts(engine, mon
     assert len(calls) == 4
     assert all('original details' in row[2][0]['content'] for row in calls)
     assert {row[3] for row in calls} == {24000, int(12000 * engine._config.l2_budget_ratio) * 2}
+
+
+def test_summary_policy_pins_context_capability_for_each_route_without_prompt_mutation(
+    engine, monkeypatch
+):
+    from agent import auxiliary_client as auxiliary, context_admission, model_metadata
+
+    client = SimpleNamespace(base_url='https://configured.invalid/v1')
+    engine._cached_system_prompt = 'immutable prompt bytes'
+    resolved = []
+    budgeted = []
+
+    monkeypatch.setattr(auxiliary, '_resolve_task_provider_model',
+                        lambda task, **kw: ('anthropic-max', kw.get('model'), None, None, None))
+    monkeypatch.setattr(auxiliary, '_get_cached_client', lambda provider, model, **kw: (client, model))
+    monkeypatch.setattr(auxiliary, '_effective_provider_for_client', lambda client, provider: provider)
+    monkeypatch.setattr(auxiliary, '_fallback_provider_from_label', lambda provider: provider)
+    monkeypatch.setattr(auxiliary, '_get_task_extra_body', lambda task: {})
+    monkeypatch.setattr(
+        auxiliary,
+        '_build_call_kwargs',
+        lambda provider, model, messages, **kwargs: {
+            'model': model, 'messages': messages, 'max_tokens': kwargs['max_tokens']},
+    )
+    monkeypatch.setattr(model_metadata, 'estimate_request_tokens_rough',
+                        lambda *args, **kwargs: 1000)
+
+    def capability(route, *, registry_version):
+        resolved.append((route.provider, route.requested_provider, route.model,
+                         route.api_mode, route.base_url, registry_version))
+        return SimpleNamespace(record_id=route.model, context_window=100000)
+
+    def budget(**kwargs):
+        budgeted.append(kwargs)
+        return SimpleNamespace(metadata_known=True, safe_input_tokens=80000,
+                               context_window=100000)
+
+
+    monkeypatch.setitem(
+        sys.modules,
+        'agent.system_prompt',
+        SimpleNamespace(resolve_agent_context_capability=capability),
+    )
+    monkeypatch.setattr(context_admission, 'resolve_context_budget', budget)
+
+    policy = preparation.model_switch_summary_policy(
+        engine, custom_providers=[{
+            'name': 'anthropic-max', 'api_mode': 'anthropic_messages',
+            'base_url': 'https://configured.invalid/v1',
+        }], registry_version=37,
+        deadline=time.monotonic() + 30, cancel_event=threading.Event())
+
+    assert policy.source_limit == 80000
+    assert policy.admit_request('physical prompt', 100, 'primary/model')
+    assert [row[2] for row in resolved] == [
+        'primary/model', 'fallback/model', 'primary/model']
+    assert all(row[0] == 'anthropic-max' for row in resolved)
+    assert all(row[1] == 'custom:anthropic-max' for row in resolved)
+    assert all(row[3] == 'anthropic_messages' for row in resolved)
+    assert all(row[-1] == 37 for row in resolved)
+    assert [row['context_capability'].record_id for row in budgeted] == [
+        'primary/model', 'fallback/model', 'primary/model']
+    assert engine._cached_system_prompt == 'immutable prompt bytes'
+
+
+def test_physical_validator_pins_capability_and_reserves_requested_output(engine, monkeypatch):
+    from agent import context_admission, model_metadata
+
+    resolved = []
+    budgeted = []
+
+    def capability(route, *, registry_version):
+        resolved.append((route.provider, route.requested_provider, route.model,
+                         route.api_mode, registry_version))
+        return SimpleNamespace(record_id='pinned')
+
+    monkeypatch.setitem(
+        sys.modules,
+        'agent.system_prompt',
+        SimpleNamespace(resolve_agent_context_capability=capability),
+    )
+    monkeypatch.setattr(
+        context_admission,
+        'resolve_context_budget',
+        lambda **kwargs: budgeted.append(kwargs) or SimpleNamespace(
+            metadata_known=True, safe_input_tokens=1800, context_window=2000),
+    )
+    monkeypatch.setattr(model_metadata, 'estimate_request_tokens_rough',
+                        lambda *args, **kwargs: 1700)
+    validate = preparation._physical_budget_validator(
+        engine, custom_providers=[{
+            'name': 'anthropic-max', 'api_mode': 'anthropic_messages',
+            'base_url': 'https://configured.invalid/v1',
+        }], registry_version=37,
+        deadline=time.monotonic() + 30, cancel_event=threading.Event())
+    client = SimpleNamespace(base_url='https://configured.invalid/v1')
+
+    assert not validate(
+        client=client,
+        request={'model': 'runtime/fallback', 'messages': [], 'max_tokens': 400},
+        provider='anthropic-max', api_mode=None)
+    assert validate(
+        client=client,
+        request={'model': 'runtime/fallback', 'messages': [], 'max_tokens': 200},
+        provider='anthropic-max', api_mode=None)
+    assert resolved == [
+        ('anthropic-max', 'custom:anthropic-max', 'runtime/fallback',
+         'anthropic_messages', 37),
+    ] * 2
+    assert all(row['context_capability'].record_id == 'pinned' for row in budgeted)
+
+
+def test_physical_fallback_validator_receives_pinned_registry_version(engine, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        preparation,
+        '_physical_budget_validator',
+        lambda route_engine, **kwargs: (
+            seen.append((route_engine, kwargs['registry_version']))
+            or (lambda **call: True)
+        ),
+    )
+    monkeypatch.setattr(preparation, 'summarize_with_escalation',
+                        lambda **kwargs: ('verified summary', 1))
+
+    result = preparation.prepare_model_switch_summary(
+        engine, [{'role': 'user', 'content': 'source'}], 256,
+        time.monotonic() + 30, threading.Event(), registry_version=37,
+        admit_request=lambda *args: True, custom_providers=[])
+
+    assert result == ('verified summary', 1)
+    assert seen == [(engine, 37)]
