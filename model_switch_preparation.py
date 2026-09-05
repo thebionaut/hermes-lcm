@@ -13,7 +13,7 @@ def _summary_route_config(config):
     task = 'model_switch_preparation'
     configured = auxiliary._get_auxiliary_task_config(task)
     if configured.get('model') or configured.get('provider') not in (None, '', 'auto'):
-        if not configured.get('provider') or not configured.get('model'):
+        if configured.get('provider') in (None, '', 'auto') or not configured.get('model'):
             raise ValueError('model-switch preparation requires an explicit provider and model')
         return task, '', [], auxiliary._get_task_timeout(task)
     return 'compression', config.summary_model, config.summary_fallback_models, config.summary_timeout_ms / 1000

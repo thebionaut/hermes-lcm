@@ -43,6 +43,15 @@ def test_summary_task_restores_after_exception():
     assert _SUMMARY_TASK.get() == 'compression'
 
 
+def test_dedicated_preparation_rejects_implicit_provider(engine, monkeypatch):
+    from agent import auxiliary_client as auxiliary
+    monkeypatch.setattr(auxiliary, '_get_auxiliary_task_config', lambda task: {
+        'provider': 'auto', 'model': 'some-model',
+    })
+    with pytest.raises(ValueError, match='explicit provider'):
+        preparation._summary_route_config(engine._config)
+
+
 @pytest.fixture
 def engine():
     config = LCMConfig()
