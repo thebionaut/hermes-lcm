@@ -54,7 +54,10 @@ def test_dedicated_preparation_rejects_implicit_provider(engine, monkeypatch):
 
 
 @pytest.fixture
-def engine():
+def engine(monkeypatch):
+    from agent import auxiliary_client as auxiliary
+
+    monkeypatch.setattr(auxiliary, '_get_auxiliary_task_config', lambda task: {})
     config = LCMConfig()
     config.summary_model = 'primary/model'
     config.summary_fallback_models = ['fallback/model']
