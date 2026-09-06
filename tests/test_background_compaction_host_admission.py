@@ -44,6 +44,14 @@ def test_global_host_pin_aligns_codex56_cap_with_fixed_reserve(tmp_path):
 
         status = engine.get_status()
         assert status["threshold_policy"] == "fixed_reserve"
+        policy = status["compression_policy"]
+        assert policy["engine"] == "lcm"
+        assert policy["ignored_stock_settings"] == [
+            "compression.threshold_tokens", "compression.target_ratio",
+        ]
+        assert policy["host_preflight_trigger_tokens"] == engine.threshold_tokens
+        assert policy["publication_trigger_tokens"] == engine._background_publication_trigger_tokens()
+        assert policy["emergency_trigger_tokens"] == engine._background_emergency_trigger_tokens()
         assert status["context_reserve_tokens"] == 100_000
         assert status["background_compaction"]["publication_trigger_tokens"] == 800_000
     finally:

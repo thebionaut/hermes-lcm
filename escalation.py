@@ -14,6 +14,8 @@ import logging
 import re
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, MutableMapping, Optional
 
@@ -22,6 +24,17 @@ from .model_routing import apply_lcm_model_route
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
+_SUMMARY_TASK = ContextVar('lcm_summary_task', default='compression')
+
+
+@contextmanager
+def summary_task(task):
+    """Scope an explicit host auxiliary task without changing ordinary LCM."""
+    token = _SUMMARY_TASK.set(task)
+    try:
+        yield
+    finally:
+        _SUMMARY_TASK.reset(token)
 
 
 # Strip inline reasoning blocks emitted by thinking models (MiniMax-M2.7,
@@ -437,7 +450,7 @@ def _call_llm_for_summary(
         summary_token_count=0,
     )
     call_kwargs: dict[str, Any] = {
-        "task": "compression",
+        "task": _SUMMARY_TASK.get(),
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "max_tokens": max_tokens,

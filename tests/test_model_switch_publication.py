@@ -6,6 +6,56 @@ from hermes_lcm.background_compaction import BackgroundCompactionStore
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.model_switch_publication import ModelSwitchPublication
+from hermes_lcm.model_switch_binding import prepare_model_switch_sources
+
+
+def test_source_projection_covers_duplicate_gaps_without_copying_raw(setup):
+    engine, publication, ids = setup
+    engine._store.append_batch('session', [
+        {'role': 'user', 'content': 'old source'},
+        {'role': 'assistant', 'content': 'old answer'},
+        {'role': 'user', 'content': 'new older request'},
+        {'role': 'user', 'content': 'current pending'},
+    ], conversation_id='conversation', token_estimates=[10]*4)
+    prefix = [{'role': 'user', 'content': 'old source'},
+              {'role': 'assistant', 'content': 'old answer'},
+              {'role': 'user', 'content': 'new older request'}]
+    tail = [{'role': 'user', 'content': 'current pending'}]
+    before = engine._store.get_session_count('session')
+    deadline = time.monotonic() + 30
+    prepared = prepare_model_switch_sources(engine, prefix, tail, deadline=deadline)
+    assert any('_lcm_switch_source' in m for m in prepared)
+    engine.reserve_model_switch(job_id='job', host_revision='revision', prefix=prepared, tail=tail,
+                                deadline=deadline, wall_deadline=time.time()+30)
+    engine.finish_model_switch({**receipt('committed'), 'lcm_summary': 'All earlier context'})
+    assert engine._store.get_session_count('session') == before
+    roots = engine._dag.get_active_frontier_nodes('session')
+    assert len(engine._dag.source_message_ids(roots[0].node_id, limit=20)) == before-1
+
+
+def test_source_projection_adds_missing_canonical_root(setup):
+    engine, publication, ids = setup
+    reserve(publication, ids)
+    engine.finish_model_switch({**receipt('committed'), 'lcm_summary': 'Canonical decision'})
+    engine._store.append_batch('session', [{'role':'user', 'content':'new pending'}],
+                              conversation_id='conversation', token_estimates=[10])
+    prefix = [{'role':'user', 'content':'protected pending prompt'}]
+    tail = [{'role':'user', 'content':'new pending'}]
+    deadline = time.monotonic()+30
+    prepared = prepare_model_switch_sources(engine, prefix, tail, deadline=deadline)
+    assert 'Canonical decision' in prepared[0]['content']
+    engine.reserve_model_switch(job_id='next', host_revision='revision2', prefix=prepared, tail=tail,
+                                deadline=deadline, wall_deadline=time.time()+30)
+
+
+def test_quoted_source_cannot_be_forged(setup):
+    engine, publication, ids = setup
+    prefix = [{'role':'user', 'content':'old source'},
+              {'role':'assistant', 'content':'old answer'},
+              {'role':'user', 'content':'fabricated', '_lcm_switch_source':ids[0]}]
+    with pytest.raises(ValueError, match='Quoted model switch source'):
+        engine.reserve_model_switch(job_id='job', host_revision='revision', prefix=prefix, tail=[],
+                                    deadline=time.monotonic()+30, wall_deadline=time.time()+30)
 
 
 @pytest.fixture

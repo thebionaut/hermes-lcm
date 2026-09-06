@@ -5776,6 +5776,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "effective_context_length_cap": self.effective_context_length_cap,
             "effective_context_length_reason": self.effective_context_length_reason,
             "threshold_tokens": self.threshold_tokens,
+            "compression_policy": {
+                "engine": "lcm",
+                "ignored_stock_settings": [
+                    "compression.threshold_tokens", "compression.target_ratio",
+                ],
+                "host_preflight_trigger_tokens": self.threshold_tokens,
+                "publication_trigger_tokens": self._background_publication_trigger_tokens(),
+                "emergency_trigger_tokens": self._background_emergency_trigger_tokens(),
+                "assembly_cap_tokens": self._effective_assembly_token_cap(),
+                "safe_input_tokens": getattr(self, "_admission_safe_input_tokens", 0),
+                "target_policy": "LCM summary budgets and protected recent messages; not a fixed stock target ratio",
+            },
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
             "last_foreground_deadline": dict(self._last_foreground_deadline),
