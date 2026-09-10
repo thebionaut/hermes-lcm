@@ -1051,11 +1051,24 @@ class ReconcileMixin:
         )
         if isinstance(manifest, dict) and manifest.get("policy") == self._active_ingest_policy_fingerprint() and not unproofed_marker:
             fingerprints = manifest.get("fingerprints")
-            # One repeated message can be a new delta, not a replay.
-            if isinstance(fingerprints, list) and len(fingerprints) >= 2:
+            # A short repeated message/exchange can be a new delta rather
+            # than a replay. Keep legacy conservative handling for those.
+            if isinstance(fingerprints, list) and len(fingerprints) >= 3:
                 incoming = self._active_ingest_fingerprints(messages[:len(fingerprints)], deadline=deadline)
                 if incoming == fingerprints:
-                    return len(fingerprints)
+                    session_count = self._store.get_session_count(
+                        self._session_id, deadline=deadline,
+                        deadline_clock=self._foreground_now,
+                        lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+                    )
+                    if session_count > 0:
+                        self._record_ingest_reconciliation(
+                            action="advanced cursor", reason="replayed durable active manifest",
+                            cursor=len(fingerprints), incoming=len(messages),
+                            session_count=session_count, stored_tail_count=0,
+                            effective_incoming=len(incoming),
+                        )
+                        return len(fingerprints)
 
         try:
             session_count = self._store.get_session_count(
