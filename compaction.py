@@ -16,6 +16,7 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import json
 import inspect
 import sqlite3
 import threading
@@ -857,6 +858,11 @@ class CompactionMixin:
                 "before placeholder ordinal persistence",
             )
             self._write_generated_ignored_placeholder_hash_ordinals(ordinals)
+            self._store.write_metadata_json(
+                [self._active_ingest_manifest_key()],
+                json.dumps(self._active_ingest_manifest(messages)),
+                skip_unchanged=True,
+            )
 
         if deadline is None:
             persist()
@@ -888,6 +894,11 @@ class CompactionMixin:
                 deadline=deadline,
             )
         )
+        updates.append((
+            [self._active_ingest_manifest_key()],
+            json.dumps(self._active_ingest_manifest(messages, deadline=deadline)),
+            True,
+        ))
         remaining = self._foreground_deadline_remaining(deadline)
         if remaining is None or remaining <= 0:
             return
@@ -1294,6 +1305,52 @@ class CompactionMixin:
             "ingest",
         )
         ingest_cleanup_changed_active_context = working_messages != messages
+        # A failed archive reconstruction must not be a prerequisite for
+        # emergency admission recovery. All live messages have just been
+        # durably ingested. Build the bounded view from those messages and
+        # existing DAG summaries, preserving raw history for LCM retrieval.
+        # Normal prepared-publication behavior remains unchanged.
+        if background_mode and background_emergency:
+            prior_deadline = getattr(self, "_last_foreground_deadline", {}) or {}
+            replay_limit = max(1000, len(working_messages) * 4)
+            durable_probe = self._store.get_session_messages_after(
+                self._session_id,
+                self._last_compacted_store_id,
+                limit=replay_limit + 1,
+                conversation_id=self._conversation_id,
+                lock_timeout_seconds=self._foreground_deadline_remaining(foreground_deadline),
+                deadline=foreground_deadline,
+                deadline_clock=self._foreground_now,
+            )
+            same_session_deadline = (
+                prior_deadline.get("status") == "exhausted"
+                and prior_deadline.get("session_id") == self._session_id
+                and prior_deadline.get("conversation_id") == self._conversation_id
+            )
+            safe_input = int(getattr(self, "_admission_safe_input_tokens", 0) or 0)
+            hard_admission_pressure = safe_input > 0 and background_observed_tokens > safe_input
+            if hard_admission_pressure or same_session_deadline or len(durable_probe) > replay_limit:
+                leading_count = self._leading_anchor_count(working_messages)
+                compressed = self._assemble_overflow_recovery_context(
+                    working_messages[0] if leading_count else None,
+                    working_messages[leading_count:],
+                    assembly_cap_override=recovery_assembly_cap,
+                    deadline=foreground_deadline,
+                )
+                result = self._finalize_forced_overflow_result(
+                    working_messages,
+                    compressed,
+                    assembly_cap_override=recovery_assembly_cap,
+                    ingest_cleanup_changed_active_context=ingest_cleanup_changed_active_context,
+                    deadline=foreground_deadline,
+                )
+                self._persist_active_placeholder_metadata(result, deadline=foreground_deadline)
+                logger.warning(
+                    "LCM emergency active-view recovery: live=%d archive_probe=%d cap=%s status=%s; raw history retained",
+                    len(working_messages), len(durable_probe), recovery_assembly_cap,
+                    self._last_compression_status,
+                )
+                return result
         if background_mode:
             self._foreground_deadline_checkpoint(
                 foreground_deadline,

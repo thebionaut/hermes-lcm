@@ -1430,7 +1430,11 @@ class MessageStore:
 
     # -- Metadata key/value JSON --------------------------------------------
 
-    def read_metadata_json(self, key: str) -> Any:
+    def read_metadata_json(
+        self, key: str, *, deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+    ) -> Any:
         """Return the JSON-decoded value stored under ``key`` in the metadata table.
 
         Returns ``None`` when the connection is closed, the key is absent, or the
@@ -1443,7 +1447,10 @@ class MessageStore:
         conn = self._conn
         if conn is None:
             return None
-        with self._write_lock:
+        with self._bounded_connection_access(
+            deadline=deadline, deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds, force_lock=True,
+        ) as conn:
             row = conn.execute(
                 "SELECT value FROM metadata WHERE key = ?",
                 (key,),

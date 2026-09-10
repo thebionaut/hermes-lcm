@@ -781,13 +781,15 @@ def _sensitive_pattern_for_key(key: Any, active_names: list[str]) -> str | None:
     return None
 
 
-def redact_sensitive_text(text: str, config) -> str:
-    """Replace configured sensitive spans with deterministic placeholders."""
-    if not isinstance(text, str) or not text:
-        return text
-    active_names = _active_sensitive_pattern_names(config)
-    if not active_names:
-        return text
+from functools import lru_cache
+
+
+@lru_cache(maxsize=512)
+def _cached_redact_sensitive_text(text: str, active_names: tuple[str, ...]) -> str:
+    return _redact_sensitive_text_with_names(text, active_names)
+
+
+def _redact_sensitive_text_with_names(text: str, active_names) -> str:
     protected = text
     for name in active_names:
         protected = _apply_sensitive_pattern(
@@ -796,6 +798,20 @@ def redact_sensitive_text(text: str, config) -> str:
             protected,
         )
     return protected
+
+
+def redact_sensitive_text(text: str, config) -> str:
+    """Replace configured sensitive spans with deterministic placeholders."""
+    if not isinstance(text, str) or not text:
+        return text
+    active_names = _active_sensitive_pattern_names(config)
+    if not active_names:
+        return text
+    # Bound retained input to 512 strings of at most 16K characters. Policy is part
+    # of the key, so enabling/changing redaction cannot reuse weaker results.
+    if len(text) <= 16_384:
+        return _cached_redact_sensitive_text(text, tuple(active_names))
+    return _redact_sensitive_text_with_names(text, active_names)
 
 
 def _redact_entire_sensitive_string(text: str, pattern_name: str) -> str:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import copy
+from collections import OrderedDict
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -325,17 +327,43 @@ def project_active_replay_messages(
         now=now,
     )
     projected: list[dict[str, Any]] = []
+    # Old stores can contain repeated replay blocks. Re-run filtering for the
+    # whole ordered sequence, but do identical redaction work only once. This
+    # per-call cache cannot outlive a policy change and excludes only the
+    # projection-owned numeric row marker, which is restored on every result.
+    cache = OrderedDict()
+    cache_bytes = 0
     for message in filtered:
         _require_projection_active(
-            deadline=deadline,
-            cancel_event=cancel_event,
-            now=now,
+            deadline=deadline, cancel_event=cancel_event, now=now,
         )
-        protected = redact_sensitive_value(
-            dict(message),
-            config,
-            parse_json_strings=True,
-        )
+        value = dict(message)
+        has_marker = "_lcm_replay_store_id" in value
+        marker = value.pop("_lcm_replay_store_id", None)
+        try:
+            key = json.dumps(value, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            # Non-JSON extension values were accepted before memoization.
+            # Preserve that behavior without attempting to cache them.
+            projected.append(redact_sensitive_value(dict(message), config, parse_json_strings=True))
+            continue
+        cached = cache.get(key)
+        if cached is None:
+            protected = copy.deepcopy(redact_sensitive_value(value, config, parse_json_strings=True))
+            entry_bytes = len(key.encode("utf-8")) + len(
+                json.dumps(protected, ensure_ascii=False).encode("utf-8")
+            )
+            if entry_bytes <= 262_144:
+                while cache and (len(cache) >= 2048 or cache_bytes + entry_bytes > 8 * 1024 * 1024):
+                    _, (_, size) = cache.popitem(last=False)
+                    cache_bytes -= size
+                cache[key] = (copy.deepcopy(protected), entry_bytes)
+                cache_bytes += entry_bytes
+        else:
+            cache.move_to_end(key)
+            protected = copy.deepcopy(cached[0])
+        if has_marker:
+            protected["_lcm_replay_store_id"] = marker
         projected.append(protected)
     _require_projection_active(
         deadline=deadline,

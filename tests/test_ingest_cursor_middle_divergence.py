@@ -31,6 +31,17 @@ _ORIGINAL = [
     [
         pytest.param(
             [
+                {"role": "user", "content": "X"},
+                {"role": "assistant", "content": "B"},
+                {"role": "user", "content": "Y"},
+                {"role": "assistant", "content": "D"},
+                {"role": "user", "content": "E"},
+            ],
+            ["X", "Y", "E"],
+            id="multiple-rewrites",
+        ),
+        pytest.param(
+            [
                 {"role": "user", "content": "A"},
                 {"role": "assistant", "content": "X"},
                 {"role": "user", "content": "C"},

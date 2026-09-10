@@ -6380,6 +6380,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             explicit_store_id_indices=set(),
         )
 
+    def supports_bounded_admission_recovery(self) -> bool:
+        """Advertise the automatic, deterministic recovery lane to the host."""
+        return self._background_compaction_enabled()
+
     def _reused_cached_suffix_indices(
         self,
         previous_identities: List[tuple[Any, ...]],
@@ -6388,12 +6392,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         common_prefix: int,
         deadline: float | None,
     ) -> dict[int, int]:
-        """Map one unchanged previous suffix onto its incoming positions.
+        """Map unchanged previous blocks onto their incoming positions.
 
         The host can replace, insert, or delete messages inside an already
         ingested active list while preserving its later messages.  Find the
         longest suffix of the previous list that still occurs contiguously in
         the incoming list, using a linear KMP scan over the reversed identities.
+        Unique ordered anchors also recover unchanged islands between edits.
         Values map incoming indices to their cached indices.
         """
         previous_tail = previous_identities[common_prefix:]
@@ -6446,13 +6451,54 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if matched == len(pattern):
                 matched = failure[matched - 1]
 
-        if best_length <= 0:
-            return {}
-        previous_start = len(previous_identities) - best_length
-        return {
-            best_incoming_start + offset: previous_start + offset
-            for offset in range(best_length)
+        reused = {}
+        if best_length > 0:
+            previous_start = len(previous_identities) - best_length
+            reused = {
+                best_incoming_start + offset: previous_start + offset
+                for offset in range(best_length)
+            }
+
+        # More than one host rewrite can leave unchanged islands before the
+        # final suffix. Reusing only that suffix re-ingests those islands on
+        # every bind. Unique identities provide ordered, unambiguous anchors;
+        # repeated text alone is never enough to suppress a new occurrence.
+        from collections import Counter
+        previous_counts = Counter(previous_tail)
+        incoming_counts = Counter(incoming_tail)
+        previous_positions = {
+            identity: common_prefix + index
+            for index, identity in enumerate(previous_tail)
+            if previous_counts[identity] == 1
         }
+        last_previous = common_prefix - 1
+        incoming_limit = best_incoming_start if reused else len(incoming_identities)
+        previous_limit = min(reused.values()) if reused else len(previous_identities)
+        for incoming_index in range(common_prefix, incoming_limit):
+            if incoming_index % 64 == 0:
+                self._foreground_deadline_checkpoint(deadline, "ingest replay validation")
+            identity = incoming_identities[incoming_index]
+            previous_index = previous_positions.get(identity)
+            if (
+                incoming_counts[identity] == 1
+                and previous_index is not None
+                and last_previous < previous_index < previous_limit
+            ):
+                reused[incoming_index] = previous_index
+                last_previous = previous_index
+        # Extend exact adjacent blocks between anchors without a quadratic
+        # diff or changing the order/multiplicity of repeated messages.
+        anchors = [(common_prefix - 1, common_prefix - 1), *sorted(reused.items()),
+                   (len(incoming_identities), len(previous_identities))]
+        for (left_i, left_p), (right_i, right_p) in zip(anchors, anchors[1:]):
+            i, pidx = left_i + 1, left_p + 1
+            while i < right_i and pidx < right_p and incoming_identities[i] == previous_identities[pidx]:
+                if i % 64 == 0:
+                    self._foreground_deadline_checkpoint(deadline, "ingest replay validation")
+                reused[i] = pidx
+                i += 1
+                pidx += 1
+        return reused
 
     def _cached_active_replay_messages(
         self,
@@ -7542,6 +7588,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 durable_indices=durable_active_indices,
                 deadline=deadline,
             )
+        # Persist replay ordering atomically with its raw rows. Otherwise a
+        # restart after multiple edits loses the only proof that unchanged
+        # islands were already ingested and appends the entire view again.
+        # Intentionally filtered rows are accepted too; bind the proof to
+        # the complete policy so changing filters forces reconciliation.
+        metadata_json_updates = list(metadata_json_updates or [])
+        metadata_json_updates.append((
+            [self._active_ingest_manifest_key()],
+            json.dumps(self._active_ingest_manifest(messages, deadline=deadline)),
+            True,
+        ))
         if ownership is not None:
             try:
                 ownership.publish(

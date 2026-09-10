@@ -66,7 +66,8 @@ def test_host_and_lcm_commit_one_projection_preserving_raw_history(tmp_path, mon
             assert store.get(job, 's')['lcm_pending']
             completed = subprocess.run([sys.executable, '-c', RECOVER_IN_NEW_PROCESS,
                 str(Path(__file__).resolve().parents[1]), str(tmp_path), job],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=30,
+                cwd=Path(sys.modules['hermes_state'].__file__).resolve().parent)
             assert completed.returncode == 0, completed.stderr
             recovered = json.loads(completed.stdout.strip().splitlines()[-1])
             assert recovered == {'status': 'committed', 'model': 'new', 'pending': 'pending',
@@ -119,9 +120,13 @@ try:
     session = dict(session_key='s', agent=agent, running=False, history=[], history_lock=threading.RLock())
     def stage(target):
         return SimpleNamespace(activate=lambda: setattr(agent, 'model', target['model']))
+    def validate(runtime, history):
+        assert sum(len(m['content']) for m in history) <= 600
+        return 'known'
     def recover():
         return recover_preparation_job(db=db, session=session, job_id=job,
-            stage_runtime=stage, settle_lcm=engine.finish_model_switch)
+            stage_runtime=stage, validate_destination=validate,
+            settle_lcm=engine.finish_model_switch)
     result = recover()
     repeat = recover()
     assert not ModelSwitchJobStore(db).get(job, 's')['lcm_pending']

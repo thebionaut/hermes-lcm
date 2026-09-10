@@ -19,6 +19,7 @@ avoid an import cycle (staticmethod resolution is identical).
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import threading
 import time
@@ -1003,11 +1004,58 @@ class ReconcileMixin:
             self._reconcile_foreground_deadline = None
             self._reconcile_lock.release()
 
+    def _active_ingest_manifest_key(self) -> str:
+        scope = json.dumps([self._session_id, self._conversation_id], separators=(",", ":"))
+        return "active_ingest_manifest_v1:" + hashlib.sha256(scope.encode()).hexdigest()
+
+    def _active_ingest_fingerprints(self, messages, *, deadline=None):
+        fingerprints = []
+        for index, message in enumerate(messages):
+            if index % 32 == 0:
+                self._foreground_deadline_checkpoint(deadline, "ingest manifest")
+            identity = self._message_replay_identity(message)
+            fingerprints.append(hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest())
+        return fingerprints
+
+    def _active_ingest_policy_fingerprint(self):
+        encoded = json.dumps(vars(self._config), sort_keys=True, default=str)
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def _active_ingest_manifest(self, messages, *, deadline=None):
+        return {
+            "policy": self._active_ingest_policy_fingerprint(),
+            "fingerprints": self._active_ingest_fingerprints(messages, deadline=deadline),
+        }
+
     def _reconcile_ingest_cursor_from_store_impl(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         self._reconcile_deadline_checkpoint("starting durable replay scan")
         if not self._session_id or not messages:
             return 0
+
+        # The append transaction records the exact admitted active ordering.
+        # After multiple rewrites that ordering need not be contiguous in the
+        # immutable archive. A bounded digest manifest proves replay without
+        # conflating genuinely new identical messages after its end.
+        deadline = getattr(self, "_reconcile_deadline", None)
+        manifest = self._store.read_metadata_json(
+            self._active_ingest_manifest_key(), deadline=deadline,
+            deadline_clock=self._foreground_now,
+            lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+        )
+        unproofed_marker = any(
+            str(msg.get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+            and recover_hermes_persisted_output_with_file_stat(normalize_content_value(msg.get("content")) or "") is None
+            for msg in messages
+        )
+        if isinstance(manifest, dict) and manifest.get("policy") == self._active_ingest_policy_fingerprint() and not unproofed_marker:
+            fingerprints = manifest.get("fingerprints")
+            # One repeated message can be a new delta, not a replay.
+            if isinstance(fingerprints, list) and len(fingerprints) >= 2:
+                incoming = self._active_ingest_fingerprints(messages[:len(fingerprints)], deadline=deadline)
+                if incoming == fingerprints:
+                    return len(fingerprints)
 
         try:
             session_count = self._store.get_session_count(
@@ -1300,10 +1348,23 @@ class ReconcileMixin:
         # the memo below) since most rows never need them.
         stored_identities: list[tuple[Any, ...]] = []
         stored_cleanup_identities: list[Optional[tuple[Any, ...]]] = []
+        stored_value_identities = {}
         for stored_index, stored in enumerate(candidates):
             if stored_index % 32 == 0:
                 checkpoint("stored source identities")
-            identity = self._message_replay_identity(stored, stored_row=True)
+            # Replayed snapshots produce distinct row objects with identical
+            # immutable values. Memoize within this mapping operation only;
+            # a later operation must observe changed payload files/policy.
+            value_key = (
+                stored.get("session_id"), stored.get("role"),
+                stored.get("content"), stored.get("tool_call_id"),
+                json.dumps(stored.get("tool_calls"), sort_keys=True),
+            )
+            identity = stored_value_identities.get(value_key)
+            if identity is None:
+                identity = self._message_replay_identity(stored, stored_row=True)
+                if len(stored_value_identities) < 8192:
+                    stored_value_identities[value_key] = identity
             stored_identities.append(identity)
             cleanup_identity = self._active_cleanup_replay_identity(identity)
             stored_cleanup_identities.append(cleanup_identity)
