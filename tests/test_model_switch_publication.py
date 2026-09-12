@@ -48,6 +48,48 @@ def test_source_projection_adds_missing_canonical_root(setup):
                                 deadline=deadline, wall_deadline=time.time()+30)
 
 
+def test_switch_reservation_spans_lifecycle_rollover(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / 'lcm.db'),
+                       background_compaction_enabled=True, background_compaction_workers=0)
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / 'home'))
+    try:
+        engine.on_session_start('session', conversation_id='conversation-1', context_length=200000)
+        engine._store.append_batch('session', [
+            {'role': 'user', 'content': 'older request'},
+            {'role': 'assistant', 'content': 'older answer'},
+        ], conversation_id='conversation-1', token_estimates=[10, 10])
+        engine.on_session_start('session', conversation_id='conversation-2', context_length=200000)
+        engine._store.append_batch('session', [
+            {'role': 'user', 'content': 'new request'},
+            {'role': 'assistant', 'content': 'new answer'},
+            {'role': 'user', 'content': 'protected pending'},
+        ], conversation_id='conversation-2', token_estimates=[10, 10, 10])
+        prefix = [
+            {'role': 'user', 'content': 'older request'},
+            {'role': 'assistant', 'content': 'older answer'},
+            {'role': 'user', 'content': 'new request'},
+            {'role': 'assistant', 'content': 'new answer'},
+        ]
+        tail = [{'role': 'user', 'content': 'protected pending'}]
+        deadline = time.monotonic() + 30
+
+        prepared = prepare_model_switch_sources(engine, prefix, tail, deadline=deadline)
+        engine.reserve_model_switch(
+            job_id='rollover-job', host_revision='revision', prefix=prepared, tail=tail,
+            deadline=deadline, wall_deadline=time.time() + 30,
+        )
+        engine.finish_model_switch({
+            'id': 'rollover-job', 'session_id': 'session', 'revision': 'revision',
+            'state': 'committed', 'lcm_summary': 'History across both conversations',
+        })
+
+        roots = engine._dag.get_active_frontier_nodes('session')
+        assert len(roots) == 1
+        assert engine._dag.source_message_ids(roots[0].node_id, limit=20)[:4]
+    finally:
+        engine.shutdown()
+
+
 def test_quoted_source_cannot_be_forged(setup):
     engine, publication, ids = setup
     prefix = [{'role':'user', 'content':'old source'},

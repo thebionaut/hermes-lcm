@@ -26,6 +26,29 @@ def _fingerprint(rows):
                                     default=str).encode()).hexdigest()
 
 
+def _source_rows(store, conn, *, session_id, source_ids):
+    """Load the exact host-projected lineage, including prior conversations.
+
+    One durable Hermes session can span more than one LCM conversation after a
+    lifecycle rollover.  A model switch summarizes the host session history,
+    so its source proof must follow the exact store IDs rather than filtering
+    them to only the currently bound conversation.
+    """
+    wanted = [int(value) for value in source_ids]
+    if not wanted:
+        return []
+    rows = conn.execute("""
+        SELECT m.store_id, m.session_id, m.conversation_id, m.role, m.content,
+               m.tool_call_id, m.tool_calls, m.tool_name, m.timestamp,
+               m.token_estimate
+        FROM json_each(?) AS wanted
+        JOIN messages AS m ON m.store_id=CAST(wanted.value AS INTEGER)
+        WHERE m.session_id=?
+        ORDER BY m.store_id
+    """, (json.dumps(wanted), str(session_id))).fetchall()
+    return [store._message_dict(row) for row in rows]
+
+
 class ModelSwitchPublication:
     def __init__(self, store):
         self.store = store
@@ -73,10 +96,22 @@ class ModelSwitchPublication:
                     or lifecycle['current_frontier_store_id'] != expected_frontier
                     or watermark < expected_frontier):
                 raise ValueError('LCM session frontier changed or is already reserved')
-            raw = store._load_source_range(conn, session_id=session_id,
-                                           conversation_id=conversation_id,
-                                           frontier=expected_frontier, watermark=watermark)
-            if [int(row['store_id']) for row in raw] != list(source_ids):
+            source_ids = [int(value) for value in source_ids]
+            if (source_ids != sorted(set(source_ids))
+                    or any(value <= expected_frontier or value > watermark for value in source_ids)):
+                raise ValueError('LCM switch source range is not ordered within the reserved frontier')
+            raw = _source_rows(store, conn, session_id=session_id, source_ids=source_ids)
+            if [int(row['store_id']) for row in raw] != source_ids:
+                raise ValueError('LCM switch source range changed')
+            current_raw = store._load_source_range(
+                conn, session_id=session_id, conversation_id=conversation_id,
+                frontier=expected_frontier, watermark=watermark,
+            )
+            represented_current = [
+                int(row['store_id']) for row in raw
+                if str(row.get('conversation_id') or '') in ('', str(conversation_id))
+            ]
+            if [int(row['store_id']) for row in current_raw] != represented_current:
                 raise ValueError('LCM switch source range changed')
             roots = _roots(conn, session_id)
             if not raw and not roots:
@@ -131,8 +166,10 @@ class ModelSwitchPublication:
                 if not summary.strip() or summary_tokens <= 0:
                     raise ValueError('committed switch summary is missing')
                 roots = _roots(conn, session)
-                raw = store._load_source_range(conn, session_id=session, conversation_id=conversation,
-                                               frontier=row['frontier'], watermark=row['watermark'])
+                raw = _source_rows(
+                    store, conn, session_id=session,
+                    source_ids=json.loads(row['source_ids']),
+                )
                 if (_fingerprint(roots) != row['roots_hash']
                         or store._source_identity_hash(raw) != row['source_hash']):
                     raise ValueError('LCM switch lineage changed; keep inference gated')
