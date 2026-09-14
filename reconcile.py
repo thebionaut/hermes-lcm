@@ -1010,6 +1010,52 @@ class ReconcileMixin:
             self._reconcile_foreground_deadline = None
             self._reconcile_lock.release()
 
+    def _historical_projection_cursor(self, messages, stored_rows):
+        # Legacy archives contain gaps and host persistence transformations.
+        # Require the actual canonical summary and complete ordered coverage
+        # through the durable end, never merely a matching suffix.
+        if len(messages) < 8 or not stored_rows:
+            return None
+        deadline = getattr(self, '_reconcile_deadline', None)
+        roots = self._dag.get_active_frontier_nodes(self._session_id,
+            deadline=deadline, deadline_clock=self._foreground_now,
+            lock_timeout_seconds=self._foreground_deadline_remaining(deadline))
+        if not any(root.summary and any(root.summary in str(m.get('content') or '')
+                   for m in messages if self._is_replayed_context_scaffold_message(m))
+                   for root in roots):
+            return None
+        class View:
+            _last_compacted_store_id = 0
+            def __getattr__(_view, name):
+                return getattr(self, name)
+        mapping = ReconcileMixin._get_store_id_map_for_messages(View(), messages,
+            deadline=getattr(self, '_reconcile_deadline', None))
+        end = int(stored_rows[-1]['store_id'])
+        matched = 0
+        previous = 0
+        for index, message in enumerate(messages):
+            self._reconcile_deadline_checkpoint('historical coverage')
+            source = mapping.get(id(message))
+            if source is None:
+                if (self._is_replayed_context_scaffold_message(message)
+                        or self._matches_ignore_message_patterns(message)):
+                    continue
+                if any(mapping.get(id(m)) == end for m in messages[index+1:]):
+                    raise ReconcileBudgetExceeded(
+                        'Historical replay contains an unverified source before the durable boundary')
+                return None
+            if source < previous:
+                return None
+            previous = source
+            matched += 1
+            if source == end:
+                cursor = index + 1
+                while cursor < len(messages) and mapping.get(id(messages[cursor])) == end:
+                    cursor += 1
+                return cursor if matched >= 8 else None
+        return None
+
+
     def _active_ingest_manifest_key(self) -> str:
         scope = json.dumps([self._session_id, self._conversation_id], separators=(",", ":"))
         return "active_ingest_manifest_v1:" + hashlib.sha256(scope.encode()).hexdigest()
@@ -1156,6 +1202,14 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
         ]
+        historical_cursor = self._historical_projection_cursor(messages, stored_rows)
+        if historical_cursor is not None:
+            self._record_ingest_reconciliation(
+                action="advanced cursor", reason="verified historical host projection",
+                cursor=historical_cursor, incoming=len(messages),
+                session_count=session_count, stored_tail_count=len(stored_tail),
+                effective_incoming=historical_cursor)
+            return historical_cursor
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
@@ -1563,4 +1617,6 @@ class ReconcileMixin:
                 ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
                 store_idx = match_idx + 1
 
-        return ids_by_message_id
+        from .historical_projection import extend_projection_mapping
+        return extend_projection_mapping(messages, candidates, stored_identities,
+            active_identity, ids_by_message_id, checkpoint)
