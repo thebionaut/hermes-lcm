@@ -76,6 +76,23 @@ def test_split_source_cannot_cross_protected_boundary(engine):
         prepare_model_switch_sources(engine, [a], [b], deadline=time.monotonic()+30)
 
 
+def test_repeated_host_message_recovers_unique_bounded_durable_copy(engine):
+    before = {'role': 'assistant', 'content': 'before goal continuation'}
+    continuation = {'role': 'user', 'content':
+        '[Continuing toward your standing goal]\nGoal: finish safely'}
+    after = {'role': 'assistant', 'content': 'after first continuation'}
+    ids = append(engine, [before, continuation, after])
+    replay = [copy.deepcopy(before), copy.deepcopy(continuation),
+              copy.deepcopy(after), copy.deepcopy(continuation)]
+
+    mapping = engine._get_store_id_map_for_messages(replay)
+
+    assert mapping[id(replay[0])] == ids[0]
+    assert mapping[id(replay[1])] == ids[1]
+    assert mapping[id(replay[2])] == ids[2]
+    assert id(replay[3]) not in mapping
+
+
 def historical_fixture(e, monkeypatch):
     root = SimpleNamespace(summary='Confirmed canonical history')
     monkeypatch.setattr(e._dag, 'get_active_frontier_nodes', lambda sid, **kwargs: [root])

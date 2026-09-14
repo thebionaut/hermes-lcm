@@ -53,7 +53,9 @@ def extend_projection_mapping(messages, candidates, identities, active_identity,
     """Fill holes bounded by already-mapped neighboring source records."""
     mapping = ProjectionMap(mapping)
     image_origins = {}
+    exact_origins = {}
     for row, identity in zip(candidates, identities):
+        exact_origins.setdefault(identity, []).append(row['store_id'])
         projection = screenshot_projection(identity)
         if projection is not None:
             image_origins.setdefault(projection, {}).setdefault(identity, []).append(row['store_id'])
@@ -65,6 +67,20 @@ def extend_projection_mapping(messages, candidates, identities, active_identity,
         lower = max((mapping[id(m)] for m in messages[:index] if id(m) in mapping), default=0)
         upper = min((mapping[id(m)] for m in messages[index+1:] if id(m) in mapping), default=float('inf'))
         identity = active_identity(message)
+        # Duplicate-count reconciliation conservatively leaves the earliest
+        # active copies unmapped when active history contains more identical
+        # messages than durable storage. That is normally safe, but periodic
+        # host-generated messages (for example standing-goal continuations)
+        # can repeat after the one durable copy. If mapped neighbors bound a
+        # single exact durable source, its position proves which active copy
+        # owns it. Recover only that unique in-order match; later repetitions
+        # remain unmapped and are ingested as new suffix messages.
+        exact_options = [source for source in exact_origins.get(identity, ())
+                         if lower < source < upper and source not in occupied]
+        if len(exact_options) == 1:
+            mapping[id(message)] = exact_options[0]
+            occupied.add(exact_options[0])
+            continue
         origins = image_origins.get(identity, {})
         if len(origins) == 1:
             options = [sid for ids in origins.values() for sid in ids
