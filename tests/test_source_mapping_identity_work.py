@@ -53,3 +53,30 @@ def test_cursor_search_does_not_rebuild_overlapping_prefix_identities(tmp_path, 
         assert max(calls.values()) == 1
     finally:
         engine.shutdown()
+
+
+def test_cursor_search_normalizes_generation_once_per_source(tmp_path, monkeypatch):
+    engine = LCMEngine(LCMConfig(database_path=str(tmp_path / 'generation.db'),
+                                 background_compaction_enabled=False))
+    try:
+        engine.on_session_start('generation', conversation_id='generation', context_length=900000)
+        messages = [{'role': 'tool', 'content': '<persisted-output>missing %s</persisted-output>' % i,
+                     'tool_call_id': str(i)} for i in range(50)]
+        monkeypatch.setattr('hermes_lcm.reconcile._is_hermes_persisted_output_marker',
+                            lambda value: value.startswith('<persisted-output>'))
+        monkeypatch.setattr('hermes_lcm.reconcile.recover_hermes_persisted_output_with_file_stat',
+                            lambda value: None)
+        monkeypatch.setattr(engine, '_message_replay_identity',
+                            lambda msg: (msg['role'], msg['content'], msg['tool_call_id'], ''))
+        calls = Counter()
+        original = engine._strip_inline_persisted_output_generation_identity
+        def counted(identity):
+            calls[identity] += 1
+            return original(identity)
+        monkeypatch.setattr(engine, '_strip_inline_persisted_output_generation_identity', counted)
+        assert engine._find_reconciled_cursor_for_store_tail(
+            messages, [('tool', 'different stored content', 'stored', '')],
+            allow_empty_prefix=False, session_count=1, raw_session_count=1) is None
+        assert max(calls.values()) == 1
+    finally:
+        engine.shutdown()

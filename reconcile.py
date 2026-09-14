@@ -564,6 +564,8 @@ class ReconcileMixin:
             identity_counts.append(len(identity_messages))
             scaffold_evidence.append(scaffold_evidence[-1] or scaffold)
             quarantine_evidence.append(quarantine_evidence[-1] or quarantined)
+        generationless_sanitized_tail = None
+        generationless_identities = None
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
             self._reconcile_deadline_checkpoint(
@@ -649,14 +651,18 @@ class ReconcileMixin:
             )
             matches_inline_generation_cleanup_tail = False
             if candidate_has_unrecoverable_persisted_marker:
-                generationless_sanitized_tail = [
-                    self._strip_inline_persisted_output_generation_identity(identity)
-                    for identity in sanitized_replay_tail
-                ]
-                generationless_candidate_prefix = [
-                    self._strip_inline_persisted_output_generation_identity(identity)
-                    for identity in candidate_prefix
-                ]
+                # Prefixes overlap throughout this search. Normalize each
+                # immutable identity once per search, not once per cursor.
+                if generationless_sanitized_tail is None:
+                    generationless_sanitized_tail = [
+                        self._strip_inline_persisted_output_generation_identity(identity)
+                        for identity in sanitized_replay_tail
+                    ]
+                    generationless_identities = [
+                        self._strip_inline_persisted_output_generation_identity(identity)
+                        for identity in identities
+                    ]
+                generationless_candidate_prefix = generationless_identities[:identity_count]
                 matches_inline_generation_cleanup_tail = self._matches_store_tail_suffix(
                     generationless_sanitized_tail,
                     generationless_candidate_prefix,
