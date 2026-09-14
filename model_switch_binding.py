@@ -5,6 +5,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .historical_projection import source_ids
 from .model_switch_publication import ModelSwitchPublication
 from .reconcile import ReconcileMixin
 from .summary_serialization import serialize_summary_messages
@@ -77,7 +78,7 @@ def prepare_model_switch_sources(engine, prefix, tail, *, deadline):
         mapping = _mapping(engine, prefix + tail, deadline)
     frontier = int(state.current_frontier_store_id or 0)
     watermark = max([frontier] + [mapping[id(m)] for m in prefix if id(m) in mapping])
-    if any(mapping[id(m)] <= watermark for m in tail if id(m) in mapping):
+    if any(source <= watermark for m in tail for source in source_ids(mapping, m)):
         raise ValueError('LCM publication would consume protected tail source')
     identities = {engine._message_replay_identity(m) for m in prefix}
     additions = []
@@ -111,8 +112,8 @@ def reserve_model_switch(engine, *, job_id, host_revision, prefix, tail,
     # Map the original partition objects together. Reconciliation can recognize
     # repeated text more reliably with the surrounding protected tail present.
     mapping = _mapping(engine, prefix + tail, deadline)
-    prefix_ids = {int(mapping[id(m)]) for m in prefix if id(m) in mapping}
-    tail_ids = {int(mapping[id(m)]) for m in tail if id(m) in mapping}
+    prefix_ids = {source for m in prefix for source in source_ids(mapping, m)}
+    tail_ids = {source for m in tail for source in source_ids(mapping, m)}
     watermark = max(prefix_ids, default=frontier)
     watermark = max(frontier, watermark)
     raw = _range(engine, frontier, watermark, deadline)
@@ -143,9 +144,9 @@ def reserve_model_switch(engine, *, job_id, host_revision, prefix, tail,
     tail_text = '\n'.join(str(m.get('api_content') or m.get('content') or '') for m in tail)
     for root in roots:
         engine._foreground_deadline_checkpoint(deadline, 'model switch', 'root lineage validation')
-        source_ids = set(engine._dag.source_message_ids(root.node_id, limit=len(prefix_ids) + 1))
+        root_sources = set(engine._dag.source_message_ids(root.node_id, limit=len(prefix_ids) + 1))
         textual = bool(root.summary and root.summary in prefix_text)
-        if not textual and not (source_ids and source_ids <= prefix_ids):
+        if not textual and not (root_sources and root_sources <= prefix_ids):
             raise ValueError('LCM active summary is not represented by the preparation prefix')
         if root.summary and root.summary in tail_text:
             raise ValueError('LCM active summary is part of the protected tail')

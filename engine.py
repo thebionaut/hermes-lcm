@@ -7834,7 +7834,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
             explicit[id(message)] = cached[1]
 
-        if all_explicit:
+        possible_joined_user = any(
+            m.get('role') == 'user' and isinstance(m.get('content'), str)
+            and '\n\n' in m['content'] for m in messages)
+        if all_explicit and not possible_joined_user:
             self._foreground_deadline_checkpoint(
                 deadline,
                 "source mapping",
@@ -7856,6 +7859,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 mapped.pop(message_id, None)
             else:
                 mapped[message_id] = int(store_id)
+                groups = getattr(mapped, 'source_groups', {})
+                if message_id in groups and groups[message_id][-1] != int(store_id):
+                    groups.pop(message_id)
         self._foreground_deadline_checkpoint(
             deadline,
             "source mapping",
@@ -7873,7 +7879,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             messages,
             deadline=deadline,
         )
-        return [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
+        from .historical_projection import source_ids
+        return [source for msg in messages for source in source_ids(ids_by_message_id, msg)]
 
     # -- Internal: summarization -------------------------------------------
 

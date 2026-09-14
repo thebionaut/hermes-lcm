@@ -34,9 +34,24 @@ def screenshot_projection(identity):
     return role, '\n'.join(texts), call_id, calls
 
 
+class ProjectionMap(dict):
+    """Keep integer boundary compatibility and every source in a joined turn."""
+    def __init__(self, mapping):
+        super().__init__(mapping)
+        self.source_groups = {}
+
+
+def source_ids(mapping, message):
+    key = id(message)
+    if key not in mapping:
+        return ()
+    return getattr(mapping, 'source_groups', {}).get(key, (mapping[key],))
+
+
 def extend_projection_mapping(messages, candidates, identities, active_identity,
                               mapping, checkpoint):
     """Fill holes bounded by already-mapped neighboring source records."""
+    mapping = ProjectionMap(mapping)
     image_origins = {}
     for row, identity in zip(candidates, identities):
         projection = screenshot_projection(identity)
@@ -57,6 +72,38 @@ def extend_projection_mapping(messages, candidates, identities, active_identity,
             if len(options) == 1:
                 mapping[id(message)] = options[0]
                 occupied.add(options[0])
+                continue
+        # The reverse host transformation also occurs on session resume:
+        # several durable user rows become one model-facing user message.
+        # Prove the entire consecutive group and retain every source ID.
+        if identity[0] == 'user' and not identity[2] and not identity[3] and '\n\n' in identity[1]:
+            options = []
+            for first, (row, stored) in enumerate(zip(candidates, identities)):
+                if not lower < row['store_id'] < upper or row['store_id'] in occupied:
+                    continue
+                if stored[0] != 'user' or stored[2] or stored[3] or not stored[1]:
+                    continue
+                if not identity[1].startswith(stored[1]+'\n\n'):
+                    continue
+                joined = stored[1]
+                group = [row['store_id']]
+                for later in range(first+1,len(candidates)):
+                    following = candidates[later]
+                    part = identities[later]
+                    if (part[0] != 'user' or part[2] or part[3] or not part[1]
+                            or following['store_id'] >= upper or following['store_id'] in occupied):
+                        break
+                    group.append(following['store_id'])
+                    joined += '\n\n'+part[1]
+                    if joined == identity[1]:
+                        options.append(tuple(group))
+                        break
+                    if not identity[1].startswith(joined+'\n\n'):
+                        break
+            if len(options) == 1:
+                mapping[id(message)] = options[0][-1]
+                mapping.source_groups[id(message)] = options[0]
+                occupied.update(options[0])
                 continue
         # Hermes joined consecutive user messages with two newlines before
         # inference, while the host persisted the two original messages.

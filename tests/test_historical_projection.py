@@ -179,3 +179,63 @@ def test_historical_root_lookup_shares_deadline(engine, monkeypatch):
         assert 0 < calls[0]['lock_timeout_seconds'] <= 30
     finally:
         engine._reconcile_deadline = None
+
+
+def test_joined_restored_user_preserves_all_source_ids(engine):
+    parts = [{'role':'user','content':'notice'}, {'role':'user','content':'request'},
+             {'role':'user','content':'clarification'}]
+    ids = append(engine,parts)
+    merged = {'role':'user','content':'notice\n\nrequest\n\nclarification'}
+    mapping = engine._get_store_id_map_for_messages([merged])
+    assert mapping[id(merged)] == ids[-1]
+    assert mapping.source_groups[id(merged)] == tuple(ids)
+    assert engine._get_store_ids_for_messages([merged]) == ids
+    engine._active_replay_store_refs_by_message_id = {id(merged):(merged,ids[-1])}
+    engine._active_replay_store_ref_session_id = 's'
+    engine._active_replay_store_ref_conversation_id = 'c'
+    assert engine._get_store_ids_for_messages([merged]) == ids
+
+
+def test_joined_user_does_not_skip_intervening_archive_message(engine):
+    append(engine,[{'role':'user','content':'notice'},
+                   {'role':'assistant','content':'intervening answer'},
+                   {'role':'user','content':'request'}])
+    assert engine._get_store_id_map_for_messages([
+        {'role':'user','content':'notice\n\nrequest'}]) == {}
+
+
+def test_joined_user_does_not_match_partial_or_changed_content(engine):
+    append(engine,[{'role':'user','content':'notice'}, {'role':'user','content':'request'}])
+    assert engine._get_store_id_map_for_messages([
+        {'role':'user','content':'notice\n\nrequest extra'}]) == {}
+
+
+def test_repaired_host_alternation_replay_does_not_duplicate_archive(engine,monkeypatch):
+    messages = historical_fixture(engine,monkeypatch)
+    append(engine,[{'role':'user','content':'model notice'}, {'role':'user','content':'new request'}])
+    restored = messages+[{'role':'user','content':'model notice\n\nnew request'}]
+    engine._ingest_cursor_needs_reconcile = True
+    before = engine._store.get_session_count('s')
+    engine._ingest_messages(restored,deadline=time.monotonic()+30)
+    assert engine._store.get_session_count('s') == before
+    engine._ingest_messages(restored+[{'role':'assistant','content':'next answer'}],
+                            deadline=time.monotonic()+30)
+    assert engine._store.get_session_count('s') == before+1
+
+
+def test_switch_publication_covers_every_joined_source_and_keeps_tail(engine):
+    ids = append(engine,[{'role':'user','content':'notice'},
+                         {'role':'user','content':'question'},
+                         {'role':'assistant','content':'old answer'},
+                         {'role':'user','content':'pending'}])
+    prefix = [{'role':'user','content':'notice\n\nquestion'},
+              {'role':'assistant','content':'old answer'}]
+    tail = [{'role':'user','content':'pending'}]
+    prepared = prepare_model_switch_sources(engine,prefix,tail,deadline=time.monotonic()+30)
+    engine.reserve_model_switch(job_id='joined',host_revision='r',prefix=prepared,tail=tail,
+        deadline=time.monotonic()+30,wall_deadline=time.time()+30)
+    engine.finish_model_switch({'id':'joined','session_id':'s','revision':'r',
+        'state':'committed','lcm_summary':'notice, question, and answer preserved'})
+    roots = engine._dag.get_active_frontier_nodes('s')
+    assert engine._dag.source_message_ids(roots[0].node_id,limit=20) == ids[:3]
+    assert engine._store.get_session_count('s') == 4
