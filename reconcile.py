@@ -46,10 +46,12 @@ from .ingest_protection import (
     _persisted_output_saved_path,
     recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_value,
+    protect_messages_for_ingest,
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
 from .sqlite_util import _is_sqlite_locked_error, _temporary_sqlite_busy_timeout
+from .tokens import count_message_tokens
 
 import logging
 
@@ -1028,19 +1030,66 @@ class ReconcileMixin:
             _last_compacted_store_id = 0
             def __getattr__(_view, name):
                 return getattr(self, name)
-        mapping = ReconcileMixin._get_store_id_map_for_messages(View(), messages,
-            deadline=getattr(self, '_reconcile_deadline', None))
+        mapping = ReconcileMixin._get_store_id_map_for_messages(
+            View(), messages,
+            deadline=getattr(self, '_reconcile_deadline', None),
+            excluded_source_prefixes=("historical_replay_gap:",),
+        )
         end = int(stored_rows[-1]['store_id'])
         matched = 0
         previous = 0
+        canonical_gaps = []
+        canonical_gap_seen = False
+        last_host_row_id = 0
+        host_rows_monotonic = True
         for index, message in enumerate(messages):
             self._reconcile_deadline_checkpoint('historical coverage')
+            raw_host_row_id = message.get('_row_id', message.get('row_id'))
+            try:
+                host_row_id = int(raw_host_row_id) if raw_host_row_id is not None else 0
+            except (TypeError, ValueError):
+                host_row_id = 0
+            if host_row_id:
+                if host_row_id <= last_host_row_id:
+                    # Canonical SessionDB row ids are strictly increasing in a
+                    # replay projection.  Never trust caller-supplied gap hints
+                    # that break that durable ordering proof.
+                    canonical_gaps = []
+                    host_rows_monotonic = False
+                last_host_row_id = host_row_id
             source = mapping.get(id(message))
+            if host_row_id in getattr(
+                self, "_recovered_historical_projection_row_ids", set()
+            ):
+                # Recovery rows live physically after the old archive end. For
+                # projection ordering they occupy their canonical host position,
+                # so exclude their later store id from the monotonic proof.
+                source = None
             if source is None:
                 if (self._is_replayed_context_scaffold_message(message)
                         or self._matches_ignore_message_patterns(message)):
                     continue
                 if any(mapping.get(id(m)) == end for m in messages[index+1:]):
+                    if host_row_id > 0 and host_rows_monotonic:
+                        if host_row_id in getattr(
+                            self, "_recovered_historical_projection_row_ids", set()
+                        ):
+                            # This canonical gap was already appended by an
+                            # earlier recovery transaction. Its durable host id
+                            # ledger remains authoritative even when an unsafe
+                            # payload marker prevents manifest replay.
+                            canonical_gap_seen = True
+                            continue
+                        # The host's canonical SessionDB can contain rows that
+                        # LCM missed between two already-durable islands (for
+                        # example context-pruned tool projections persisted
+                        # while an earlier reconcile was deferred). Preserve
+                        # those rows below before advancing the cursor. A row
+                        # without the host's monotonic durable id still fails
+                        # closed as an unverified source.
+                        canonical_gaps.append(message)
+                        canonical_gap_seen = True
+                        continue
                     raise ReconcileBudgetExceeded(
                         'Historical replay contains an unverified source before the durable boundary')
                 return None
@@ -1052,8 +1101,89 @@ class ReconcileMixin:
                 cursor = index + 1
                 while cursor < len(messages) and mapping.get(id(messages[cursor])) == end:
                     cursor += 1
-                return cursor if matched >= 8 else None
+                if matched >= 8:
+                    if canonical_gap_seen and not host_rows_monotonic:
+                        raise ReconcileBudgetExceeded(
+                            'Historical replay host row ids are not monotonic'
+                        )
+                    self._pending_historical_projection_gaps = canonical_gaps
+                    return cursor
+                return None
         return None
+
+    def _historical_projection_gap_ledger_key(self) -> str:
+        scope = json.dumps([self._session_id, self._conversation_id], separators=(",", ":"))
+        return "historical_projection_gap_row_ids_v1:" + hashlib.sha256(scope.encode()).hexdigest()
+
+    def _recover_historical_projection_gaps(self, messages, gaps, *, deadline=None):
+        """Atomically preserve canonical host rows omitted from the LCM archive.
+
+        The append is paired with the exact active-view manifest.  A restart
+        therefore proves the replay before considering physical store order,
+        while the recovered rows remain searchable and retain their original
+        host timestamps.  The operation is idempotent because the manifest is
+        checked before historical projection on every later bind.
+        """
+        if not gaps:
+            return []
+        self._foreground_deadline_checkpoint(deadline, "historical gap protection")
+        protected = protect_messages_for_ingest(
+            gaps,
+            config=self._config,
+            hermes_home=self._hermes_home,
+            session_id=self._session_id,
+        )
+        estimates = [count_message_tokens(message) for message in protected]
+        row_ids = []
+        for message in gaps:
+            try:
+                row_ids.append(int(message.get('_row_id', message.get('row_id'))))
+            except (TypeError, ValueError):
+                pass
+        source = (
+            f"historical_replay_gap:{min(row_ids)}-{max(row_ids)}"
+            if row_ids else "historical_replay_gap"
+        )
+        updates = [(
+            [self._active_ingest_manifest_key()],
+            json.dumps(self._active_ingest_manifest(messages, deadline=deadline)),
+            True,
+        )]
+        ledger_additions = [(
+            [self._historical_projection_gap_ledger_key()],
+            [str(row_id) for row_id in row_ids],
+            100000,
+        )]
+        remaining = self._foreground_deadline_remaining(deadline)
+        try:
+            ids = self._store._append_protected_batch(
+                self._session_id,
+                protected,
+                estimates,
+                source=source,
+                conversation_id=self._conversation_id,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+                lock_timeout_seconds=remaining,
+                busy_timeout_ms=(
+                    None if remaining is None else max(0, int(remaining * 1000))
+                ),
+                metadata_json_updates=updates,
+                metadata_json_list_additions=ledger_additions,
+            )
+        except TimeoutError as exc:
+            raise ReconcileBudgetExceeded(
+                "historical replay gap recovery exceeded its budget"
+            ) from exc
+        logger.warning(
+            "LCM recovered canonical historical replay gaps: session=%s rows=%d "
+            "host_row_ids=%s-%s",
+            self._session_id,
+            len(ids),
+            min(row_ids) if row_ids else "unknown",
+            max(row_ids) if row_ids else "unknown",
+        )
+        return ids
 
 
     def _active_ingest_manifest_key(self) -> str:
@@ -1202,8 +1332,31 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
         ]
-        historical_cursor = self._historical_projection_cursor(messages, stored_rows)
+        recovered_gap_row_ids = self._store.read_metadata_json(
+            self._historical_projection_gap_ledger_key(), deadline=deadline,
+            deadline_clock=self._foreground_now,
+            lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+        )
+        self._recovered_historical_projection_row_ids = {
+            int(row_id)
+            for row_id in (recovered_gap_row_ids or [])
+            if str(row_id).isdigit()
+        }
+        self._pending_historical_projection_gaps = []
+        historical_projection_rows = [
+            row for row in stored_rows
+            if not str(row.get("source") or "").startswith("historical_replay_gap:")
+        ]
+        historical_cursor = self._historical_projection_cursor(
+            messages, historical_projection_rows
+        )
         if historical_cursor is not None:
+            gaps = list(getattr(self, '_pending_historical_projection_gaps', []) or [])
+            self._pending_historical_projection_gaps = []
+            if gaps:
+                self._recover_historical_projection_gaps(
+                    messages[:historical_cursor], gaps, deadline=deadline
+                )
             self._record_ingest_reconciliation(
                 action="advanced cursor", reason="verified historical host projection",
                 cursor=historical_cursor, incoming=len(messages),
@@ -1327,6 +1480,7 @@ class ReconcileMixin:
         messages: List[Dict[str, Any]],
         *,
         deadline: float | None = None,
+        excluded_source_prefixes: tuple[str, ...] = (),
     ) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
@@ -1390,7 +1544,15 @@ class ReconcileMixin:
             checkpoint("after durable source page")
             if not page:
                 break
-            candidates.extend(page)
+            if excluded_source_prefixes:
+                candidates.extend(
+                    row for row in page
+                    if not str(row.get("source") or "").startswith(
+                        excluded_source_prefixes
+                    )
+                )
+            else:
+                candidates.extend(page)
             next_candidate_after = page[-1]["store_id"]
         # Identity construction may decode large tool payloads. Keep it once
         # per active object for this operation, never across mutable turns.

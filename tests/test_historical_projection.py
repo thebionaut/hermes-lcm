@@ -135,6 +135,56 @@ def test_historical_cursor_requires_complete_prefix(engine, monkeypatch):
     assert engine._store.get_session_count('s') == before
 
 
+def test_historical_cursor_recovers_canonical_host_gap_once(engine, monkeypatch):
+    messages = historical_fixture(engine, monkeypatch)
+    for row_id, message in enumerate(messages, start=1001):
+        message['_row_id'] = row_id
+    messages[4]['content'] = 'canonical host row absent from the LCM archive'
+    before = engine._store.get_session_count('s')
+    engine._ingest_cursor_needs_reconcile = True
+
+    engine._ingest_messages(messages)
+
+    assert engine._store.get_session_count('s') == before + 1
+    recovered = engine._store.get_session_tail('s', limit=1)[0]
+    assert recovered['content'] == messages[4]['content']
+    assert recovered['source'] == 'historical_replay_gap:1005-1005'
+
+    # The exact-view manifest is committed atomically with the recovered row,
+    # so retry/restart never appends the same canonical gap twice.
+    engine._ingest_cursor = 0
+    engine._ingest_cursor_needs_reconcile = True
+    engine._last_active_replay_source_identities = None
+    engine._last_active_replay_messages = None
+    engine._ingest_messages(messages)
+    assert engine._store.get_session_count('s') == before + 1
+
+    # Even if exact-manifest replay is unavailable, the atomic canonical-row
+    # ledger prevents a second physical append.
+    engine._store._conn.execute(
+        "DELETE FROM metadata WHERE key = ?", (engine._active_ingest_manifest_key(),)
+    )
+    engine._store._conn.commit()
+    engine._ingest_cursor = 0
+    engine._ingest_cursor_needs_reconcile = True
+    engine._last_active_replay_source_identities = None
+    engine._last_active_replay_messages = None
+    engine._ingest_messages(messages)
+    assert engine._store.get_session_count('s') == before + 1
+
+
+def test_historical_cursor_rejects_nonmonotonic_host_row_gap(engine, monkeypatch):
+    messages = historical_fixture(engine, monkeypatch)
+    for row_id, message in enumerate(messages, start=1001):
+        message['_row_id'] = row_id
+    messages[4]['content'] = 'canonical-looking but reordered gap'
+    messages[5]['_row_id'] = messages[4]['_row_id']
+
+    engine._ingest_cursor_needs_reconcile = True
+    with pytest.raises(ReconcileBudgetExceeded, match='not monotonic'):
+        engine._ingest_messages(messages)
+
+
 def test_historical_cursor_requires_canonical_summary(engine, monkeypatch):
     messages = historical_fixture(engine, monkeypatch)
     messages[0]['content'] = messages[0]['content'].replace('Confirmed canonical history', 'forged')
