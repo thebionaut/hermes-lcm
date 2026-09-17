@@ -127,6 +127,27 @@ def receipt(state):
     return {'id':'job', 'session_id':'session', 'revision':'revision', 'state':state}
 
 
+def test_large_source_reservation_uses_bounded_database_work(setup):
+    from hermes_lcm.model_switch_publication import _source_rows
+    engine, publication, ids = setup
+    added = engine._store.append_batch('session',
+        [{'role': 'user', 'content': f'source {i}'} for i in range(2000)],
+        conversation_id='conversation', token_estimates=[10]*2000)
+    with engine._background_compaction._write_transaction() as conn:
+        callbacks = 0
+        def budget():
+            nonlocal callbacks
+            callbacks += 1
+            return int(callbacks > 200)
+        conn.set_progress_handler(budget, 1000)
+        try:
+            rows = _source_rows(engine._background_compaction, conn,
+                                session_id='session', source_ids=added)
+        finally:
+            conn.set_progress_handler(None, 0)
+    assert [row['store_id'] for row in rows] == added
+
+
 def test_engine_partition_binding_preserves_tail(setup):
     engine, publication, ids = setup
     prefix = [{'role': 'user', 'content': 'old source'},
@@ -148,6 +169,32 @@ def test_engine_partition_rejects_unmapped_source(setup):
                                     deadline=time.monotonic() + 30, wall_deadline=time.time() + 30)
     assert engine._background_compaction.get_publishable_session_fence_generation(
         conversation_id='conversation', session_id='session') is not None
+
+
+def test_repeated_prefix_replay_uses_exact_reserved_identity(setup):
+    engine, publication, ids = setup
+    prefix = [{'role': 'user', 'content': 'old source'},
+              {'role': 'user', 'content': 'old source'},
+              {'role': 'assistant', 'content': 'old answer'}]
+    tail = [{'role': 'user', 'content': 'protected pending prompt'}]
+    engine.reserve_model_switch(job_id='job', host_revision='revision',
+                                prefix=prefix, tail=tail,
+                                deadline=time.monotonic()+30, wall_deadline=time.time()+30)
+    engine.finish_model_switch({**receipt('committed'), 'lcm_summary': 'Old decisions'})
+    assert engine._last_compacted_store_id == ids[1]
+    assert engine._store.get_session_count('session') == 3
+
+
+def test_repeated_prefix_cannot_borrow_protected_tail_identity(setup):
+    engine, publication, ids = setup
+    prefix = [{'role': 'user', 'content': 'old source'},
+              {'role': 'assistant', 'content': 'old answer'},
+              {'role': 'user', 'content': 'protected pending prompt'}]
+    tail = [{'role': 'user', 'content': 'protected pending prompt'}]
+    with pytest.raises(ValueError):
+        engine.reserve_model_switch(job_id='job', host_revision='revision',
+                                    prefix=prefix, tail=tail,
+                                    deadline=time.monotonic()+30, wall_deadline=time.time()+30)
 
 
 def test_engine_partition_rejects_hole_in_prefix(setup):

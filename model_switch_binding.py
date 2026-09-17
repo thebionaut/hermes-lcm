@@ -132,10 +132,13 @@ def reserve_model_switch(engine, *, job_id, host_revision, prefix, tail,
         quoted.add(id(message))
     # Duplicate archived replays are covered only when their exact replay
     # identity is actually represented, never merely because IDs are nearby.
+    represented_raw_identities = set()
     for row in raw:
         engine._foreground_deadline_checkpoint(deadline, 'model switch', 'source coverage')
-        if engine._message_replay_identity(row, stored_row=True) in identities:
+        identity = engine._message_replay_identity(row, stored_row=True)
+        if identity in identities:
             prefix_ids.add(int(row['store_id']))
+            represented_raw_identities.add(identity)
     if prefix_ids & tail_ids:
         raise ValueError('LCM prefix and protected tail overlap')
     roots = engine._dag.get_active_frontier_nodes(engine._session_id)
@@ -154,6 +157,11 @@ def reserve_model_switch(engine, *, job_id, host_revision, prefix, tail,
             represented_summaries.add(root.summary)
     for message in prefix:
         if id(message) in mapping or id(message) in quoted or _transient_source(engine, message):
+            continue
+        # Ordered reconciliation can leave repeated historical copies unmapped.
+        # Their complete replay identity is nevertheless proved by an exact row
+        # already included in this reservation, never by call id or text alone.
+        if engine._message_replay_identity(message) in represented_raw_identities:
             continue
         content = str(message.get('api_content') or message.get('content') or '')
         if not any(summary in content for summary in represented_summaries):

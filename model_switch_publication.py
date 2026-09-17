@@ -37,12 +37,15 @@ def _source_rows(store, conn, *, session_id, source_ids):
     wanted = [int(value) for value in source_ids]
     if not wanted:
         return []
+    # Keep the requested IDs outermost, then use the store_id primary key.
+    # An ordinary JOIN can choose the session index first and rescan the whole
+    # JSON ID list for every archived row, making large reservations quadratic.
     rows = conn.execute("""
         SELECT m.store_id, m.session_id, m.conversation_id, m.role, m.content,
                m.tool_call_id, m.tool_calls, m.tool_name, m.timestamp,
                m.token_estimate
         FROM json_each(?) AS wanted
-        JOIN messages AS m ON m.store_id=CAST(wanted.value AS INTEGER)
+        CROSS JOIN messages AS m ON m.store_id=CAST(wanted.value AS INTEGER)
         WHERE m.session_id=?
         ORDER BY m.store_id
     """, (json.dumps(wanted), str(session_id))).fetchall()
