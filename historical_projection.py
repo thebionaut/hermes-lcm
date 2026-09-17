@@ -60,12 +60,25 @@ def extend_projection_mapping(messages, candidates, identities, active_identity,
         if projection is not None:
             image_origins.setdefault(projection, {}).setdefault(identity, []).append(row['store_id'])
     occupied = set(mapping.values())
+    # Only the current message and its immediate successor can gain mappings
+    # below. Future unmapped messages therefore have the original suffix
+    # boundary; carry the prefix maximum forward as mappings are added.
+    suffix_upper = [float("inf")] * (len(messages) + 1)
+    for index in range(len(messages) - 1, -1, -1):
+        if index % 32 == 0:
+            checkpoint("historical host projection boundaries")
+        suffix_upper[index] = min(
+            suffix_upper[index + 1],
+            mapping.get(id(messages[index]), float("inf")),
+        )
+    lower = 0
     for index, message in enumerate(messages):
+        if index:
+            lower = max(lower, mapping.get(id(messages[index - 1]), 0))
         checkpoint('historical host projection')
         if id(message) in mapping:
             continue
-        lower = max((mapping[id(m)] for m in messages[:index] if id(m) in mapping), default=0)
-        upper = min((mapping[id(m)] for m in messages[index+1:] if id(m) in mapping), default=float('inf'))
+        upper = suffix_upper[index + 1]
         identity = active_identity(message)
         # Duplicate-count reconciliation conservatively leaves the earliest
         # active copies unmapped when active history contains more identical

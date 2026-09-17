@@ -306,3 +306,38 @@ def test_switch_publication_covers_every_joined_source_and_keeps_tail(engine):
     roots = engine._dag.get_active_frontier_nodes('s')
     assert engine._dag.source_message_ids(roots[0].node_id,limit=20) == ids[:3]
     assert engine._store.get_session_count('s') == 4
+
+
+def test_projection_boundary_work_scales_linearly(monkeypatch):
+    """Large unmapped prefixes must not repeatedly scan the active history."""
+    import builtins
+    import hermes_lcm.historical_projection as projection
+    messages = [{'role': 'assistant', 'content': f'item-{i}'} for i in range(4000)]
+    mapping = {id(m): i + 1 for i, m in enumerate(messages) if i % 2}
+    calls = 0
+
+    def counted_id(value):
+        nonlocal calls
+        calls += 1
+        return builtins.id(value)
+
+    monkeypatch.setattr(projection, 'id', counted_id, raising=False)
+    result = projection.extend_projection_mapping(
+        messages, [], [], lambda m: ('assistant', m['content'], '', ''),
+        mapping, lambda stage: None,
+    )
+    assert result == mapping
+    assert calls < len(messages) * 8
+
+
+def test_projection_new_prefix_mapping_bounds_later_duplicates():
+    from hermes_lcm.historical_projection import extend_projection_mapping
+    a = {'role': 'assistant', 'content': 'a'}
+    b = {'role': 'assistant', 'content': 'b'}
+    messages = [a, b]
+    identity = lambda m: ('assistant', m['content'], '', '')
+    # Once a is recovered at 20, b must resolve only to 30, not also 10.
+    rows = [{'store_id': 10}, {'store_id': 20}, {'store_id': 30}]
+    result = extend_projection_mapping(messages, rows,
+        [identity(b), identity(a), identity(b)], identity, {}, lambda stage: None)
+    assert result == {id(a): 20, id(b): 30}
