@@ -6030,6 +6030,22 @@ class BackgroundCompactionStore:
                 return False
             attempts = max(1, int(row["attempt_count"] or 1))
             delay = min(300.0, float(5 * (2 ** min(attempts - 1, 6))))
+            # A skipped provider call is not evidence that another immediate
+            # attempt can succeed. The ordinary 5/10/20/40-second backoff
+            # exhausted all five claims before the 300-second circuit reopened.
+            # Persist the guard wait so restart/another process cannot hot-loop
+            # the same job. Keep the existing finite attempt limit unchanged.
+            if completion_reason == "provider_circuit_open":
+                delay = max(
+                    delay,
+                    float(self.config.summary_circuit_breaker_cooldown_seconds),
+                )
+            elif completion_reason == "provider_spend_guard":
+                delay = max(
+                    delay,
+                    float(self.config.summary_spend_backoff_seconds),
+                    float(self.config.summary_spend_window_seconds),
+                )
             sanitized = _sanitize_error(error)
             terminal = bool(terminal) or attempts >= 5
             conn.execute(
