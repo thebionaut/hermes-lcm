@@ -94,6 +94,7 @@ _EVENT_REASON_CODES = frozenset(
         "insufficient_compressible_source",
         "non_compressing_output",
         "provider_connection_error",
+        "provider_error",
         "provider_auth_error",
         "provider_quota",
         "provider_rate_limit",
@@ -8790,6 +8791,35 @@ class BackgroundCompactionStore:
             terminal_reason = str(route_trace.get("terminal_reason") or "")
             if terminal_reason not in _EVENT_REASON_CODES:
                 terminal_reason = ""
+            trace_attempts = [
+                item
+                for item in list(route_trace.get("attempts") or [])
+                if isinstance(item, Mapping)
+            ]
+            last_trace_attempt = trace_attempts[-1] if trace_attempts else None
+            deterministic_l3_terminal = bool(
+                terminal_reason == "non_compressing_output"
+                and last_trace_attempt is not None
+                and str(last_trace_attempt.get("outcome") or "") == "rejected"
+                and not bool(last_trace_attempt.get("attribution_available"))
+                and not any(
+                    str(item.get("outcome") or "") == "success"
+                    for item in trace_attempts
+                )
+            )
+            if deterministic_l3_terminal:
+                transient_failure = next(
+                    (
+                        str(item.get("failure_reason") or "")
+                        for item in reversed(trace_attempts[:-1])
+                        if str(item.get("outcome") or "") == "failure"
+                        and str(item.get("failure_reason") or "")
+                        in _TRANSIENT_RANGE_DISPOSITION_REASONS
+                    ),
+                    "",
+                )
+                if transient_failure:
+                    terminal_reason = transient_failure
             self._try_record_compaction_attempts(
                 job=claimed,
                 chunk_ordinal=chunk.ordinal,

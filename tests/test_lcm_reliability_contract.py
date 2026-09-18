@@ -105,6 +105,56 @@ def test_mixed_physical_failure_then_guard_skip_consumes_attempt(tmp_path):
         bg.close()
 
 
+def test_transient_provider_failure_before_l3_fallback_remains_retryable(tmp_path):
+    path = tmp_path / "transient-before-l3.db"
+    design._seed(path)
+    config = design._config(
+        path,
+        background_compaction_workers=0,
+        leaf_chunk_tokens=1_000,
+    )
+    bg = BackgroundCompactionStore(path, config=config)
+
+    def transient_then_l3(*, trace=None, **_kwargs):
+        trace.update(
+            {
+                "terminal_reason": "non_compressing_output",
+                "attempts": [
+                    {
+                        "outcome": "failure",
+                        "failure_reason": "provider_timeout",
+                        "actual_provider": "zai",
+                        "actual_model": "glm-test",
+                        "attribution_available": True,
+                    },
+                    {
+                        "outcome": "rejected",
+                        "failure_reason": "non_compressing_output",
+                        "attribution_available": False,
+                    },
+                ],
+            }
+        )
+        return ("lossless deterministic fallback", 3)
+
+    try:
+        job = bg.capture_and_enqueue(
+            conversation_id="c",
+            session_id="s",
+            expected_frontier_store_id=0,
+            active_tokens=1,
+            effective_context_window=372_000,
+            policy_fingerprint=background_policy_fingerprint(config),
+        )
+        assert job is not None
+        result = bg.run_next_job(owner="worker", summarizer=transient_then_l3)
+        assert result.state == "retry"
+        assert result.completion_reason == "provider_timeout"
+        assert result.attempt_count == 1
+    finally:
+        bg.close()
+
+
 def test_cache_friendly_background_chunks_stay_at_configured_leaf_size(tmp_path):
     path = tmp_path / "chunks.db"
     config = design._config(path)
