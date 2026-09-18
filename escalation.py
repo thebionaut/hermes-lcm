@@ -17,7 +17,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Callable, MutableMapping, Optional
+from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 from . import tokens as _token_module
 from .model_routing import apply_lcm_model_route
@@ -432,6 +432,7 @@ def _call_llm_for_summary(
     *,
     route_info: MutableMapping[str, Any] | None = None,
     trace: MutableMapping[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization.
 
@@ -465,6 +466,8 @@ def _call_llm_for_summary(
 
         if route_info is not None and _supports_explicit_keyword(call_llm, "route_info"):
             call_kwargs["route_info"] = route_info
+        if deadline is not None and _supports_explicit_keyword(call_llm, "deadline"):
+            call_kwargs["deadline"] = deadline
         response = call_llm(**call_kwargs)
     except Exception as exc:
         reason = _classify_provider_exception(exc)
@@ -563,6 +566,7 @@ def _invoke_summary_llm(
     *,
     route_info: MutableMapping[str, Any] | None = None,
     trace: MutableMapping[str, Any] | None = None,
+    deadline: float | None = None,
 ) -> Optional[str]:
     kwargs = {"model": model} if model else {}
     try:
@@ -582,6 +586,8 @@ def _invoke_summary_llm(
         kwargs["route_info"] = route_info
     if trace is not None and sig is not None and "trace" in sig.parameters:
         kwargs["trace"] = trace
+    if deadline is not None and sig is not None and "deadline" in sig.parameters:
+        kwargs["deadline"] = deadline
     return _call_llm_for_summary(prompt, max_tokens, **kwargs)
 
 
@@ -747,6 +753,7 @@ def _invoke_summary_llm_chain(
             started_at=started_at,
             finished_at=started_at,
         )
+        route_info: dict[str, Any] = {}
 
         def finish_attempt(*, outcome: str, reason: str = "") -> None:
             _set_attempt_trace(
@@ -759,8 +766,53 @@ def _invoke_summary_llm_chain(
                     max(0, int((time.monotonic() - started_monotonic) * 1000)),
                 ),
             )
-            if attempts is not None:
-                attempts.append(dict(attempt))
+            if attempts is None:
+                return
+            physical_attempts = route_info.get("physical_attempts")
+            if isinstance(physical_attempts, list) and physical_attempts:
+                valid_physical = [
+                    item for item in physical_attempts if isinstance(item, Mapping)
+                ]
+                for physical_index, physical_raw in enumerate(valid_physical):
+                    physical = dict(attempt)
+                    physical_outcome = str(
+                        physical_raw.get("outcome") or "failure"
+                    )
+                    physical_reason = str(
+                        physical_raw.get("failure_reason") or ""
+                    )
+                    if physical_index == len(valid_physical) - 1 and outcome != "success":
+                        physical_outcome = outcome
+                        physical_reason = reason
+                    _set_attempt_trace(
+                        physical,
+                        logical_route_ordinal=len(attempts),
+                        actual_provider=physical_raw.get("provider"),
+                        actual_model=physical_raw.get("model"),
+                        attribution_available=bool(
+                            physical_raw.get("provider")
+                            and physical_raw.get("model")
+                        ),
+                        fallback_used=(
+                            True
+                            if logical_route_ordinal > 0 or physical_index > 0
+                            else None
+                        ),
+                        outcome=physical_outcome,
+                        failure_reason=physical_reason,
+                        summary_token_count=(
+                            attempt.get("summary_token_count", 0)
+                            if physical_index == len(valid_physical) - 1
+                            and physical_outcome == "success"
+                            else 0
+                        ),
+                        latency_ms=physical_raw.get("latency_ms", 0),
+                        started_at=physical_raw.get("started_at", started_at),
+                        finished_at=physical_raw.get("finished_at", time.time()),
+                    )
+                    attempts.append(physical)
+                return
+            attempts.append(dict(attempt))
 
         if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
             skipped += 1
@@ -786,7 +838,6 @@ def _invoke_summary_llm_chain(
                 "deferring to deterministic fallback"
             )
             break
-        route_info: dict[str, Any] = {}
         try:
             result = _invoke_summary_llm(
                 prompt,
@@ -795,6 +846,7 @@ def _invoke_summary_llm_chain(
                 timeout=route_timeout,
                 route_info=route_info,
                 trace=attempt,
+                deadline=deadline,
             )
         except Exception as exc:
             reason = _classify_provider_exception(exc)

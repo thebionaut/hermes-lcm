@@ -496,6 +496,12 @@ def _background_compaction_status_lines(engine) -> list[str]:
             f"failed={status.get('failed_jobs', 0)}"
         ),
         (
+            "background_compaction_publications: "
+            f"summaries={status.get('published_summary_jobs', 0)} "
+            f"references={status.get('published_reference_jobs', 0)} "
+            f"total={status.get('published_jobs', 0)}"
+        ),
+        (
             "background_compaction_provider_permits: "
             f"active={status.get('active_provider_permits', 0)} "
             f"non_timed_out={status.get('active_non_timed_out_provider_permits', 0)} "

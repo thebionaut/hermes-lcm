@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 from pathlib import Path
 
@@ -26,7 +27,9 @@ terminal = _module("test_background_compaction_terminal_disposition_progress.py"
     "reason,wait_seconds",
     [("provider_circuit_open", 300), ("provider_spend_guard", 1800)],
 )
-def test_guard_deferrals_do_not_consume_provider_attempts(tmp_path, reason, wait_seconds):
+def test_guard_deferrals_do_not_consume_provider_attempts(
+    tmp_path, reason, wait_seconds
+):
     path = tmp_path / f"{reason}.db"
     clock = design.Clock()
     ids = design._seed(path)
@@ -78,6 +81,30 @@ def test_real_provider_failures_retain_finite_attempt_limit(tmp_path):
         bg.close()
 
 
+def test_mixed_physical_failure_then_guard_skip_consumes_attempt(tmp_path):
+    path = tmp_path / "mixed-physical-and-guard.db"
+    clock = design.Clock()
+    ids = design._seed(path)
+    bg = BackgroundCompactionStore(path, config=design._config(path), now=clock)
+    try:
+        job = design._explicit_job(bg, ids)
+        claim = bg.claim_next_job(owner="worker")
+        result = bg.mark_retry(
+            job.job_id,
+            owner="worker",
+            generation=claim.lease_generation,
+            error=RuntimeError("later route was circuit blocked"),
+            completion_reason="provider_circuit_open",
+            provider_attempted=True,
+        )
+        assert result.state == "retry"
+        assert result.attempt_count == 1
+        clock.advance(result.next_retry_at - clock())
+        assert bg.claim_next_job(owner="worker").attempt_count == 2
+    finally:
+        bg.close()
+
+
 def test_cache_friendly_background_chunks_stay_at_configured_leaf_size(tmp_path):
     path = tmp_path / "chunks.db"
     config = design._config(path)
@@ -91,7 +118,7 @@ def test_cache_friendly_background_chunks_stay_at_configured_leaf_size(tmp_path)
             "store_id": index + 1,
             "role": "user",
             "content": f"message-{index}",
-            "token_count": 2_000,
+            "token_estimate": 2_000,
         }
         for index in range(12)
     ]
@@ -101,8 +128,115 @@ def test_cache_friendly_background_chunks_stay_at_configured_leaf_size(tmp_path)
         assert max(chunk.source_token_count for chunk in chunks) <= 8_000
         config.cache_friendly_condensation_enabled = False
         dynamic = bg._chunk_messages(messages)
-        assert len(dynamic) == 1
-        assert dynamic[0].source_token_count == 24_000
+        assert len(dynamic) == 2
+        assert dynamic[0].source_token_count == 16_000
+    finally:
+        bg.close()
+
+
+def test_full_historical_sized_range_progresses_across_jobs_and_restart(tmp_path):
+    path = tmp_path / "historical-sized-range.db"
+    messages = [
+        {"role": "user", "content": f"historical-row-{index}"} for index in range(57)
+    ]
+    source_ids = design._seed(path, messages=messages, tokens=[2_000] * len(messages))
+    config = design._config(
+        path,
+        background_compaction_workers=0,
+        fresh_tail_count=1,
+        leaf_chunk_tokens=8_000,
+        dynamic_leaf_chunk_enabled=True,
+        dynamic_leaf_chunk_max=40_000,
+        cache_friendly_condensation_enabled=True,
+    )
+    policy = background_policy_fingerprint(config)
+    calls = []
+
+    def summarize(**kwargs):
+        calls.append(
+            {
+                "source_tokens": kwargs["source_tokens"],
+                "depth": kwargs["depth"],
+            }
+        )
+        return (f"summary-{len(calls)}", 0)
+
+    bg = BackgroundCompactionStore(path, config=config)
+    raw_before = list(
+        bg.connection.execute(
+            "SELECT store_id, role, content, tool_calls, tool_call_id, tool_name "
+            "FROM messages ORDER BY store_id"
+        )
+    )
+    raw_digest = hashlib.sha256(
+        repr([tuple(row) for row in raw_before]).encode()
+    ).hexdigest()
+    frontier = 0
+    jobs = []
+    try:
+        while True:
+            job = bg.capture_and_enqueue(
+                conversation_id="c",
+                session_id="s",
+                expected_frontier_store_id=frontier,
+                active_tokens=900_000,
+                effective_context_window=1_000_000,
+                policy_fingerprint=policy,
+            )
+            if job is None:
+                break
+            prepared = bg.run_next_job(owner="offline-worker", summarizer=summarize)
+            assert prepared is not None and prepared.state == "prepared"
+            lease = bg.acquire_publication_lease(
+                prepared.job_id, owner="offline-publisher"
+            )
+            assert lease is not None
+            published = bg.publish_prepared(
+                prepared.job_id,
+                owner="offline-publisher",
+                generation=lease.lease_generation,
+                policy_fingerprint=policy,
+                observed_active_tokens=900_000,
+                effective_context_window=1_000_000,
+                publication_trigger_tokens=900_000,
+                emergency_trigger_tokens=950_000,
+                trigger_policy="fixed_reserve",
+            )
+            assert published.promoted
+            frontier = published.captured_watermark_store_id
+            jobs.append(prepared.job_id)
+            if len(jobs) == 1:
+                bg.close()
+                bg = BackgroundCompactionStore(path, config=config)
+            assert len(jobs) < 10
+
+        raw_after = list(
+            bg.connection.execute(
+                "SELECT store_id, role, content, tool_calls, tool_call_id, tool_name "
+                "FROM messages ORDER BY store_id"
+            )
+        )
+        after_digest = hashlib.sha256(
+            repr([tuple(row) for row in raw_after]).encode()
+        ).hexdigest()
+        covered = [
+            int(row[0])
+            for row in bg.connection.execute(
+                "SELECT store_id FROM lcm_compaction_source_coverage "
+                "WHERE session_id='s' ORDER BY store_id"
+            )
+        ]
+        assert raw_digest == after_digest
+        assert covered == source_ids[:-1]
+        assert source_ids[-1] not in covered
+        assert frontier == source_ids[-2]
+        assert len(jobs) == 5
+        assert len(calls) == 19
+        assert (
+            max(call["source_tokens"] for call in calls if call["depth"] == 0) <= 8_000
+        )
+        assert sum(call["depth"] == 1 for call in calls) == len(jobs)
+        assert bg.status(conversation_id="c")["failed_jobs"] == 0
     finally:
         bg.close()
 
@@ -115,7 +249,19 @@ def test_summary_host_receives_absolute_deadline(monkeypatch):
         return type(
             "Response",
             (),
-            {"choices": [type("Choice", (), {"message": type("Message", (), {"content": "bounded summary"})()})()]},
+            {
+                "choices": [
+                    type(
+                        "Choice",
+                        (),
+                        {
+                            "message": type(
+                                "Message", (), {"content": "bounded summary"}
+                            )()
+                        },
+                    )()
+                ]
+            },
         )()
 
     monkeypatch.setattr("agent.auxiliary_client.call_llm", host_call)
@@ -127,8 +273,17 @@ def test_summary_host_receives_absolute_deadline(monkeypatch):
 
 
 def test_host_physical_attempts_are_flattened_into_durable_trace(monkeypatch):
-    def host_summary(_prompt, _max_tokens, **kwargs):
-        kwargs["route_info"].update(
+    def host_summary(
+        _prompt,
+        _max_tokens,
+        model="",
+        timeout=None,
+        route_info=None,
+        trace=None,
+        deadline=None,
+    ):
+        del model, timeout, deadline
+        route_info.update(
             {
                 "provider": "openai-codex",
                 "model": "luna",
@@ -156,7 +311,7 @@ def test_host_physical_attempts_are_flattened_into_durable_trace(monkeypatch):
                 ],
             }
         )
-        kwargs["trace"].update(outcome="success", failure_reason="")
+        trace.update(outcome="success", failure_reason="")
         return "retained factual summary"
 
     monkeypatch.setattr(escalation, "_call_llm_for_summary", host_summary)
@@ -171,7 +326,9 @@ def test_host_physical_attempts_are_flattened_into_durable_trace(monkeypatch):
         trace=trace,
     )
     assert result[0] == "retained factual summary"
-    assert [(item["actual_provider"], item["outcome"]) for item in trace["attempts"]] == [
+    assert [
+        (item["actual_provider"], item["outcome"]) for item in trace["attempts"]
+    ] == [
         ("zai", "failure"),
         ("openai-codex", "success"),
     ]
@@ -185,7 +342,7 @@ def test_reference_publication_is_reported_separately_from_summary_success(tmp_p
     config = terminal._config(path)
     bg = BackgroundCompactionStore(path, config=config, now=clock)
     try:
-        initial = terminal._capture(bg, config)
+        assert terminal._capture(bg, config) is not None
         exact_prefix = tuple(source_ids[: config.background_compaction_max_passes])
         failed = bg.run_next_job(
             owner="terminal-worker",

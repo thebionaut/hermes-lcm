@@ -79,6 +79,7 @@ _EVENT_REASON_CODES = frozenset(
     {
         "background_summary_prepared",
         "prepared_summary_published",
+        "degraded_reference_published",
         "prepared_summary_superseded",
         "foreground_emergency_compaction",
         "provider_timeout",
@@ -4177,7 +4178,12 @@ class BackgroundCompactionStore:
             1, int(getattr(self.config, "leaf_chunk_tokens", 20_000) or 20_000)
         )
         token_limit = base_limit
-        if bool(getattr(self.config, "dynamic_leaf_chunk_enabled", False)):
+        if (
+            bool(getattr(self.config, "dynamic_leaf_chunk_enabled", False))
+            and not bool(
+                getattr(self.config, "cache_friendly_condensation_enabled", False)
+            )
+        ):
             ceiling = max(
                 base_limit,
                 int(getattr(self.config, "dynamic_leaf_chunk_max", 40_000) or 40_000),
@@ -6003,6 +6009,7 @@ class BackgroundCompactionStore:
         keep_provider_permit: bool = False,
         completion_reason: str = "provider_error",
         terminal: bool = False,
+        provider_attempted: bool | None = None,
         now: float | None = None,
     ) -> CompactionJob | bool:
         with self._write_transaction() as conn:
@@ -6030,11 +6037,16 @@ class BackgroundCompactionStore:
                 return False
             attempts = max(1, int(row["attempt_count"] or 1))
             delay = min(300.0, float(5 * (2 ** min(attempts - 1, 6))))
-            # A skipped provider call is not evidence that another immediate
-            # attempt can succeed. The ordinary 5/10/20/40-second backoff
-            # exhausted all five claims before the 300-second circuit reopened.
-            # Persist the guard wait so restart/another process cannot hot-loop
-            # the same job. Keep the existing finite attempt limit unchanged.
+            guard_deferred = (
+                not terminal
+                and completion_reason
+                in {"provider_circuit_open", "provider_spend_guard"}
+                and provider_attempted is not True
+            )
+            # A guard rejection did not start a physical provider call. Persist
+            # the full guard wait and restore the claim counter so repeated
+            # circuit/spend deferrals cannot exhaust the finite provider-attempt
+            # allowance. Ordinary provider failures still terminate after five.
             if completion_reason == "provider_circuit_open":
                 delay = max(
                     delay,
@@ -6047,13 +6059,15 @@ class BackgroundCompactionStore:
                     float(self.config.summary_spend_window_seconds),
                 )
             sanitized = _sanitize_error(error)
-            terminal = bool(terminal) or attempts >= 5
+            recorded_attempts = max(0, attempts - 1) if guard_deferred else attempts
+            terminal = bool(terminal) or (not guard_deferred and attempts >= 5)
             conn.execute(
                 """
                 UPDATE lcm_compaction_jobs
                 SET state=?, next_retry_at=?, last_error=?,
                     completion_reason=?, lease_owner=NULL,
-                    lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?
+                    lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?,
+                    attempt_count=?
                 WHERE job_id=?
                 """,
                 (
@@ -6062,6 +6076,7 @@ class BackgroundCompactionStore:
                     sanitized,
                     str(completion_reason or "provider_error"),
                     current,
+                    recorded_attempts,
                     str(job_id),
                 ),
             )
@@ -7657,15 +7672,21 @@ class BackgroundCompactionStore:
                 current=commit_current,
             ):
                 raise RuntimeError("background publication frontier CAS changed inside transaction")
+            publication_reason = (
+                "degraded_reference_published"
+                if str(row["job_kind"] or "") == _LOSSLESS_RAW_PROJECTION_JOB_KIND
+                else "published"
+            )
             completed = conn.execute(
                 """
                 UPDATE lcm_compaction_jobs
-                SET state='published', completion_reason='published', published_at=?,
+                SET state='published', completion_reason=?, published_at=?,
                     updated_at=?, lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL
                 WHERE job_id=? AND state='prepared' AND lease_owner=? AND lease_generation=?
                   AND lease_expires_at>?
                 """,
                 (
+                    publication_reason,
                     commit_current,
                     commit_current,
                     str(job_id),
@@ -7703,7 +7724,11 @@ class BackgroundCompactionStore:
             )
             self._record_event_under_tx(
                 conn,
-                "prepared_summary_published",
+                (
+                    "degraded_reference_published"
+                    if publication_reason == "degraded_reference_published"
+                    else "prepared_summary_published"
+                ),
                 conversation_id=str(row["conversation_id"] or ""),
                 session_id=str(row["session_id"] or ""),
                 job_id=str(job_id),
@@ -7712,7 +7737,7 @@ class BackgroundCompactionStore:
             )
             return PromotionResult(
                 True,
-                "published",
+                publication_reason,
                 str(job_id),
                 int(row["captured_watermark_store_id"] or 0),
                 node_ids,
@@ -8781,6 +8806,15 @@ class BackgroundCompactionStore:
                 error = RuntimeError(
                     "background summarizer returned no publishable provider summary"
                 )
+                provider_attempted = any(
+                    isinstance(item, Mapping)
+                    and str(item.get("outcome") or "") != "skipped"
+                    and bool(
+                        item.get("attribution_available")
+                        or item.get("actual_provider")
+                    )
+                    for item in list(route_trace.get("attempts") or [])
+                )
                 try:
                     retry = self.mark_retry(
                         claimed.job_id,
@@ -8793,6 +8827,7 @@ class BackgroundCompactionStore:
                             or terminal_reason
                             in {"non_compressing_output", "reasoning_only_output"}
                         ),
+                        provider_attempted=provider_attempted,
                     )
                 except BaseException:
                     release_unused_permit()
@@ -9138,6 +9173,28 @@ class BackgroundCompactionStore:
                     "SELECT state, COUNT(*) AS count FROM lcm_compaction_jobs GROUP BY state"
                 ).fetchall()
             }
+            publication_kind_args: tuple[Any, ...] = (
+                (str(conversation_id),) if conversation_id else ()
+            )
+            publication_kind_scope = (
+                " AND conversation_id=?" if conversation_id else ""
+            )
+            publication_kind_row = conn.execute(
+                f"""
+                SELECT
+                  COALESCE(SUM(CASE WHEN job_kind=? THEN 1 ELSE 0 END),0)
+                    AS reference_count,
+                  COALESCE(SUM(CASE WHEN job_kind<>? THEN 1 ELSE 0 END),0)
+                    AS summary_count
+                FROM lcm_compaction_jobs
+                WHERE state='published'{publication_kind_scope}
+                """,
+                (
+                    _LOSSLESS_RAW_PROJECTION_JOB_KIND,
+                    _LOSSLESS_RAW_PROJECTION_JOB_KIND,
+                    *publication_kind_args,
+                ),
+            ).fetchone()
             oldest = conn.execute(
                 "SELECT MIN(created_at) FROM lcm_compaction_jobs WHERE state='queued'"
             ).fetchone()[0]
@@ -9496,6 +9553,12 @@ class BackgroundCompactionStore:
             "prepared_jobs": counts.get("prepared", 0),
             "retry_jobs": counts.get("retry", 0),
             "published_jobs": counts.get("published", 0),
+            "published_summary_jobs": int(
+                publication_kind_row["summary_count"] or 0
+            ),
+            "published_reference_jobs": int(
+                publication_kind_row["reference_count"] or 0
+            ),
             "superseded_jobs": counts.get("superseded", 0),
             "failed_jobs": counts.get("failed", 0),
             "active_provider_permits": active_provider_permits,

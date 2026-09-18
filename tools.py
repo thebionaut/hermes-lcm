@@ -604,6 +604,7 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
 _BACKGROUND_DIAGNOSTIC_REASONS = frozenset({
     "background_summary_prepared",
     "prepared_summary_published",
+    "degraded_reference_published",
     "prepared_summary_superseded",
     "foreground_emergency_compaction",
     "provider_timeout",
@@ -785,6 +786,8 @@ def _background_compaction_status_payload(engine: "LCMEngine") -> dict[str, Any]
             "prepared_jobs": 0,
             "retry_jobs": 0,
             "published_jobs": 0,
+            "published_summary_jobs": 0,
+            "published_reference_jobs": 0,
             "superseded_jobs": 0,
             "failed_jobs": 0,
             "active_provider_permits": 0,
@@ -1066,6 +1069,9 @@ def _background_compaction_status_payload(engine: "LCMEngine") -> dict[str, Any]
             ).lower()
         else:
             result_text = str(result or "").lower()
+        if "degraded_reference" in result_text:
+            reasons.add("degraded_reference_published")
+            continue
         for needle, reason in result_reason_map.items():
             if needle in result_text:
                 reasons.add(reason)
@@ -1090,6 +1096,8 @@ def _background_compaction_status_payload(engine: "LCMEngine") -> dict[str, Any]
         "prepared_jobs": _integer(raw, "prepared_jobs"),
         "retry_jobs": _integer(raw, "retry_jobs"),
         "published_jobs": _integer(raw, "published_jobs"),
+        "published_summary_jobs": _integer(raw, "published_summary_jobs"),
+        "published_reference_jobs": _integer(raw, "published_reference_jobs"),
         "superseded_jobs": _integer(raw, "superseded_jobs"),
         "failed_jobs": _integer(raw, "failed_jobs"),
         "active_provider_permits": _integer(raw, "active_provider_permits"),
