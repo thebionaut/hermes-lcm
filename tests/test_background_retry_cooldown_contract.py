@@ -68,6 +68,8 @@ def test_retry_has_a_real_opportunity_after_circuit_reopens(tmp_path):
         )
         clock.advance(result.next_retry_at - clock())
         assert breaker.allows("", now=clock())
-        assert bg.claim_next_job(owner="worker").attempt_count == 2
+        # Guard deferral did not launch a provider call, so the recovered claim
+        # is still provider attempt one rather than an exhausted second try.
+        assert bg.claim_next_job(owner="worker").attempt_count == 1
     finally:
         bg.close()
