@@ -1029,7 +1029,7 @@ class LCMConfig:
 
         def _record(field: str, source: str, warning: str | None = None) -> None:
             config_sources[field] = source
-            if warning:
+            if warning and warning not in config_source_warnings:
                 config_source_warnings.append(warning)
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
@@ -1083,6 +1083,23 @@ class LCMConfig:
             summary_timeout_default,
             default_source=summary_timeout_source,
         )
+        if c.summary_timeout_ms <= 0:
+            warning = (
+                "nonpositive LCM_SUMMARY_TIMEOUT_MS ignored; using "
+                f"{summary_timeout_default}ms from {summary_timeout_source}"
+            )
+            c.summary_timeout_ms = summary_timeout_default
+            source = summary_timeout_source
+        elif (
+            source == "env:LCM_SUMMARY_TIMEOUT_MS"
+            and summary_timeout_source.startswith("config_yaml:")
+            and c.summary_timeout_ms != summary_timeout_default
+        ):
+            warning = (
+                "LCM summary timeout override differs from YAML authority: "
+                f"effective={c.summary_timeout_ms}ms source={source}; "
+                f"yaml={summary_timeout_default}ms source={summary_timeout_source}"
+            )
         _record("summary_timeout_ms", source, warning)
 
         for spec in ENV_FIELD_SPECS:
