@@ -163,6 +163,11 @@ from .summary_serialization import (
 )
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
+from .working_set import (
+    WORKING_SET_REFERENCE_PREFIX,
+    WorkingSetDecision,
+    select_phase_working_set,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -576,6 +581,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        self._last_working_set_decision: dict[str, Any] = {
+            "reason": "never_run",
+            "source_tokens": 0,
+            "selected_tokens": 0,
+            "omitted_tokens": 0,
+            "source_sha256": "",
+            "cache_state": "unknown",
+            "payback_calls": 0,
+        }
         self._last_foreground_deadline: Dict[str, Any] = {
             "status": "never_exhausted"
         }
@@ -1093,6 +1107,165 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     @property
     def name(self) -> str:
         return "lcm"
+
+    @staticmethod
+    def _working_set_message_identity(message: Dict[str, Any]) -> str:
+        return json.dumps(
+            message,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _working_set_required_request_indices(
+        self,
+        request_messages: List[Dict[str, Any]],
+        conversation_messages: Optional[List[Dict[str, Any]]],
+    ) -> set[int]:
+        """Preserve request-only authority/profile/prefill scaffolding.
+
+        The persisted transcript is reference data. Messages present only in
+        the assembled request include the system prompt, policy/profile
+        projections, prefill and other host-owned scaffolding, so they are
+        mandatory even when their text is not recognized by a heuristic.
+        """
+        remaining: dict[str, int] = {}
+        for message in conversation_messages or []:
+            identity = self._working_set_message_identity(message)
+            remaining[identity] = remaining.get(identity, 0) + 1
+        required: set[int] = set()
+        for index, message in enumerate(request_messages):
+            if message.get("role") == "system":
+                required.add(index)
+                continue
+            identity = self._working_set_message_identity(message)
+            available = remaining.get(identity, 0)
+            if available > 0:
+                remaining[identity] = available - 1
+            else:
+                required.add(index)
+        return required
+
+    def _working_set_cache_state(self) -> str:
+        if self.last_cache_read_tokens > 0 or self.last_cache_write_tokens > 0:
+            return "hot"
+        if self.cache_metrics_available:
+            return "cold"
+        return "unknown"
+
+    def _record_working_set_decision(self, decision: WorkingSetDecision) -> None:
+        self._last_working_set_decision = {
+            "reason": decision.reason,
+            "source_tokens": decision.source_tokens,
+            "selected_tokens": decision.selected_tokens,
+            "omitted_tokens": decision.omitted_tokens,
+            "source_sha256": decision.source_sha256,
+            "omitted_ranges": [list(value) for value in decision.omitted_ranges],
+            "cache_state": decision.cache_state,
+            "payback_calls": decision.payback_calls,
+        }
+
+    def _ingest_for_working_set(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        if not messages or self._bypasses_lcm_context_management():
+            return False
+        timeout = max(
+            0.1,
+            float(self._config.focused_working_set_ingest_timeout_seconds),
+        )
+        deadline = self._foreground_now() + timeout
+        try:
+            self._ingest_messages(messages, deadline=deadline)
+            return True
+        except Exception as exc:
+            self._record_ingest_failure("focused working set", exc)
+            logger.warning(
+                "LCM focused working-set ingest failed; retaining full request",
+                exc_info=True,
+            )
+            return False
+
+    def select_context(
+        self,
+        request_messages: List[Dict[str, Any]],
+        *,
+        conversation_messages: Optional[List[Dict[str, Any]]] = None,
+        incoming_message: Optional[Dict[str, Any]] = None,
+        budget_tokens: int = 0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Select a bounded phase view while keeping raw history lossless."""
+        if not self._config.focused_working_set_enabled:
+            return None
+        if self._bypasses_lcm_context_management():
+            return None
+        durable_source = list(conversation_messages or [])
+        if isinstance(incoming_message, dict) and incoming_message not in durable_source:
+            durable_source.append(incoming_message)
+        if durable_source and not self._ingest_for_working_set(durable_source):
+            return None
+
+        target = int(self._config.focused_working_set_target_tokens)
+        if budget_tokens > 0:
+            # Never spend more than half of a model window on replay when the
+            # configured target is larger, while retaining a useful floor.
+            target = min(target, max(8_000, int(budget_tokens * 0.50)))
+        required_indices = self._working_set_required_request_indices(
+            request_messages,
+            conversation_messages,
+        )
+        decision = select_phase_working_set(
+            request_messages,
+            target_tokens=target,
+            trigger_tokens=max(
+                target,
+                int(self._config.focused_working_set_trigger_tokens),
+            ),
+            min_reclaim_tokens=int(
+                self._config.focused_working_set_min_reclaim_tokens
+            ),
+            min_reclaim_ratio=float(
+                self._config.focused_working_set_min_reclaim_ratio
+            ),
+            cache_state=self._working_set_cache_state(),
+            expected_remaining_calls=int(
+                self._config.focused_working_set_payback_calls
+            ),
+            required_indices=required_indices,
+        )
+        self._record_working_set_decision(decision)
+        if decision.messages is None:
+            return None
+        selected = self._sanitize_active_context_messages(decision.messages)
+        if not selected or count_messages_tokens(selected) >= decision.source_tokens:
+            self._record_working_set_decision(
+                WorkingSetDecision(
+                    None,
+                    "post_validation_failed",
+                    decision.source_tokens,
+                    count_messages_tokens(selected),
+                    0,
+                    decision.source_sha256,
+                    decision.omitted_ranges,
+                    decision.cache_state,
+                    decision.payback_calls,
+                )
+            )
+            return None
+        return selected
+
+    def on_turn_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        usage: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Durably ingest each finalized turn without triggering a model call."""
+        if not self._config.focused_working_set_enabled:
+            return
+        self._ingest_for_working_set(messages)
 
     @property
     def last_compression_status(self) -> str:
@@ -5812,6 +5985,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
+            "focused_working_set": {
+                "enabled": bool(self._config.focused_working_set_enabled),
+                "target_tokens": int(self._config.focused_working_set_target_tokens),
+                "trigger_tokens": int(self._config.focused_working_set_trigger_tokens),
+                "min_reclaim_tokens": int(self._config.focused_working_set_min_reclaim_tokens),
+                "min_reclaim_ratio": float(self._config.focused_working_set_min_reclaim_ratio),
+                "expected_payback_calls": int(self._config.focused_working_set_payback_calls),
+                "last_decision": dict(self._last_working_set_decision),
+            },
         })
         status["background_compaction"] = self.get_background_compaction_status()
         with self._assertion_extraction_metrics_lock:
@@ -6545,6 +6727,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX):
             return True
         if content.lstrip().startswith("<relevant-memories>"):
+            return True
+        if content.lstrip().startswith(WORKING_SET_REFERENCE_PREFIX):
             return True
         if "[Expand for details:" not in content:
             return False

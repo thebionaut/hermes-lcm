@@ -397,6 +397,13 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
+    _EnvFieldSpec("focused_working_set_enabled", "LCM_FOCUSED_WORKING_SET_ENABLED", bool),
+    _EnvFieldSpec("focused_working_set_target_tokens", "LCM_FOCUSED_WORKING_SET_TARGET_TOKENS", int),
+    _EnvFieldSpec("focused_working_set_trigger_tokens", "LCM_FOCUSED_WORKING_SET_TRIGGER_TOKENS", int),
+    _EnvFieldSpec("focused_working_set_min_reclaim_tokens", "LCM_FOCUSED_WORKING_SET_MIN_RECLAIM_TOKENS", int),
+    _EnvFieldSpec("focused_working_set_min_reclaim_ratio", "LCM_FOCUSED_WORKING_SET_MIN_RECLAIM_RATIO", float),
+    _EnvFieldSpec("focused_working_set_payback_calls", "LCM_FOCUSED_WORKING_SET_PAYBACK_CALLS", int),
+    _EnvFieldSpec("focused_working_set_ingest_timeout_seconds", "LCM_FOCUSED_WORKING_SET_INGEST_TIMEOUT_SECONDS", float),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
     _EnvFieldSpec("extraction_enabled", "LCM_EXTRACTION_ENABLED", bool),
     _EnvFieldSpec("extraction_model", "LCM_EXTRACTION_MODEL", str),
@@ -610,6 +617,20 @@ class LCMConfig:
     # Reserve this many tokens from the model context window before assembly
     # (0 = disabled). Effective cap becomes context_length - reserve_tokens_floor.
     reserve_tokens_floor: int = 0
+
+    # -- Request-only focused phase working sets ---
+    # Opt-in until the integrated Hermes candidate is qualified. Complete raw
+    # history remains in LCM; only the provider-visible request is selected.
+    focused_working_set_enabled: bool = False
+    focused_working_set_target_tokens: int = 64_000
+    focused_working_set_trigger_tokens: int = 80_000
+    focused_working_set_min_reclaim_tokens: int = 16_000
+    focused_working_set_min_reclaim_ratio: float = 0.30
+    # Estimated remaining calls in the current phase used for hot-cache
+    # reseed payback. A cold/unknown request has no cache-displacement charge.
+    focused_working_set_payback_calls: int = 4
+    # Lossless pre-selection/post-turn ingest shares a bounded foreground wait.
+    focused_working_set_ingest_timeout_seconds: float = 5.0
 
     # -- Session and message filtering ---
     # Sessions to exclude from LCM storage entirely.
@@ -938,6 +959,39 @@ class LCMConfig:
             ratio = 0.55
         self.background_compaction_prepare_ratio = min(1.0, max(0.0, ratio))
 
+    def _normalize_focused_working_set(self) -> None:
+        """Clamp request-selection limits to finite, operational values."""
+        integer_defaults = {
+            "focused_working_set_target_tokens": 64_000,
+            "focused_working_set_trigger_tokens": 80_000,
+            "focused_working_set_min_reclaim_tokens": 16_000,
+            "focused_working_set_payback_calls": 4,
+        }
+        for field_name, default in integer_defaults.items():
+            try:
+                value = int(getattr(self, field_name))
+            except (TypeError, ValueError):
+                value = default
+            setattr(self, field_name, max(1, value))
+        self.focused_working_set_trigger_tokens = max(
+            self.focused_working_set_target_tokens,
+            self.focused_working_set_trigger_tokens,
+        )
+        try:
+            ratio = float(self.focused_working_set_min_reclaim_ratio)
+        except (TypeError, ValueError):
+            ratio = 0.30
+        if not math.isfinite(ratio):
+            ratio = 0.30
+        self.focused_working_set_min_reclaim_ratio = min(1.0, max(0.0, ratio))
+        try:
+            timeout = float(self.focused_working_set_ingest_timeout_seconds)
+        except (TypeError, ValueError):
+            timeout = 5.0
+        if not math.isfinite(timeout):
+            timeout = 5.0
+        self.focused_working_set_ingest_timeout_seconds = min(30.0, max(0.1, timeout))
+
     @classmethod
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
@@ -1019,6 +1073,7 @@ class LCMConfig:
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
         c._normalize_reconcile_budget()
         c._normalize_background_compaction()
+        c._normalize_focused_working_set()
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")
