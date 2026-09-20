@@ -348,6 +348,10 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
+    _EnvFieldSpec("compaction_payback_enabled", "LCM_COMPACTION_PAYBACK_ENABLED", bool),
+    _EnvFieldSpec("compaction_payback_expected_calls", "LCM_COMPACTION_PAYBACK_EXPECTED_CALLS", int),
+    _EnvFieldSpec("compaction_payback_min_reclaim_tokens", "LCM_COMPACTION_PAYBACK_MIN_RECLAIM_TOKENS", int),
+    _EnvFieldSpec("compaction_payback_summary_ratio", "LCM_COMPACTION_PAYBACK_SUMMARY_RATIO", float),
     _EnvFieldSpec(
         "background_compaction_enabled",
         "LCM_BACKGROUND_COMPACTION_ENABLED",
@@ -587,6 +591,12 @@ class LCMConfig:
     threshold_full_sweep_enabled: bool = False
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
+    # Require useful aggregate reclaim before elective summary work. Emergency
+    # provider-limit recovery always bypasses this gate.
+    compaction_payback_enabled: bool = False
+    compaction_payback_expected_calls: int = 16
+    compaction_payback_min_reclaim_tokens: int = 8_000
+    compaction_payback_summary_ratio: float = 0.20
 
     # -- Durable background compaction ---
     # Explicit opt-in keeps disabled deployments byte-for-byte foreground-only.
@@ -991,6 +1001,24 @@ class LCMConfig:
         if not math.isfinite(timeout):
             timeout = 5.0
         self.focused_working_set_ingest_timeout_seconds = min(30.0, max(0.1, timeout))
+
+        try:
+            expected_calls = int(self.compaction_payback_expected_calls)
+        except (TypeError, ValueError):
+            expected_calls = 16
+        self.compaction_payback_expected_calls = max(1, expected_calls)
+        try:
+            reclaim = int(self.compaction_payback_min_reclaim_tokens)
+        except (TypeError, ValueError):
+            reclaim = 8_000
+        self.compaction_payback_min_reclaim_tokens = max(1, reclaim)
+        try:
+            summary_ratio = float(self.compaction_payback_summary_ratio)
+        except (TypeError, ValueError):
+            summary_ratio = 0.20
+        if not math.isfinite(summary_ratio):
+            summary_ratio = 0.20
+        self.compaction_payback_summary_ratio = min(0.90, max(0.01, summary_ratio))
 
     @classmethod
     def from_env(cls) -> "LCMConfig":

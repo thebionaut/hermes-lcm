@@ -200,3 +200,66 @@ def test_working_set_reference_is_never_reingested(tmp_path):
     rows = engine._store.get_session_messages("session")
     assert [row["content"] for row in rows] == ["real source"]
     engine.shutdown()
+
+
+def test_compaction_payback_stops_two_unchanged_ineffective_passes(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=800,
+        compaction_payback_enabled=True,
+        compaction_payback_expected_calls=1,
+        compaction_payback_min_reclaim_tokens=100,
+        compaction_payback_summary_ratio=0.20,
+    )
+    engine = LCMEngine(config, hermes_home=str(tmp_path / "home"))
+    engine.on_session_start("session", conversation_id="conversation", context_length=200_000)
+    messages = _history(8)
+    engine._last_active_replay_messages = messages
+    engine.threshold_tokens = 100
+    engine.last_cache_read_tokens = 5_000
+
+    assert engine.should_compress(prompt_tokens=8_000) is False
+    assert engine._last_compaction_payback["reason"] == "payback_not_reached"
+    assert engine.should_compress(prompt_tokens=8_000) is False
+    assert engine._last_compaction_payback["reason"] == "unchanged_source_checkpoint_required"
+    assert engine._last_compaction_payback["same_source_denials"] == 2
+    engine.shutdown()
+
+
+def test_emergency_overflow_bypasses_payback_gate(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=800,
+        max_assembly_tokens=7_000,
+        compaction_payback_enabled=True,
+        compaction_payback_expected_calls=1,
+        compaction_payback_min_reclaim_tokens=100_000,
+    )
+    engine = LCMEngine(config, hermes_home=str(tmp_path / "home"))
+    engine.on_session_start("session", conversation_id="conversation", context_length=200_000)
+    engine._last_active_replay_messages = _history(8)
+    engine.threshold_tokens = 100
+    engine.last_cache_read_tokens = 5_000
+
+    assert engine.should_compress(prompt_tokens=8_000) is True
+    assert engine._last_compaction_payback["reason"] == "never_evaluated"
+    engine.shutdown()
+
+
+def test_new_environment_controls_are_normalized(monkeypatch):
+    monkeypatch.setenv("LCM_FOCUSED_WORKING_SET_ENABLED", "true")
+    monkeypatch.setenv("LCM_FOCUSED_WORKING_SET_TARGET_TOKENS", "64000")
+    monkeypatch.setenv("LCM_FOCUSED_WORKING_SET_TRIGGER_TOKENS", "1")
+    monkeypatch.setenv("LCM_COMPACTION_PAYBACK_ENABLED", "true")
+    monkeypatch.setenv("LCM_COMPACTION_PAYBACK_EXPECTED_CALLS", "0")
+    monkeypatch.setenv("LCM_COMPACTION_PAYBACK_SUMMARY_RATIO", "5")
+
+    config = LCMConfig.from_env()
+
+    assert config.focused_working_set_enabled is True
+    assert config.focused_working_set_trigger_tokens == 64_000
+    assert config.compaction_payback_enabled is True
+    assert config.compaction_payback_expected_calls == 1
+    assert config.compaction_payback_summary_ratio == 0.90

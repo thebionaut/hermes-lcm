@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import json
+import hashlib
 import inspect
 import sqlite3
 import threading
@@ -41,6 +42,99 @@ _MANUAL_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    def _compaction_payback_status(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        observed_tokens: int | None = None,
+    ) -> tuple[bool, str]:
+        """Estimate whether elective leaf compaction repays its total work.
+
+        Summary input/output and a hot-cache reseed are charged before future
+        replay savings. Emergency overflow recovery is deliberately evaluated
+        by callers first and never reaches this gate.
+        """
+        if not getattr(self._config, "compaction_payback_enabled", False):
+            return True, "disabled"
+        if not messages:
+            return False, "no source messages"
+        fresh_tail_start = self._fresh_tail_start(messages)
+        leading_anchor_count = self._leading_anchor_count(messages)
+        if fresh_tail_start <= leading_anchor_count:
+            return False, "no eligible raw backlog outside fresh tail"
+        candidate = messages[leading_anchor_count:fresh_tail_start]
+        raw_tokens = count_messages_tokens(candidate)
+        if raw_tokens <= 0:
+            return False, "no eligible raw backlog outside fresh tail"
+        chunk_tokens = min(
+            raw_tokens,
+            self._working_leaf_chunk_tokens(raw_tokens),
+        )
+        summary_tokens = max(
+            256,
+            int(chunk_tokens * float(self._config.compaction_payback_summary_ratio)),
+        )
+        reclaim_tokens = max(0, chunk_tokens - summary_tokens)
+        minimum_reclaim = max(
+            1,
+            int(self._config.compaction_payback_min_reclaim_tokens),
+        )
+        source_tokens = max(
+            count_messages_tokens(messages),
+            int(observed_tokens or 0),
+        )
+        cache_hot = bool(
+            getattr(self, "last_cache_read_tokens", 0) > 0
+            or getattr(self, "last_cache_write_tokens", 0) > 0
+        )
+        reseed_tokens = max(0, source_tokens - reclaim_tokens) if cache_hot else 0
+        one_time_tokens = chunk_tokens + summary_tokens + reseed_tokens
+        expected_calls = max(1, int(self._config.compaction_payback_expected_calls))
+        projected_savings = reclaim_tokens * expected_calls
+        source_digest = hashlib.sha256(
+            json.dumps(
+                candidate,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        allowed = bool(
+            reclaim_tokens >= minimum_reclaim
+            and projected_savings > one_time_tokens
+        )
+        previous = getattr(self, "_last_compaction_payback", {}) or {}
+        same_denial_count = 0
+        if not allowed:
+            same_denial_count = (
+                int(previous.get("same_source_denials", 0) or 0) + 1
+                if previous.get("source_sha256") == source_digest
+                and previous.get("allowed") is False
+                else 1
+            )
+        reason = "payback_reached" if allowed else "payback_not_reached"
+        if not allowed and same_denial_count >= 2:
+            reason = "unchanged_source_checkpoint_required"
+        self._last_compaction_payback = {
+            "allowed": allowed,
+            "reason": reason,
+            "source_sha256": source_digest,
+            "source_tokens": source_tokens,
+            "chunk_tokens": chunk_tokens,
+            "estimated_summary_tokens": summary_tokens,
+            "estimated_reclaim_tokens": reclaim_tokens,
+            "estimated_reseed_tokens": reseed_tokens,
+            "estimated_one_time_tokens": one_time_tokens,
+            "expected_phase_calls": expected_calls,
+            "projected_savings_tokens": projected_savings,
+            "cache_state": "hot" if cache_hot else (
+                "cold" if getattr(self, "cache_metrics_available", False) else "unknown"
+            ),
+            "same_source_denials": same_denial_count,
+        }
+        return allowed, reason
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(
         self,
         *,
@@ -162,7 +256,19 @@ class CompactionMixin:
             return True
         if self.threshold_tokens <= 0:
             return False
-        return tokens >= self.threshold_tokens
+        if tokens < self.threshold_tokens:
+            return False
+        replay = list(getattr(self, "_last_active_replay_messages", ()) or ())
+        if replay:
+            allowed, reason = self._compaction_payback_status(
+                replay,
+                observed_tokens=int(tokens or 0),
+            )
+            if not allowed:
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = reason
+            return allowed
+        return True
 
     def _clear_foreground_preflight_deadline_handoff(self) -> None:
         context = getattr(self, "_thread_context", None)
@@ -449,7 +555,16 @@ class CompactionMixin:
                 deadline=deadline,
             )
             if eligible:
-                return self._mark_preflight_compression_requested()
+                payback_allowed, payback_reason = self._compaction_payback_status(
+                    replay_messages,
+                    observed_tokens=replay_rough,
+                )
+                if payback_allowed:
+                    return self._mark_preflight_compression_requested()
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = payback_reason
+                logger.info("LCM preflight compression no-op: %s", payback_reason)
+                return False
             if self._has_ignored_backlog_outside_fresh_tail(
                 replay_messages,
                 deadline=deadline,
@@ -494,7 +609,16 @@ class CompactionMixin:
                 deadline=deadline,
             )
             if eligible:
-                return self._mark_preflight_compression_requested()
+                payback_allowed, payback_reason = self._compaction_payback_status(
+                    messages,
+                    observed_tokens=rough,
+                )
+                if payback_allowed:
+                    return self._mark_preflight_compression_requested()
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = payback_reason
+                logger.info("LCM preflight compression no-op: %s", payback_reason)
+                return False
             if self._has_ignored_backlog_outside_fresh_tail(
                 messages,
                 deadline=deadline,

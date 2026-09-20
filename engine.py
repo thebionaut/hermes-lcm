@@ -590,6 +590,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "cache_state": "unknown",
             "payback_calls": 0,
         }
+        self._last_compaction_payback: dict[str, Any] = {
+            "allowed": None,
+            "reason": "never_evaluated",
+            "same_source_denials": 0,
+        }
         self._last_foreground_deadline: Dict[str, Any] = {
             "status": "never_exhausted"
         }
@@ -5993,6 +5998,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "min_reclaim_ratio": float(self._config.focused_working_set_min_reclaim_ratio),
                 "expected_payback_calls": int(self._config.focused_working_set_payback_calls),
                 "last_decision": dict(self._last_working_set_decision),
+            },
+            "compaction_payback": {
+                "enabled": bool(self._config.compaction_payback_enabled),
+                "expected_phase_calls": int(self._config.compaction_payback_expected_calls),
+                "min_reclaim_tokens": int(self._config.compaction_payback_min_reclaim_tokens),
+                "summary_ratio": float(self._config.compaction_payback_summary_ratio),
+                "last_decision": dict(self._last_compaction_payback),
             },
         })
         status["background_compaction"] = self.get_background_compaction_status()
