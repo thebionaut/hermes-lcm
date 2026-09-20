@@ -819,6 +819,32 @@ class TestConfig:
         c = LCMConfig.from_env()
 
         assert c.summary_timeout_ms == 45_000
+        assert c.config_sources["summary_timeout_ms"] == "env:LCM_SUMMARY_TIMEOUT_MS"
+        assert c.config_source_warnings == [
+            "LCM summary timeout override differs from YAML authority: "
+            "effective=45000ms source=env:LCM_SUMMARY_TIMEOUT_MS; "
+            "yaml=120000ms source=config_yaml:auxiliary.compression.timeout"
+        ]
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "invalid"])
+    def test_from_env_rejects_invalid_or_nonpositive_summary_timeout_override(
+        self, monkeypatch, tmp_path, raw
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    timeout: 45\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", raw)
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 45_000
+        assert c.config_sources["summary_timeout_ms"] == (
+            "config_yaml:auxiliary.compression.timeout"
+        )
+        assert len(c.config_source_warnings) == 1
 
     def test_from_env_reads_auxiliary_timeout_without_pyyaml(self, monkeypatch, tmp_path):
         import hermes_lcm.config as config_mod
