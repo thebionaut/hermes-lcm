@@ -33,6 +33,7 @@ from .diagnostics import (
     doctor_guidance_for_checks,
 )
 from .dag import build_nodes_fts_spec
+from .background_compaction import background_policy_fingerprint
 from .db_bootstrap import (
     check_external_content_fts_integrity,
     inspect_lcm_schema_health,
@@ -47,6 +48,7 @@ from .ingest_protection import (
     scan_sqlite_payload_risks,
     sensitive_pattern_status,
 )
+from .invariant_audit import audit_compaction_invariants
 from .model_routing import apply_lcm_model_route
 from .assertion_state import query_assertion_state
 from .assertion_store import ASSERTION_KINDS
@@ -7321,6 +7323,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "LCM engine not initialized"})
 
     checks: list[dict] = []
+    invariant_audit: dict[str, Any] | None = None
     background_compaction = _background_compaction_status_payload(engine)
     # Diagnose the foreground session, not whatever side-channel session
     # currently owns engine._session_id. Falls back to the bound id when no
@@ -7691,15 +7694,82 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         "detail": background_compaction,
     })
 
+    if bool(args.get("integrity_audit", False)):
+        helper = getattr(engine, "_background_compaction", None)
+        if helper is None:
+            invariant_audit = {
+                "status": "unknown",
+                "complete": False,
+                "error": "background_compaction_store_unavailable",
+            }
+        else:
+            try:
+                audit_deadline = time.monotonic() + min(
+                    15.0, max(0.25, float(args.get("audit_timeout_seconds", 5.0)))
+                )
+                with helper._bounded_read_connection(
+                    lock_timeout_seconds=1.0,
+                    deadline=audit_deadline,
+                    busy_timeout_ms=1_000,
+                ) as conn:
+                    opened_snapshot = not conn.in_transaction
+                    if opened_snapshot:
+                        conn.execute("BEGIN")
+                    try:
+                        invariant_audit = audit_compaction_invariants(
+                            conn,
+                            current_policy_fingerprint=background_policy_fingerprint(
+                                engine._config
+                            ),
+                            scope=str(args.get("audit_scope") or "session"),
+                            session_id=str(
+                                args.get("session_id") or engine.current_session_id or ""
+                            ),
+                            job_id=str(args.get("job_id") or ""),
+                            fence_generation=(
+                                int(args["fence_generation"])
+                                if args.get("fence_generation") is not None
+                                else None
+                            ),
+                            cursor=str(args.get("cursor") or ""),
+                            limit=int(args.get("limit") or 100),
+                            example_limit=int(args.get("example_limit") or 10),
+                            snapshot_kind="bounded_live_read_transaction",
+                        )
+                    finally:
+                        if opened_snapshot and conn.in_transaction:
+                            conn.execute("ROLLBACK")
+            except Exception as exc:
+                invariant_audit = {
+                    "status": "unknown",
+                    "complete": False,
+                    "error": type(exc).__name__,
+                }
+        audit_status = str(invariant_audit.get("status") or "unknown")
+        checks.append(
+            {
+                "check": "compaction_invariants",
+                "status": (
+                    "pass" if audit_status == "pass"
+                    else "fail" if audit_status == "fail"
+                    else "warn"
+                ),
+                "detail": invariant_audit,
+            }
+        )
+
     overall = "healthy"
     if any(ch["status"] == "fail" for ch in checks):
         overall = "unhealthy"
     elif any(ch["status"] == "warn" for ch in checks):
         overall = "warnings"
 
-    return json.dumps({
+    payload = {
         "overall": overall,
         "runtime_identity": engine.get_runtime_identity(),
         "checks": checks,
         "guidance": doctor_guidance_for_checks(checks),
-    })
+    }
+    if invariant_audit is not None:
+        payload["compaction_invariant_audit"] = invariant_audit
+    return json.dumps(payload)

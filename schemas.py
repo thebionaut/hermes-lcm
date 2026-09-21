@@ -1129,12 +1129,60 @@ LCM_DOCTOR = {
     "description": (
         "Run diagnostics on the LCM database and configuration. Checks database "
         "integrity, detects orphaned DAG nodes, validates configuration, and "
-        "reports potential issues. Use this to troubleshoot problems or verify "
-        "a healthy setup."
+        "reports potential issues. Optionally runs a bounded, read-only compaction "
+        "relationship audit and prepared-job classifier. Use this to troubleshoot "
+        "problems or verify a healthy setup."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+            "integrity_audit": {
+                "type": "boolean",
+                "description": "Run the bounded read-only compaction invariant audit.",
+                "default": False,
+            },
+            "audit_scope": {
+                "type": "string",
+                "enum": ["session", "job", "epoch", "whole_store"],
+                "description": "Prepared-job audit scope. Whole-store scans are resumable and incomplete pages never pass.",
+                "default": "session",
+            },
+            "session_id": {
+                "type": "string",
+                "description": "Session for session or epoch scope; defaults to the current foreground session.",
+            },
+            "job_id": {
+                "type": "string",
+                "description": "Exact prepared job for job scope.",
+            },
+            "fence_generation": {
+                "type": "integer",
+                "description": "Historical session fence generation for epoch scope.",
+                "minimum": 0,
+            },
+            "cursor": {
+                "type": "string",
+                "description": "Opaque last job ID from a previous audit page.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 500,
+                "default": 100,
+            },
+            "example_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "default": 10,
+            },
+            "audit_timeout_seconds": {
+                "type": "number",
+                "minimum": 0.25,
+                "maximum": 15,
+                "default": 5,
+            },
+        },
         "required": [],
     },
 }
