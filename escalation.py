@@ -115,7 +115,21 @@ def _set_attempt_trace(
     if trace is None:
         return
     for key, value in values.items():
-        if key in {"requested_model", "actual_provider", "actual_model"}:
+        if key in {
+            "physical_attempt_id",
+            "requested_provider",
+            "requested_model",
+            "actual_provider",
+            "actual_model",
+            "served_model",
+            "send_state",
+            "usage_coverage",
+            "usage_convention",
+            "usage_normalization_version",
+            "finish_reason",
+            "timeout_source",
+            "estimate_method",
+        }:
             trace[key] = _safe_trace_label(value)
         elif key == "failure_reason":
             trace[key] = _safe_reason_code(value) if value else ""
@@ -127,8 +141,19 @@ def _set_attempt_trace(
             "source_token_count",
             "summary_token_count",
             "latency_ms",
+            "effective_timeout_ms",
+            "provider_input_total",
+            "provider_output_total",
+            "cache_read_input",
+            "cache_write_input",
+            "reasoning_output",
+            "normalized_input",
+            "normalized_output",
+            "source_input_estimate",
+            "serialized_input_estimate",
+            "framed_input_estimate",
         }:
-            trace[key] = max(0, int(value or 0))
+            trace[key] = None if value is None else max(0, int(value or 0))
         elif key in {"started_at", "finished_at"}:
             trace[key] = max(0.0, float(value or 0.0))
         elif key == "attribution_available":
@@ -754,6 +779,32 @@ def _invoke_summary_llm_chain(
             finished_at=started_at,
         )
         route_info: dict[str, Any] = {}
+        root_receipt_sink = trace.get("receipt_sink") if trace is not None else None
+        if callable(root_receipt_sink):
+            def receipt_sink(
+                event: Mapping[str, Any],
+                *,
+                _sink: Callable[[Mapping[str, Any]], None] = root_receipt_sink,
+                _level: int = escalation_level,
+                _ordinal: int = logical_route_ordinal,
+                _requested_model: str = candidate_model,
+                _source_tokens: int = source_token_count,
+                _framed_tokens: int = count_tokens(prompt),
+            ) -> None:
+                payload = dict(event)
+                payload.update(
+                    {
+                        "escalation_level": _level,
+                        "logical_route_ordinal": _ordinal,
+                        "requested_model": _requested_model,
+                        "source_input_estimate": max(0, int(_source_tokens or 0)),
+                        "framed_input_estimate": max(0, int(_framed_tokens or 0)),
+                        "estimate_method": "lcm-tokenizer-v1",
+                    }
+                )
+                _sink(payload)
+
+            route_info["receipt_sink"] = receipt_sink
 
         def finish_attempt(*, outcome: str, reason: str = "") -> None:
             _set_attempt_trace(
@@ -786,9 +837,35 @@ def _invoke_summary_llm_chain(
                         physical_reason = reason
                     _set_attempt_trace(
                         physical,
+                        physical_attempt_id=physical_raw.get("physical_attempt_id"),
+                        requested_provider=physical_raw.get("provider"),
+                        requested_model=physical_raw.get("model"),
                         logical_route_ordinal=len(attempts),
                         actual_provider=physical_raw.get("provider"),
                         actual_model=physical_raw.get("model"),
+                        served_model=physical_raw.get("served_model"),
+                        send_state=physical_raw.get("send_state"),
+                        effective_timeout_ms=physical_raw.get("effective_timeout_ms"),
+                        timeout_source=physical_raw.get("timeout_source"),
+                        usage_coverage=physical_raw.get("usage_coverage"),
+                        provider_input_total=physical_raw.get("provider_input_total"),
+                        provider_output_total=physical_raw.get("provider_output_total"),
+                        cache_read_input=physical_raw.get("cache_read_input"),
+                        cache_write_input=physical_raw.get("cache_write_input"),
+                        reasoning_output=physical_raw.get("reasoning_output"),
+                        normalized_input=physical_raw.get("normalized_input"),
+                        normalized_output=physical_raw.get("normalized_output"),
+                        usage_convention=physical_raw.get("usage_convention"),
+                        usage_normalization_version=physical_raw.get(
+                            "usage_normalization_version"
+                        ),
+                        finish_reason=physical_raw.get("finish_reason"),
+                        source_input_estimate=physical_raw.get("source_input_estimate"),
+                        serialized_input_estimate=physical_raw.get(
+                            "serialized_input_estimate"
+                        ),
+                        framed_input_estimate=physical_raw.get("framed_input_estimate"),
+                        estimate_method=physical_raw.get("estimate_method"),
                         attribution_available=bool(
                             physical_raw.get("provider")
                             and physical_raw.get("model")

@@ -323,6 +323,8 @@ def test_summary_host_receives_absolute_deadline(monkeypatch):
 
 
 def test_host_physical_attempts_are_flattened_into_durable_trace(monkeypatch):
+    receipt_events = []
+
     def host_summary(
         _prompt,
         _max_tokens,
@@ -365,7 +367,7 @@ def test_host_physical_attempts_are_flattened_into_durable_trace(monkeypatch):
         return "retained factual summary"
 
     monkeypatch.setattr(escalation, "_call_llm_for_summary", host_summary)
-    trace = {}
+    trace = {"receipt_sink": lambda event: receipt_events.append(dict(event))}
     result = escalation.summarize_with_escalation(
         "source " * 200,
         source_tokens=500,
@@ -383,6 +385,44 @@ def test_host_physical_attempts_are_flattened_into_durable_trace(monkeypatch):
         ("openai-codex", "success"),
     ]
     assert [item["logical_route_ordinal"] for item in trace["attempts"]] == [0, 1]
+    # The per-route bridge preserves the durable sink while adding stable
+    # logical and estimate metadata to each physical event.
+    route_info = {}
+
+    def sink_probe(
+        _prompt, _max_tokens, *, route_info=None, trace=None, **_kwargs
+    ):
+        del trace
+        info = route_info
+        info["receipt_sink"](
+            {
+                "physical_attempt_id": "probe:0",
+                "send_state": "started",
+                "provider": "zai",
+                "model": "glm",
+            }
+        )
+        info.update(provider="zai", model="glm", physical_attempts=[])
+        return "short"
+
+    monkeypatch.setattr(escalation, "_call_llm_for_summary", sink_probe)
+    probe_trace = {"receipt_sink": lambda event: route_info.update(event)}
+    escalation.summarize_with_escalation(
+        "source " * 200,
+        source_tokens=500,
+        token_budget=100,
+        model="glm",
+        timeout=60.0,
+        deadline=escalation.time.monotonic() + 60.0,
+        trace=probe_trace,
+    )
+    assert route_info["physical_attempt_id"] == "probe:0"
+    assert route_info["escalation_level"] == 1
+    assert route_info["logical_route_ordinal"] == 0
+    assert route_info["requested_model"] == "glm"
+    assert route_info["source_input_estimate"] == 500
+    assert route_info["framed_input_estimate"] > 0
+    assert route_info["estimate_method"] == "lcm-tokenizer-v1"
 
 
 def test_reference_publication_is_reported_separately_from_summary_success(tmp_path):

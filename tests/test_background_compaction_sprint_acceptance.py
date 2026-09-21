@@ -921,6 +921,7 @@ def test_range_disposition_and_telemetry_migration_is_idempotent_across_two_proc
         assert {
             "lcm_compaction_range_dispositions",
             "lcm_compaction_attempts",
+            "lcm_compaction_attempt_receipts",
             "lcm_compaction_publications",
             "lcm_compaction_prepared_nodes",
         } <= tables

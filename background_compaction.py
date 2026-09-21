@@ -56,6 +56,9 @@ BACKGROUND_COMPACTION_RANGE_DISPOSITIONS_MIGRATION_STEP = (
 )
 BACKGROUND_COMPACTION_TELEMETRY_MIGRATION_STEP = "background_compaction_telemetry_v1"
 BACKGROUND_PREPARATION_POLICY_VERSION = "background-preparation-v1"
+LCM_PHYSICAL_RECEIPT_SCHEMA_VERSION = "lcm-physical-attempt-v1"
+LCM_SUMMARY_PROMPT_VERSION = "lcm-summary-prompt-v1"
+LCM_ACTIVE_REPLAY_PROJECTION_VERSION = "disabled-v1"
 _ACTIVE_STATES = ("queued", "running", "prepared", "retry")
 _FINAL_STATES = ("published", "superseded", "failed")
 _MAX_ERROR_CHARS = 512
@@ -1234,6 +1237,49 @@ def _ensure_background_schema(conn: sqlite3.Connection) -> None:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS lcm_compaction_attempt_receipts (
+                physical_attempt_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                job_attempt INTEGER NOT NULL,
+                chunk_ordinal INTEGER NOT NULL,
+                escalation_level INTEGER NOT NULL DEFAULT 0,
+                logical_route_ordinal INTEGER NOT NULL DEFAULT 0,
+                send_state TEXT NOT NULL,
+                transport_outcome TEXT NOT NULL DEFAULT 'started',
+                transport_reason TEXT NOT NULL DEFAULT '',
+                summary_outcome TEXT NOT NULL DEFAULT 'pending',
+                summary_reason TEXT NOT NULL DEFAULT '',
+                requested_provider TEXT NOT NULL DEFAULT '',
+                requested_model TEXT NOT NULL DEFAULT '',
+                served_provider TEXT NOT NULL DEFAULT '',
+                served_model TEXT NOT NULL DEFAULT '',
+                effective_timeout_ms INTEGER,
+                timeout_source TEXT NOT NULL DEFAULT '',
+                source_version TEXT NOT NULL,
+                config_version TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                projection_version TEXT NOT NULL,
+                provider_input_total INTEGER,
+                provider_output_total INTEGER,
+                cache_read_input INTEGER,
+                cache_write_input INTEGER,
+                reasoning_output INTEGER,
+                normalized_input INTEGER,
+                normalized_output INTEGER,
+                usage_convention TEXT NOT NULL DEFAULT 'unknown',
+                usage_normalization_version TEXT NOT NULL DEFAULT '',
+                usage_coverage TEXT NOT NULL DEFAULT 'unavailable',
+                source_input_estimate INTEGER,
+                serialized_input_estimate INTEGER,
+                framed_input_estimate INTEGER,
+                estimate_method TEXT NOT NULL DEFAULT '',
+                finish_reason TEXT NOT NULL DEFAULT '',
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                started_at REAL NOT NULL,
+                finished_at REAL
+            ) WITHOUT ROWID
+            """,
+            """
             CREATE TABLE IF NOT EXISTS lcm_compaction_publications (
                 job_id TEXT PRIMARY KEY,
                 conversation_id TEXT NOT NULL,
@@ -1358,6 +1404,17 @@ def _ensure_background_schema(conn: sqlite3.Connection) -> None:
                 ON lcm_compaction_attempts(
                     actual_provider, actual_model, finished_at
                 )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_lcm_attempt_receipts_job
+                ON lcm_compaction_attempt_receipts(
+                    job_id, job_attempt, chunk_ordinal, escalation_level,
+                    logical_route_ordinal
+                )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_lcm_attempt_receipts_started
+                ON lcm_compaction_attempt_receipts(started_at, send_state)
             """,
         )
         conn.execute(statements[0])
@@ -8083,6 +8140,203 @@ class BackgroundCompactionStore:
             return "provider_connection_error"
         return "provider_error"
 
+    def _record_physical_attempt_receipt(
+        self,
+        *,
+        job: CompactionJob,
+        chunk_ordinal: int,
+        event: Mapping[str, Any],
+        serialized_input_estimate: int,
+    ) -> None:
+        """Durably upsert one physical send start or settlement event.
+
+        The physical id is allocated before transport.  A committed ``started``
+        row therefore remains truthful when the process dies before settlement;
+        later settlement for the same id updates that row and never creates a
+        second counted attempt.
+        """
+        physical_id = str(event.get("physical_attempt_id") or "").strip()[:200]
+        if not physical_id:
+            return
+
+        def nullable_int(name: str) -> int | None:
+            value = event.get(name)
+            if value is None:
+                return None
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        started_at = event.get("started_at")
+        finished_at = event.get("finished_at")
+        try:
+            started_at_value = max(0.0, float(started_at or self._now()))
+        except (TypeError, ValueError, OverflowError):
+            started_at_value = float(self._now())
+        try:
+            finished_at_value = (
+                max(started_at_value, float(finished_at))
+                if finished_at is not None and float(finished_at) > 0
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            finished_at_value = None
+        send_state = (
+            "settled" if str(event.get("send_state") or "") == "settled" else "started"
+        )
+        transport_outcome = str(event.get("outcome") or "started")
+        if transport_outcome not in {"started", "success", "failure"}:
+            transport_outcome = "failure" if send_state == "settled" else "started"
+        transport_reason = str(event.get("failure_reason") or "")[:64]
+        requested_provider = str(
+            event.get("requested_provider") or event.get("provider") or ""
+        )[:64]
+        requested_model = str(
+            event.get("requested_model") or event.get("model") or ""
+        )[:160]
+        served_provider = str(event.get("provider") or "")[:64]
+        served_model = str(event.get("served_model") or event.get("model") or "")[:160]
+        with self._write_transaction() as conn:
+            if conn.execute(
+                "SELECT 1 FROM lcm_compaction_jobs WHERE job_id=?",
+                (str(job.job_id),),
+            ).fetchone() is None:
+                return
+            conn.execute(
+                """
+                INSERT INTO lcm_compaction_attempt_receipts(
+                    physical_attempt_id, job_id, job_attempt, chunk_ordinal,
+                    escalation_level, logical_route_ordinal, send_state,
+                    transport_outcome, transport_reason, summary_outcome,
+                    summary_reason, requested_provider, requested_model,
+                    served_provider, served_model, effective_timeout_ms,
+                    timeout_source, source_version, config_version,
+                    prompt_version, projection_version, provider_input_total,
+                    provider_output_total, cache_read_input, cache_write_input,
+                    reasoning_output, normalized_input, normalized_output,
+                    usage_convention, usage_normalization_version,
+                    usage_coverage, source_input_estimate,
+                    serialized_input_estimate, framed_input_estimate,
+                    estimate_method, finish_reason, latency_ms, started_at,
+                    finished_at
+                ) VALUES(
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                    ?,?,?,?,?,?,?,?,?,?
+                )
+                ON CONFLICT(physical_attempt_id) DO UPDATE SET
+                    send_state=CASE
+                        WHEN lcm_compaction_attempt_receipts.send_state='settled'
+                        THEN 'settled' ELSE excluded.send_state END,
+                    transport_outcome=CASE
+                        WHEN excluded.send_state='settled'
+                        THEN excluded.transport_outcome
+                        ELSE lcm_compaction_attempt_receipts.transport_outcome END,
+                    transport_reason=CASE
+                        WHEN excluded.send_state='settled'
+                        THEN excluded.transport_reason
+                        ELSE lcm_compaction_attempt_receipts.transport_reason END,
+                    served_provider=CASE
+                        WHEN excluded.send_state='settled'
+                        THEN excluded.served_provider
+                        ELSE lcm_compaction_attempt_receipts.served_provider END,
+                    served_model=CASE
+                        WHEN excluded.send_state='settled'
+                        THEN excluded.served_model
+                        ELSE lcm_compaction_attempt_receipts.served_model END,
+                    effective_timeout_ms=COALESCE(
+                        excluded.effective_timeout_ms,
+                        lcm_compaction_attempt_receipts.effective_timeout_ms
+                    ),
+                    timeout_source=excluded.timeout_source,
+                    provider_input_total=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.provider_input_total
+                        ELSE lcm_compaction_attempt_receipts.provider_input_total END,
+                    provider_output_total=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.provider_output_total
+                        ELSE lcm_compaction_attempt_receipts.provider_output_total END,
+                    cache_read_input=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.cache_read_input
+                        ELSE lcm_compaction_attempt_receipts.cache_read_input END,
+                    cache_write_input=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.cache_write_input
+                        ELSE lcm_compaction_attempt_receipts.cache_write_input END,
+                    reasoning_output=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.reasoning_output
+                        ELSE lcm_compaction_attempt_receipts.reasoning_output END,
+                    normalized_input=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.normalized_input
+                        ELSE lcm_compaction_attempt_receipts.normalized_input END,
+                    normalized_output=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.normalized_output
+                        ELSE lcm_compaction_attempt_receipts.normalized_output END,
+                    usage_convention=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.usage_convention
+                        ELSE lcm_compaction_attempt_receipts.usage_convention END,
+                    usage_normalization_version=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.usage_normalization_version
+                        ELSE lcm_compaction_attempt_receipts.usage_normalization_version END,
+                    usage_coverage=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.usage_coverage
+                        ELSE lcm_compaction_attempt_receipts.usage_coverage END,
+                    framed_input_estimate=COALESCE(
+                        excluded.framed_input_estimate,
+                        lcm_compaction_attempt_receipts.framed_input_estimate
+                    ),
+                    estimate_method=excluded.estimate_method,
+                    finish_reason=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.finish_reason
+                        ELSE lcm_compaction_attempt_receipts.finish_reason END,
+                    latency_ms=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.latency_ms
+                        ELSE lcm_compaction_attempt_receipts.latency_ms END,
+                    finished_at=CASE WHEN excluded.send_state='settled'
+                        THEN excluded.finished_at
+                        ELSE lcm_compaction_attempt_receipts.finished_at END
+                """,
+                (
+                    physical_id,
+                    str(job.job_id),
+                    max(1, int(job.attempt_count or 1)),
+                    max(0, int(chunk_ordinal)),
+                    nullable_int("escalation_level") or 0,
+                    nullable_int("logical_route_ordinal") or 0,
+                    send_state,
+                    transport_outcome,
+                    transport_reason,
+                    "pending",
+                    "",
+                    requested_provider,
+                    requested_model,
+                    served_provider,
+                    served_model,
+                    nullable_int("effective_timeout_ms"),
+                    str(event.get("timeout_source") or "")[:160],
+                    LCM_PHYSICAL_RECEIPT_SCHEMA_VERSION,
+                    str(job.policy_fingerprint or "")[:160],
+                    LCM_SUMMARY_PROMPT_VERSION,
+                    LCM_ACTIVE_REPLAY_PROJECTION_VERSION,
+                    nullable_int("provider_input_total"),
+                    nullable_int("provider_output_total"),
+                    nullable_int("cache_read_input"),
+                    nullable_int("cache_write_input"),
+                    nullable_int("reasoning_output"),
+                    nullable_int("normalized_input"),
+                    nullable_int("normalized_output"),
+                    str(event.get("usage_convention") or "unknown")[:64],
+                    str(event.get("usage_normalization_version") or "")[:64],
+                    str(event.get("usage_coverage") or "unavailable")[:32],
+                    nullable_int("source_input_estimate"),
+                    max(0, int(serialized_input_estimate or 0)),
+                    nullable_int("framed_input_estimate"),
+                    str(event.get("estimate_method") or "lcm-tokenizer-v1")[:64],
+                    str(event.get("finish_reason") or "")[:64],
+                    nullable_int("latency_ms") or 0,
+                    started_at_value,
+                    finished_at_value,
+                ),
+            )
+
     def _record_compaction_attempts(
         self,
         *,
@@ -8233,6 +8487,18 @@ class BackgroundCompactionStore:
                         finished_at,
                     ),
                 )
+                physical_attempt_id = str(
+                    attempt.get("physical_attempt_id") or ""
+                ).strip()[:200]
+                if physical_attempt_id:
+                    conn.execute(
+                        """
+                        UPDATE lcm_compaction_attempt_receipts
+                        SET summary_outcome=?, summary_reason=?
+                        WHERE physical_attempt_id=?
+                        """,
+                        (outcome, failure_reason, physical_attempt_id),
+                    )
 
     def _try_record_compaction_attempts(self, **kwargs: Any) -> None:
         """Persist optional attempt telemetry without owning job correctness."""
@@ -8531,7 +8797,35 @@ class BackgroundCompactionStore:
 
             completed = threading.Event()
             result_box: dict[str, Any] = {}
-            route_trace: dict[str, Any] = {"attempts": []}
+            serialized_chunk = self._serialize_chunk(chunk)
+            serialized_input_estimate = max(0, int(count_tokens(serialized_chunk)))
+
+            def receipt_sink(
+                event: Mapping[str, Any],
+                *,
+                _job: CompactionJob = claimed,
+                _chunk_ordinal: int = chunk.ordinal,
+                _serialized_estimate: int = serialized_input_estimate,
+            ) -> None:
+                payload = dict(event)
+                payload["serialized_input_estimate"] = _serialized_estimate
+                payload["timeout_source"] = str(
+                    getattr(self.config, "config_sources", {}).get(
+                        "summary_timeout_ms",
+                        payload.get("timeout_source") or "request.timeout",
+                    )
+                )
+                self._record_physical_attempt_receipt(
+                    job=_job,
+                    chunk_ordinal=_chunk_ordinal,
+                    event=payload,
+                    serialized_input_estimate=_serialized_estimate,
+                )
+
+            route_trace: dict[str, Any] = {
+                "attempts": [],
+                "receipt_sink": receipt_sink,
+            }
             provider_started = time.monotonic()
             source_tokens = max(1, int(chunk.source_token_count or 0))
             token_budget = min(12_000, max(2_000, int(source_tokens * 0.20)))
@@ -8610,7 +8904,7 @@ class BackgroundCompactionStore:
                 try:
                     provider_remaining = max(0.001, deadline - time.monotonic())
                     summarize_kwargs: dict[str, Any] = {
-                        "text": self._serialize_chunk(chunk),
+                        "text": serialized_chunk,
                         "source_tokens": source_tokens,
                         "token_budget": token_budget,
                         "depth": 1 if aggregation_pass else 0,
