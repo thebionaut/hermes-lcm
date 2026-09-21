@@ -291,6 +291,28 @@ def test_engine_flag_off_equivalence_and_pre_measurement_projection(tmp_path):
     engine.shutdown()
 
 
+def test_preview_allowlist_and_policy_version_load_from_environment(monkeypatch):
+    monkeypatch.setenv(
+        "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_ALLOWLIST",
+        "session-a, session-b, session-a,  ",
+    )
+    monkeypatch.setenv(
+        "LCM_ACTIVE_REPLAY_PREVIEW_POLICY_VERSION",
+        "externalized-tool-preview-v1-canary",
+    )
+
+    config = LCMConfig.from_env()
+
+    assert config.active_replay_preview_session_allowlist == [
+        "session-a",
+        "session-b",
+    ]
+    assert (
+        config.active_replay_preview_policy_version
+        == "externalized-tool-preview-v1-canary"
+    )
+
+
 def test_preview_does_not_cancel_raw_backlog_job_or_change_captured_source(tmp_path):
     content = _payload()
     config = _config(

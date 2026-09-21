@@ -409,6 +409,11 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("focused_working_set_payback_calls", "LCM_FOCUSED_WORKING_SET_PAYBACK_CALLS", int),
     _EnvFieldSpec("focused_working_set_ingest_timeout_seconds", "LCM_FOCUSED_WORKING_SET_INGEST_TIMEOUT_SECONDS", float),
     _EnvFieldSpec("active_replay_preview_enabled", "LCM_ACTIVE_REPLAY_PREVIEW_ENABLED", bool),
+    _EnvFieldSpec(
+        "active_replay_preview_policy_version",
+        "LCM_ACTIVE_REPLAY_PREVIEW_POLICY_VERSION",
+        str,
+    ),
     _EnvFieldSpec("active_replay_preview_min_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_MIN_TOKENS", int),
     _EnvFieldSpec("active_replay_preview_head_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_HEAD_TOKENS", int),
     _EnvFieldSpec("active_replay_preview_tail_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_TAIL_TOKENS", int),
@@ -1161,6 +1166,13 @@ class LCMConfig:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+        raw_preview_allowlist = os.environ.get(
+            "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_ALLOWLIST"
+        )
+        if raw_preview_allowlist is not None:
+            c.active_replay_preview_session_allowlist = _parse_pattern_list(
+                raw_preview_allowlist
+            )
         c._normalize_reconcile_budget()
         c._normalize_background_compaction()
         c._normalize_focused_working_set()
