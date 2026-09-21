@@ -168,6 +168,10 @@ from .working_set import (
     WorkingSetDecision,
     select_phase_working_set,
 )
+from .active_replay_preview import (
+    ActiveReplayPreviewPolicy,
+    project_externalized_tool_results,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -589,6 +593,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "source_sha256": "",
             "cache_state": "unknown",
             "payback_calls": 0,
+        }
+        self._active_replay_preview_policies: dict[
+            str, ActiveReplayPreviewPolicy
+        ] = {}
+        self._last_active_replay_preview: dict[str, Any] = {
+            "reason": "never_run",
+            "policy_version": "externalized-tool-preview-v1",
+            "eligible_results": 0,
+            "projected_results": 0,
+            "source_tokens": 0,
+            "projected_tokens": 0,
+            "tokens_saved": 0,
+            "refs": [],
         }
         self._last_compaction_payback: dict[str, Any] = {
             "allowed": None,
@@ -1159,6 +1176,43 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return "cold"
         return "unknown"
 
+    def _active_replay_preview_policy(self) -> ActiveReplayPreviewPolicy:
+        """Return the immutable policy snapshot for the bound session."""
+        session_id = str(self._session_id or "")
+        existing = self._active_replay_preview_policies.get(session_id)
+        if existing is not None:
+            return existing
+        policy = ActiveReplayPreviewPolicy(
+            enabled=bool(self._config.active_replay_preview_enabled),
+            version=str(
+                self._config.active_replay_preview_policy_version
+                or "externalized-tool-preview-v1"
+            ),
+            min_tokens=int(self._config.active_replay_preview_min_tokens),
+            head_tokens=int(self._config.active_replay_preview_head_tokens),
+            tail_tokens=int(self._config.active_replay_preview_tail_tokens),
+            max_tokens=int(self._config.active_replay_preview_max_tokens),
+            fresh_tail_count=int(self._config.fresh_tail_count),
+        )
+        self._active_replay_preview_policies[session_id] = policy
+        while len(self._active_replay_preview_policies) > 1_024:
+            self._active_replay_preview_policies.pop(
+                next(iter(self._active_replay_preview_policies))
+            )
+        return policy
+
+    def _record_active_replay_preview(self, decision: Any) -> None:
+        self._last_active_replay_preview = {
+            "reason": str(decision.reason),
+            "policy_version": str(decision.policy_version),
+            "eligible_results": int(decision.eligible_results),
+            "projected_results": int(decision.projected_results),
+            "source_tokens": int(decision.source_tokens),
+            "projected_tokens": int(decision.projected_tokens),
+            "tokens_saved": int(decision.tokens_saved),
+            "refs": list(decision.refs),
+        }
+
     def _record_working_set_decision(self, decision: WorkingSetDecision) -> None:
         self._last_working_set_decision = {
             "reason": decision.reason,
@@ -1170,6 +1224,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "cache_state": decision.cache_state,
             "payback_calls": decision.payback_calls,
         }
+
+    def _active_replay_preview_excluded_indices(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> set[int]:
+        """Exclude content altered by existing privacy/ignore policy."""
+        excluded: set[int] = set()
+        for index, message in enumerate(messages):
+            if self._matches_ignore_message_patterns(message):
+                excluded.add(index)
+                continue
+            original = normalize_content_value(message.get("content")) or ""
+            redacted = normalize_content_value(
+                redact_sensitive_value(
+                    message.get("content"),
+                    self._config,
+                    parse_json_strings=False,
+                )
+            ) or ""
+            if redacted != original:
+                excluded.add(index)
+        return excluded
 
     def _ingest_for_working_set(
         self,
@@ -1202,7 +1278,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         budget_tokens: int = 0,
     ) -> Optional[List[Dict[str, Any]]]:
         """Select a bounded phase view while keeping raw history lossless."""
-        if not self._config.focused_working_set_enabled:
+        preview_policy = self._active_replay_preview_policy()
+        working_set_enabled = bool(self._config.focused_working_set_enabled)
+        if not working_set_enabled and not preview_policy.enabled:
             return None
         if self._bypasses_lcm_context_management():
             return None
@@ -1212,17 +1290,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if durable_source and not self._ingest_for_working_set(durable_source):
             return None
 
+        preview_decision = project_externalized_tool_results(
+            request_messages,
+            session_id=str(self._session_id or ""),
+            config=self._config,
+            hermes_home=self._hermes_home,
+            policy=preview_policy,
+            excluded_result_indices=self._active_replay_preview_excluded_indices(
+                request_messages
+            ),
+        )
+        self._record_active_replay_preview(preview_decision)
+        projected_messages = preview_decision.messages or request_messages
+        if not working_set_enabled:
+            return preview_decision.messages
+
         target = int(self._config.focused_working_set_target_tokens)
         if budget_tokens > 0:
             # Never spend more than half of a model window on replay when the
             # configured target is larger, while retaining a useful floor.
             target = min(target, max(8_000, int(budget_tokens * 0.50)))
         required_indices = self._working_set_required_request_indices(
-            request_messages,
+            projected_messages,
             conversation_messages,
         )
         decision = select_phase_working_set(
-            request_messages,
+            projected_messages,
             target_tokens=target,
             trigger_tokens=max(
                 target,
@@ -1242,7 +1335,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._record_working_set_decision(decision)
         if decision.messages is None:
-            return None
+            return preview_decision.messages
         selected = self._sanitize_active_context_messages(decision.messages)
         if not selected or count_messages_tokens(selected) >= decision.source_tokens:
             self._record_working_set_decision(
@@ -1258,7 +1351,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     decision.payback_calls,
                 )
             )
-            return None
+            return preview_decision.messages
         return selected
 
     def on_turn_complete(
@@ -4151,6 +4244,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
+        if hasattr(self, "_active_replay_preview_policies"):
+            self._active_replay_preview_policy()
         # Hold the foreground view stable when the new binding is a side
         # channel (cron tick inside the gateway process, debug probe, etc.).
         # Tools that report "current session" to operators must keep pointing
@@ -5999,6 +6094,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "expected_payback_calls": int(self._config.focused_working_set_payback_calls),
                 "last_decision": dict(self._last_working_set_decision),
             },
+            "active_replay_preview": {
+                "enabled_for_current_session": bool(
+                    self._active_replay_preview_policy().enabled
+                ),
+                "policy_version": self._active_replay_preview_policy().version,
+                "last_decision": dict(self._last_active_replay_preview),
+            },
             "compaction_payback": {
                 "enabled": bool(self._config.compaction_payback_enabled),
                 "expected_phase_calls": int(self._config.compaction_payback_expected_calls),
@@ -7756,13 +7858,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 active_replay_messages[absolute_idx] = stubbed_message
 
         estimates: list[int] = []
-        for estimate_index, protected_message in enumerate(protected_messages):
+        for estimate_index, (protected_message, (absolute_idx, _replay_message)) in enumerate(
+            zip(protected_messages, messages_to_store_with_index)
+        ):
             if estimate_index % 32 == 0:
                 self._foreground_deadline_checkpoint(
                     deadline,
                     "ingest token counting",
                 )
-            estimates.append(count_message_tokens(protected_message))
+            # When previewing is enabled, the stored row may contain a small
+            # lossless externalization marker. Keep backlog/compaction accounting
+            # tied to the original source message so request-only projections
+            # cannot make raw work disappear. Flag-off sessions retain the prior
+            # marker-estimate behavior exactly.
+            # The integer estimate contains no payload and does not weaken the
+            # protected/externalized storage boundary.
+            source_message = protected_message
+            if self._active_replay_preview_policy().enabled:
+                source_message = (
+                    messages[absolute_idx]
+                    if 0 <= absolute_idx < len(messages)
+                    else protected_message
+                )
+            estimates.append(count_message_tokens(source_message))
         self._foreground_deadline_checkpoint(deadline, "ingest commit")
         metadata_json_updates = None
         metadata_json_list_additions = None

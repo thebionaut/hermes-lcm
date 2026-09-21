@@ -255,6 +255,10 @@ def test_new_environment_controls_are_normalized(monkeypatch):
     monkeypatch.setenv("LCM_COMPACTION_PAYBACK_ENABLED", "true")
     monkeypatch.setenv("LCM_COMPACTION_PAYBACK_EXPECTED_CALLS", "0")
     monkeypatch.setenv("LCM_COMPACTION_PAYBACK_SUMMARY_RATIO", "5")
+    monkeypatch.setenv("LCM_ACTIVE_REPLAY_PREVIEW_ENABLED", "true")
+    monkeypatch.setenv("LCM_ACTIVE_REPLAY_PREVIEW_HEAD_TOKENS", "300")
+    monkeypatch.setenv("LCM_ACTIVE_REPLAY_PREVIEW_TAIL_TOKENS", "300")
+    monkeypatch.setenv("LCM_ACTIVE_REPLAY_PREVIEW_MAX_TOKENS", "100")
 
     config = LCMConfig.from_env()
 
@@ -263,3 +267,5 @@ def test_new_environment_controls_are_normalized(monkeypatch):
     assert config.compaction_payback_enabled is True
     assert config.compaction_payback_expected_calls == 1
     assert config.compaction_payback_summary_ratio == 0.90
+    assert config.active_replay_preview_enabled is True
+    assert config.active_replay_preview_max_tokens == 664

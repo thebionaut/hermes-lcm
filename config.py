@@ -408,6 +408,11 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("focused_working_set_min_reclaim_ratio", "LCM_FOCUSED_WORKING_SET_MIN_RECLAIM_RATIO", float),
     _EnvFieldSpec("focused_working_set_payback_calls", "LCM_FOCUSED_WORKING_SET_PAYBACK_CALLS", int),
     _EnvFieldSpec("focused_working_set_ingest_timeout_seconds", "LCM_FOCUSED_WORKING_SET_INGEST_TIMEOUT_SECONDS", float),
+    _EnvFieldSpec("active_replay_preview_enabled", "LCM_ACTIVE_REPLAY_PREVIEW_ENABLED", bool),
+    _EnvFieldSpec("active_replay_preview_min_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_MIN_TOKENS", int),
+    _EnvFieldSpec("active_replay_preview_head_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_HEAD_TOKENS", int),
+    _EnvFieldSpec("active_replay_preview_tail_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_TAIL_TOKENS", int),
+    _EnvFieldSpec("active_replay_preview_max_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_MAX_TOKENS", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
     _EnvFieldSpec("extraction_enabled", "LCM_EXTRACTION_ENABLED", bool),
     _EnvFieldSpec("extraction_model", "LCM_EXTRACTION_MODEL", str),
@@ -641,6 +646,15 @@ class LCMConfig:
     focused_working_set_payback_calls: int = 4
     # Lossless pre-selection/post-turn ingest shares a bounded foreground wait.
     focused_working_set_ingest_timeout_seconds: float = 5.0
+    # Optional lossless provider-visible preview of old, durably externalized
+    # textual tool results. Policy is snapshotted per session; disabled by
+    # default until the frozen fixture gate qualifies it.
+    active_replay_preview_enabled: bool = False
+    active_replay_preview_policy_version: str = "externalized-tool-preview-v1"
+    active_replay_preview_min_tokens: int = 2_000
+    active_replay_preview_head_tokens: int = 256
+    active_replay_preview_tail_tokens: int = 256
+    active_replay_preview_max_tokens: int = 768
 
     # -- Session and message filtering ---
     # Sessions to exclude from LCM storage entirely.
@@ -1001,6 +1015,24 @@ class LCMConfig:
         if not math.isfinite(timeout):
             timeout = 5.0
         self.focused_working_set_ingest_timeout_seconds = min(30.0, max(0.1, timeout))
+        preview_defaults = {
+            "active_replay_preview_min_tokens": 2_000,
+            "active_replay_preview_head_tokens": 256,
+            "active_replay_preview_tail_tokens": 256,
+            "active_replay_preview_max_tokens": 768,
+        }
+        for field_name, default in preview_defaults.items():
+            try:
+                value = int(getattr(self, field_name))
+            except (TypeError, ValueError, OverflowError):
+                value = default
+            setattr(self, field_name, max(1, value))
+        self.active_replay_preview_max_tokens = max(
+            self.active_replay_preview_max_tokens,
+            self.active_replay_preview_head_tokens
+            + self.active_replay_preview_tail_tokens
+            + 64,
+        )
 
         try:
             expected_calls = int(self.compaction_payback_expected_calls)
