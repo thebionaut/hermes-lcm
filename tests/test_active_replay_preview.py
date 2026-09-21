@@ -237,6 +237,7 @@ def test_existing_redaction_and_ignore_policy_excludes_preview(tmp_path):
             incoming_message=ignored_messages[-1],
             budget_tokens=200_000,
         ) is None
+        assert engine._last_active_replay_preview["reason"] == "disabled"
     finally:
         engine.shutdown()
 

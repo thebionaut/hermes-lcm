@@ -1286,6 +1286,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return None
         if self._bypasses_lcm_context_management():
             return None
+        if (
+            preview_policy.enabled
+            and self._config.ignore_message_patterns
+            and not self._compiled_ignore_message_patterns
+        ):
+            # A configured ignore policy that could not be compiled must not
+            # become a privacy bypass merely because the optional bounded
+            # regex engine is unavailable. Disable only this request-local
+            # preview; established working-set behavior remains unchanged.
+            preview_policy = ActiveReplayPreviewPolicy(
+                enabled=False,
+                version=preview_policy.version,
+                min_tokens=preview_policy.min_tokens,
+                head_tokens=preview_policy.head_tokens,
+                tail_tokens=preview_policy.tail_tokens,
+                max_tokens=preview_policy.max_tokens,
+                fresh_tail_count=preview_policy.fresh_tail_count,
+            )
         durable_source = list(conversation_messages or [])
         if isinstance(incoming_message, dict) and incoming_message not in durable_source:
             durable_source.append(incoming_message)
