@@ -392,3 +392,18 @@ def test_preview_policy_is_snapshotted_per_session(tmp_path):
     engine.on_session_start("session-a", conversation_id="a", context_length=200_000)
     assert engine._active_replay_preview_policy().enabled is True
     engine.shutdown()
+
+
+def test_preview_can_be_enabled_for_one_exact_canary_session(tmp_path):
+    config = _config(
+        tmp_path,
+        active_replay_preview_session_allowlist=["session-a"],
+    )
+    engine = LCMEngine(config, hermes_home=str(tmp_path / "home"))
+    try:
+        engine.on_session_start("session-a", conversation_id="a", context_length=200_000)
+        assert engine._active_replay_preview_policy().enabled is True
+        engine.on_session_start("session-b", conversation_id="b", context_length=200_000)
+        assert engine._active_replay_preview_policy().enabled is False
+    finally:
+        engine.shutdown()

@@ -650,6 +650,9 @@ class LCMConfig:
     # textual tool results. Policy is snapshotted per session; disabled by
     # default until the frozen fixture gate qualifies it.
     active_replay_preview_enabled: bool = False
+    # Empty means all newly bound sessions once the master flag is enabled;
+    # otherwise only exact session IDs in this list can enter a canary.
+    active_replay_preview_session_allowlist: list[str] = field(default_factory=list)
     active_replay_preview_policy_version: str = "externalized-tool-preview-v1"
     active_replay_preview_min_tokens: int = 2_000
     active_replay_preview_head_tokens: int = 256
@@ -1032,6 +1035,16 @@ class LCMConfig:
             self.active_replay_preview_head_tokens
             + self.active_replay_preview_tail_tokens
             + 64,
+        )
+        preview_allowlist = self.active_replay_preview_session_allowlist
+        if isinstance(preview_allowlist, str):
+            preview_allowlist = _parse_pattern_list(preview_allowlist)
+        self.active_replay_preview_session_allowlist = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (preview_allowlist or [])
+                if str(value).strip()
+            )
         )
 
         try:

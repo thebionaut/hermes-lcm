@@ -1182,8 +1182,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         existing = self._active_replay_preview_policies.get(session_id)
         if existing is not None:
             return existing
+        allowlist = set(self._config.active_replay_preview_session_allowlist)
         policy = ActiveReplayPreviewPolicy(
-            enabled=bool(self._config.active_replay_preview_enabled),
+            enabled=bool(self._config.active_replay_preview_enabled)
+            and (not allowlist or session_id in allowlist),
             version=str(
                 self._config.active_replay_preview_policy_version
                 or "externalized-tool-preview-v1"
