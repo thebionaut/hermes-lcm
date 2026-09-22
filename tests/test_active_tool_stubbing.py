@@ -10,7 +10,11 @@ import pytest
 import hermes_lcm.engine as lcm_engine
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
-from hermes_lcm.externalize import extract_externalized_ref, load_externalized_payload
+from hermes_lcm.externalize import (
+    extract_externalized_ref,
+    load_externalized_payload,
+    resolve_large_output_storage_dir,
+)
 from hermes_lcm.message_content import normalize_content_value
 
 
@@ -18,7 +22,7 @@ from hermes_lcm.message_content import normalize_content_value
 def make_engine(tmp_path):
     engines = []
 
-    def build(**overrides):
+    def build(*, _provision_externalization_storage=False, **overrides):
         settings = dict(
             database_path=str(tmp_path / f"active-stub-{len(engines)}.db"),
             fresh_tail_count=2,
@@ -29,6 +33,11 @@ def make_engine(tmp_path):
         )
         settings.update(overrides)
         config = LCMConfig(**settings)
+        if _provision_externalization_storage:
+            resolve_large_output_storage_dir(
+                config,
+                hermes_home=str(tmp_path / "hermes"),
+            )
         engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
         engine_index = len(engines)
         engine.on_session_start(
@@ -321,7 +330,11 @@ def test_orphan_tool_result_is_not_externalized_as_a_phantom_reference(make_engi
 
 
 def test_live_interceptor_adopts_current_tool_stub_below_compaction_threshold(make_engine):
-    engine = make_engine(fresh_tail_count=32, leaf_chunk_tokens=20_000)
+    engine = make_engine(
+        _provision_externalization_storage=True,
+        fresh_tail_count=32,
+        leaf_chunk_tokens=20_000,
+    )
     engine.threshold_tokens = 100_000
     payload = "live current payload " * 100
     messages = [
@@ -340,7 +353,11 @@ def test_live_interceptor_adopts_current_tool_stub_below_compaction_threshold(ma
 
 
 def test_live_stub_adoption_outranks_compression_boundary_cooldown(make_engine):
-    engine = make_engine(fresh_tail_count=32, leaf_chunk_tokens=20_000)
+    engine = make_engine(
+        _provision_externalization_storage=True,
+        fresh_tail_count=32,
+        leaf_chunk_tokens=20_000,
+    )
     engine.threshold_tokens = 100_000
     engine._last_boundary_skip_time = time.time()
     payload = "durable live payload during cooldown " * 100
@@ -433,7 +450,11 @@ def test_flag_off_noncleanup_replay_diff_remains_blocked_during_cooldown(
 
 
 def test_live_stub_cooldown_adoption_skips_eligible_leaf_work(make_engine, monkeypatch):
-    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine = make_engine(
+        _provision_externalization_storage=True,
+        fresh_tail_count=2,
+        leaf_chunk_tokens=1,
+    )
     engine.threshold_tokens = 100_000
     engine._last_boundary_skip_time = time.time()
     payload = "fresh durable payload with old eligible backlog " * 100
@@ -461,7 +482,11 @@ def test_live_stub_cooldown_adoption_skips_eligible_leaf_work(make_engine, monke
 
 
 def test_live_interceptor_converges_when_no_leaf_is_eligible(make_engine):
-    engine = make_engine(fresh_tail_count=32, leaf_chunk_tokens=20_000)
+    engine = make_engine(
+        _provision_externalization_storage=True,
+        fresh_tail_count=32,
+        leaf_chunk_tokens=20_000,
+    )
     engine.threshold_tokens = 1
     payload = "no eligible leaf payload " * 100
     messages = [
@@ -480,6 +505,7 @@ def test_live_interceptor_converges_when_no_leaf_is_eligible(make_engine):
 
 def test_live_interceptor_survives_fresh_tail_overflow_recovery(make_engine):
     engine = make_engine(
+        _provision_externalization_storage=True,
         fresh_tail_count=32,
         max_assembly_tokens=200,
         leaf_chunk_tokens=20_000,
@@ -501,7 +527,11 @@ def test_live_interceptor_survives_fresh_tail_overflow_recovery(make_engine):
 
 
 def test_live_interceptor_is_preserved_after_normal_leaf_compaction(make_engine, monkeypatch):
-    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine = make_engine(
+        _provision_externalization_storage=True,
+        fresh_tail_count=2,
+        leaf_chunk_tokens=1,
+    )
     engine.threshold_tokens = 1
     payload = "current result after compaction " * 100
     messages = [

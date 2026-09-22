@@ -605,6 +605,69 @@ class TestConfig:
         assert c.expansion_context_tokens == 32_000
         assert c.summary_timeout_ms == 60_000
         assert c.expansion_timeout_ms == 120_000
+        assert c.background_compaction_enabled is False
+        assert c.background_compaction_workers == 1
+        assert c.background_compaction_global_limit == 2
+        assert c.background_compaction_max_passes == 4
+        assert c.background_compaction_job_timeout_seconds == 120
+        assert c.background_compaction_lease_seconds == 300
+        assert c.background_compaction_backlog_tokens == 32_000
+        assert c.background_compaction_min_provider_source_tokens == 256
+        assert c.background_compaction_prepare_ratio == 0.55
+
+    def test_background_compaction_from_exact_env_names(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
+        expected = {
+            "background_compaction_enabled": ("LCM_BACKGROUND_COMPACTION_ENABLED", "true", True),
+            "background_compaction_workers": ("LCM_BACKGROUND_COMPACTION_WORKERS", "1", 1),
+            "background_compaction_global_limit": (
+                "LCM_BACKGROUND_COMPACTION_GLOBAL_LIMIT",
+                "2",
+                2,
+            ),
+            "background_compaction_max_passes": (
+                "LCM_BACKGROUND_COMPACTION_MAX_PASSES",
+                "4",
+                4,
+            ),
+            "background_compaction_job_timeout_seconds": (
+                "LCM_BACKGROUND_COMPACTION_JOB_TIMEOUT_SECONDS",
+                "120",
+                120,
+            ),
+            "background_compaction_lease_seconds": (
+                "LCM_BACKGROUND_COMPACTION_LEASE_SECONDS",
+                "300",
+                300,
+            ),
+            "background_compaction_backlog_tokens": (
+                "LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS",
+                "32000",
+                32_000,
+            ),
+            "background_compaction_min_provider_source_tokens": (
+                "LCM_BACKGROUND_COMPACTION_MIN_PROVIDER_SOURCE_TOKENS",
+                "256",
+                256,
+            ),
+            "background_compaction_prepare_ratio": (
+                "LCM_BACKGROUND_COMPACTION_PREPARE_RATIO",
+                "0.55",
+                0.55,
+            ),
+        }
+        for _field, (env_name, raw_value, _parsed_value) in expected.items():
+            monkeypatch.setenv(env_name, raw_value)
+
+        config = LCMConfig.from_env()
+
+        for field, (env_name, _raw_value, parsed_value) in expected.items():
+            assert getattr(config, field) == parsed_value
+            assert config.config_sources[field] == f"env:{env_name}"
+
+    def test_background_compaction_has_at_most_one_worker_per_process(self):
+        assert LCMConfig(background_compaction_workers=99).background_compaction_workers == 1
+        assert LCMConfig(background_compaction_workers=0).background_compaction_workers == 0
 
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
@@ -756,6 +819,32 @@ class TestConfig:
         c = LCMConfig.from_env()
 
         assert c.summary_timeout_ms == 45_000
+        assert c.config_sources["summary_timeout_ms"] == "env:LCM_SUMMARY_TIMEOUT_MS"
+        assert c.config_source_warnings == [
+            "LCM summary timeout override differs from YAML authority: "
+            "effective=45000ms source=env:LCM_SUMMARY_TIMEOUT_MS; "
+            "yaml=120000ms source=config_yaml:auxiliary.compression.timeout"
+        ]
+
+    @pytest.mark.parametrize("raw", ["0", "-1", "invalid"])
+    def test_from_env_rejects_invalid_or_nonpositive_summary_timeout_override(
+        self, monkeypatch, tmp_path, raw
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    timeout: 45\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", raw)
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 45_000
+        assert c.config_sources["summary_timeout_ms"] == (
+            "config_yaml:auxiliary.compression.timeout"
+        )
+        assert len(c.config_source_warnings) == 1
 
     def test_from_env_reads_auxiliary_timeout_without_pyyaml(self, monkeypatch, tmp_path):
         import hermes_lcm.config as config_mod
@@ -6511,6 +6600,7 @@ class TestIngestExternalization:
         from hermes_lcm.engine import LCMEngine
 
         engine, output_dir = self._engine(tmp_path)
+        output_dir.mkdir()
         content = "ACTIVE_RAW_NEEDLE:" + ("r" * 5000)
         messages = [{"role": "user", "content": content}]
 
@@ -6552,7 +6642,8 @@ class TestIngestExternalization:
         assert rows[-1]["content"] == "followup"
 
     def test_preflight_requests_cleanup_for_oversized_raw_payload_stub(self, tmp_path):
-        engine, _output_dir = self._engine(tmp_path)
+        engine, output_dir = self._engine(tmp_path)
+        output_dir.mkdir()
         content = "PREFLIGHT_RAW_NEEDLE:" + ("r" * 5000)
         messages = [{"role": "user", "content": content}]
 
@@ -7013,6 +7104,7 @@ class TestExtraction:
                     "content": "Please save this image for later\n\ndata:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA",
                 },
             ])
+            assert engine._extraction_persistence_idle.wait(timeout=2)
         finally:
             ext_module._call_extraction_llm = original
 
@@ -7112,6 +7204,7 @@ class TestExtraction:
                 {"role": "user", "content": "Let's use Redis"},
                 {"role": "assistant", "content": "Done"},
             ])
+            assert engine._extraction_persistence_idle.wait(timeout=2)
             extraction_dir = tmp_path / "hermes" / "lcm-extractions"
             files = list(extraction_dir.glob("*.md"))
             assert len(files) == 1

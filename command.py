@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 import dataclasses
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -85,6 +86,23 @@ from .vector_store import EmbeddingIdentity, EmbeddingPublishOutcome, VectorStor
 _EMBEDDING_BACKFILL_CLAIM_KEY = "lcm_embedding_backfill_claim"
 _EMBEDDING_BACKFILL_CLAIM_TTL_S = 10 * 60
 _EMBEDDING_BACKFILL_BATCH_SIZE = 32
+
+
+@contextmanager
+def _serialized_connection(owner):
+    """Use a store/DAG lock while retaining lightweight test-double support."""
+    connection = getattr(owner, "connection", None)
+    if connection is None:
+        yield None
+        return
+    access = getattr(owner, "connection_access", None)
+    if callable(access):
+        with access() as locked_connection:
+            yield locked_connection
+        return
+    # Non-production test doubles and explicitly read-only diagnostic handles
+    # predate the lock-bearing store API and do not share a live engine.
+    yield connection
 
 
 def _env_float(key: str, default: float) -> float:
@@ -424,6 +442,160 @@ def _fmt_bool(value: Any) -> str:
     return "yes" if bool(value) else "no"
 
 
+def _compact_background_value(value: Any, limit: int = 320) -> str:
+    if value in (None, "", [], {}):
+        return "(none)"
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        rendered = str(value)
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[: max(0, limit - 3)] + "..."
+
+
+def _background_compaction_status_lines(engine) -> list[str]:
+    """Render the identifier-safe status view shared with JSON diagnostics."""
+    try:
+        from .tools import _background_compaction_status_payload
+
+        status = _background_compaction_status_payload(engine)
+    except Exception as exc:  # pragma: no cover - defensive status rendering
+        # Exception messages may contain provider or connection details.  The
+        # shared JSON helper redacts ordinary failures; keep this last-resort
+        # import/render path opaque as well.
+        return [f"background_compaction_status_error: {type(exc).__name__}"]
+
+    current_job = status.get("current_job")
+    worker_available = status.get("worker_available")
+    worker_available_text = (
+        "(unknown)" if worker_available is None else _fmt_bool(worker_available)
+    )
+    blocker = status.get("compatibility_blocked_reason") or "(none)"
+    lines = [
+        (
+            "background_compaction_enabled: "
+            f"configured={_fmt_bool(status.get('configured_enabled'))} "
+            f"effective={_fmt_bool(status.get('enabled'))} "
+            f"blocker={blocker}"
+        ),
+        (
+            "background_compaction_limits: "
+            f"workers={status.get('worker_count', 0)} "
+            f"global={status.get('global_limit', 0)} "
+            f"available={worker_available_text}"
+        ),
+        (
+            "background_compaction_jobs: "
+            f"queued={status.get('queued_jobs', 0)} "
+            f"running={status.get('running_jobs', 0)} "
+            f"prepared={status.get('prepared_jobs', 0)} "
+            f"retry={status.get('retry_jobs', 0)} "
+            f"published={status.get('published_jobs', 0)} "
+            f"superseded={status.get('superseded_jobs', 0)} "
+            f"failed={status.get('failed_jobs', 0)}"
+        ),
+        (
+            "background_compaction_publications: "
+            f"summaries={status.get('published_summary_jobs', 0)} "
+            f"references={status.get('published_reference_jobs', 0)} "
+            f"total={status.get('published_jobs', 0)}"
+        ),
+        (
+            "background_compaction_provider_permits: "
+            f"active={status.get('active_provider_permits', 0)} "
+            f"non_timed_out={status.get('active_non_timed_out_provider_permits', 0)} "
+            f"timed_out={status.get('timed_out_provider_permits', 0)} "
+            "oldest_age_seconds="
+            f"{status.get('provider_permit_oldest_age_seconds') if status.get('provider_permit_oldest_age_seconds') is not None else '(none)'} "
+            "min_lease_remaining_seconds="
+            f"{status.get('provider_permit_min_lease_remaining_seconds') if status.get('provider_permit_min_lease_remaining_seconds') is not None else '(none)'}"
+        ),
+        (
+            "background_compaction_oldest_queued_age_seconds: "
+            f"{status.get('oldest_queued_job_age_seconds') if status.get('oldest_queued_job_age_seconds') is not None else '(none)'}"
+        ),
+        (
+            "background_compaction_policy: "
+            f"backlog={status.get('backlog_trigger_tokens', 0)} "
+            f"min_provider_source={status.get('minimum_provider_source_tokens', 0)} "
+            f"prepare_ratio={status.get('prepare_ratio', 0)}"
+        ),
+        (
+            "background_compaction_triggers: "
+            f"publication={status.get('publication_trigger_tokens', 0)} "
+            f"emergency={status.get('emergency_trigger_tokens', 0)}"
+        ),
+        (
+            "background_compaction_frontier: "
+            f"durable={status.get('durable_frontier_store_id', 0)} "
+            f"debt={status.get('current_debt_tokens', 0)} "
+            f"coverage={status.get('active_coverage', 'raw')}"
+        ),
+    ]
+    publication_fence = status.get("publication_fence")
+    if isinstance(publication_fence, dict):
+        lines.append(
+            "background_compaction_publication_fence: "
+            f"generation={publication_fence.get('generation', 0)} "
+            f"publishable={_fmt_bool(publication_fence.get('publishable'))} "
+            "updated_at="
+            f"{publication_fence.get('updated_at') if publication_fence.get('updated_at') is not None else '(none)'}"
+        )
+    if isinstance(current_job, dict):
+        lines.append(
+            "background_compaction_current_job: "
+            f"hint={current_job.get('job_hint') or '(none)'} "
+            f"state={current_job.get('state') or '(unknown)'} "
+            f"frontier={current_job.get('expected_frontier_store_id', 0)} "
+            f"watermark={current_job.get('captured_watermark_store_id', 0)} "
+            f"debt={current_job.get('debt_tokens', 0)} "
+            f"attempt={current_job.get('attempt_count', 0)}"
+        )
+        lines.append(
+            "background_compaction_lease: "
+            f"owner_hint={current_job.get('lease_owner_hint') or '(none)'} "
+            f"remaining_seconds={current_job.get('lease_remaining_seconds') if current_job.get('lease_remaining_seconds') is not None else '(none)'}"
+        )
+        lines.append(
+            "background_compaction_retry: "
+            f"next_at={current_job.get('next_retry_at') if current_job.get('next_retry_at') is not None else '(none)'} "
+            f"error={_compact_background_value(current_job.get('last_error'), 240)}"
+        )
+    else:
+        lines.append("background_compaction_current_job: (none)")
+    lines.extend([
+        "background_compaction_last_preparation: "
+        + _compact_background_value(status.get("last_preparation_result")),
+        "background_compaction_last_publication: "
+        + _compact_background_value(status.get("last_publication_result")),
+        "background_compaction_publication_telemetry: "
+        + _compact_background_value(status.get("last_publication_telemetry"), 768),
+        "background_compaction_last_provider_attempt: "
+        + _compact_background_value(status.get("last_provider_attempt"), 768),
+        "background_compaction_recent_provider_outcomes_24h: "
+        + _compact_background_value(status.get("recent_provider_outcomes"), 768),
+        "background_compaction_provider_attribution: "
+        + _compact_background_value(status.get("provider_attribution"), 512),
+        "background_compaction_range_dispositions: "
+        + _compact_background_value(status.get("range_dispositions"), 512),
+        "background_compaction_durable_event_counts: "
+        # The stable reason set is finite and identifier-safe.  Preserve every
+        # exact counter instead of applying the shorter free-form-result cap.
+        + _compact_background_value(status.get("durable_event_counts"), 2_048),
+        "background_compaction_durable_event_reasons: "
+        + (", ".join(status.get("durable_event_reasons") or []) or "(none)"),
+        "background_compaction_diagnostic_reasons: "
+        + (", ".join(status.get("diagnostic_reasons") or []) or "(none)"),
+    ])
+    if status.get("status_error"):
+        lines.append(
+            "background_compaction_status_error: "
+            + _compact_background_value(status.get("status_error"), 240)
+        )
+    return lines
+
+
 def _fmt_size(num_bytes: int) -> str:
     if num_bytes < 1024:
         return f"{num_bytes} B"
@@ -526,6 +698,8 @@ def _status_text(engine) -> str:
         f"compression_count: {engine.compression_count}",
         f"last_compression_status: {status.get('last_compression_status', 'idle')}",
         f"last_compression_noop_reason: {status.get('last_compression_noop_reason', '') or '(none)'}",
+        "last_foreground_deadline: "
+        + _compact_background_value(status.get("last_foreground_deadline"), 512),
         f"context_length: {engine.context_length if session_bound else '(uninitialized)'}",
         f"raw_context_length: {status.get('raw_context_length', 0) if session_bound else '(uninitialized)'}",
         f"effective_context_length_cap: {status.get('effective_context_length_cap') or '(none)'}",
@@ -533,6 +707,8 @@ def _status_text(engine) -> str:
         f"context_length_source: {context_length_source}",
         f"configured_context_threshold: {status.get('configured_context_threshold', engine._config.context_threshold)}",
         f"context_threshold: {status.get('context_threshold', engine._config.context_threshold)}",
+        f"threshold_policy: {status.get('threshold_policy', 'ratio')}",
+        f"context_reserve_tokens: {status.get('context_reserve_tokens', engine._config.context_reserve_tokens)}",
         f"context_threshold_source: {status.get('context_threshold_source', config_sources.get('context_threshold', 'manual_or_default'))}",
         f"context_threshold_autoraised: {status.get('context_threshold_autoraised') or '(none)'}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
@@ -562,6 +738,7 @@ def _status_text(engine) -> str:
         f"source_legacy_blank_messages: {source_stats['legacy_blank_source_messages']}",
         f"source_effective_unknown_messages: {source_stats['effective_unknown_messages']}",
     ]
+    lines.extend(_background_compaction_status_lines(engine))
 
     last_rotate_at = status.get("last_rotate_at")
     if last_rotate_at:
@@ -905,12 +1082,16 @@ def _rotate_apply_text(engine) -> str:
 
 
 def _scan_fts_repair(engine) -> dict[str, Any]:
+    with _serialized_connection(engine._store) as conn:
+        return _scan_fts_repair_with_connection(conn)
+
+
+def _scan_fts_repair_with_connection(conn) -> dict[str, Any]:
     checks: dict[str, dict[str, Any]] = {}
     specs = {
         "messages_fts": build_message_fts_spec(),
         "nodes_fts": build_nodes_fts_spec(),
     }
-    conn = engine._store.connection
     for label, spec in specs.items():
         try:
             structural_needs_repair = external_content_fts_needs_repair(conn, spec)
@@ -987,20 +1168,23 @@ def _doctor_repair_apply_text(engine) -> str:
     # via a race (F3).
     join_background_integrity_scans()
 
-    conn = engine._store.connection
-    try:
-        messages_result = repair_external_content_fts(conn, build_message_fts_spec())
-        nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
-    except sqlite3.Error as exc:
-        return "\n".join([
-            "LCM doctor repair apply",
-            "status: error",
-            f"database_path: {backup['db_path']}",
-            f"backup_path: {backup['backup_path']}",
-            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
-            f"error: FTS repair failed: {exc}",
-            "note: backup was created before repair apply",
-        ])
+    with _serialized_connection(engine._store) as conn:
+        try:
+            messages_result = repair_external_content_fts(
+                conn,
+                build_message_fts_spec(),
+            )
+            nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
+        except sqlite3.Error as exc:
+            return "\n".join([
+                "LCM doctor repair apply",
+                "status: error",
+                f"database_path: {backup['db_path']}",
+                f"backup_path: {backup['backup_path']}",
+                f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+                f"error: FTS repair failed: {exc}",
+                "note: backup was created before repair apply",
+            ])
 
     return "\n".join([
         "LCM doctor repair apply",
@@ -1272,10 +1456,16 @@ def _doctor_source_apply_text(engine) -> str:
 
 
 def _doctor_text(engine) -> str:
+    with (
+        _serialized_connection(engine._store) as store_conn,
+        _serialized_connection(engine._dag) as dag_conn,
+    ):
+        return _doctor_text_with_connections(engine, store_conn, dag_conn)
+
+
+def _doctor_text_with_connections(engine, store_conn, dag_conn) -> str:
     db_path = Path(engine._store.db_path)
     runtime_identity = engine.get_runtime_identity()
-    store_conn = engine._store.connection
-    dag_conn = engine._dag.connection
 
     issues: list[str] = []
     recommended_actions: list[str] = []
@@ -1846,7 +2036,15 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
     apply is destructive, so do the coordinated deletes on one connection to
     avoid half-cleaned state if a later table delete fails.
     """
-    conn = engine._store.connection
+    with _serialized_connection(engine._store) as conn:
+        return _delete_clean_candidates_with_connection(engine, session_ids, conn)
+
+
+def _delete_clean_candidates_with_connection(
+    engine,
+    session_ids: set[str],
+    conn,
+) -> dict[str, int]:
     # Protect the actively-bound session id, not current_session_id. While a
     # cron tick has rebound the engine, _session_id is the row the engine is
     # actively writing to via lifecycle hooks; deleting it during cleanup

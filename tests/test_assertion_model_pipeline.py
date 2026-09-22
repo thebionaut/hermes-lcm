@@ -8,6 +8,7 @@ import json
 import pytest
 
 import hermes_lcm.assertion_extraction as extraction_module
+import hermes_lcm.assertion_store as assertion_store_module
 import hermes_lcm.engine as engine_module
 from hermes_lcm.assertion_extraction import ModelAssertionExtractor
 from hermes_lcm.assertion_store import AssertionStore, SourceSnapshot
@@ -213,8 +214,26 @@ def test_scheduled_batch_is_bounded_resumable_and_does_not_rewrite_raw_rows(
     fts_before = engine._store._conn.execute(
         "SELECT rowid, content FROM messages_fts ORDER BY rowid"
     ).fetchall()
+
+    configure_calls: list[object] = []
+
+    def forbidden_worker_configure(conn):
+        configure_calls.append(conn)
+        raise AssertionError("deadline-owned worker must use the schema-ready open path")
+
+    # Engine construction above owns first-boot schema initialization. From
+    # this point onward the daemon worker may validate, but never configure or
+    # migrate, the shared database under the foreground origin deadline.
+    monkeypatch.setattr(
+        assertion_store_module,
+        "configure_connection",
+        forbidden_worker_configure,
+    )
     try:
-        assert engine._schedule_pre_compaction_assertions(messages) is True
+        assert engine._schedule_pre_compaction_assertions(
+            messages,
+            deadline=engine._foreground_now() + 5.0,
+        ) is True
         assert engine._assertion_extraction_idle.wait(3)
 
         rows = engine._assertions.query_assertions()
@@ -233,6 +252,7 @@ def test_scheduled_batch_is_bounded_resumable_and_does_not_rewrite_raw_rows(
         assert status["input_tokens"] == 11
         assert status["output_tokens"] == 7
         assert status["last_model"] == "provider/model"
+        assert configure_calls == []
         assert engine._store._conn.execute(
             "SELECT store_id, session_id, role, content, timestamp FROM messages ORDER BY store_id"
         ).fetchall() == raw_before

@@ -19,11 +19,16 @@ avoid an import cycle (staticmethod resolution is identical).
 from __future__ import annotations
 
 import json
+import hashlib
 import re
+import threading
+import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .externalize import (
+    ExternalizedPayloadLookupBudgetExceeded,
     extract_externalized_ref,
     externalized_tool_result_has_persisted_output_marker,
     find_externalized_tool_result_content_for_call,
@@ -41,9 +46,12 @@ from .ingest_protection import (
     _persisted_output_saved_path,
     recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_value,
+    protect_messages_for_ingest,
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
+from .sqlite_util import _is_sqlite_locked_error, _temporary_sqlite_busy_timeout
+from .tokens import count_message_tokens
 
 import logging
 
@@ -52,7 +60,60 @@ logger = logging.getLogger(__name__)
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
 
 
+class ReconcileBudgetExceeded(Exception):
+    """Ingest-cursor reconciliation outlived its budget; abort the batch."""
+
+
+class ForegroundDeadlineExceeded(ReconcileBudgetExceeded):
+    """The shared automatic foreground deadline expired at a safe boundary."""
+
+    def __init__(self, stage: str, detail: str = "") -> None:
+        self.stage = str(stage or "foreground work")
+        self.detail = str(detail or "")
+        message = f"foreground deadline exhausted during {self.stage}"
+        if self.detail:
+            message = f"{message}: {self.detail}"
+        super().__init__(message)
+
+
 class ReconcileMixin:
+    # Real engines install an instance lock. This class lock is a safe fallback
+    # for lightweight mixin harnesses and external consumers.
+    _reconcile_lock = threading.Lock()
+
+    def _foreground_now(self) -> float:
+        """Monotonic clock seam shared by foreground work and deterministic tests."""
+        clock = getattr(self, "_foreground_monotonic", None)
+        return float(clock() if callable(clock) else time.monotonic())
+
+    def _foreground_deadline_remaining(self, deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        return max(0.0, float(deadline) - self._foreground_now())
+
+    def _foreground_deadline_checkpoint(
+        self,
+        deadline: float | None,
+        stage: str,
+        detail: str = "",
+    ) -> None:
+        if deadline is not None and self._foreground_now() >= float(deadline):
+            raise ForegroundDeadlineExceeded(stage, detail)
+
+    def _reconcile_deadline_checkpoint(self, detail: str = "") -> None:
+        deadline = getattr(self, "_reconcile_deadline", None)
+        if deadline is None or self._foreground_now() < float(deadline):
+            return
+        foreground_deadline = getattr(self, "_reconcile_foreground_deadline", None)
+        if (
+            foreground_deadline is not None
+            and float(foreground_deadline) <= float(deadline)
+            and self._foreground_now() >= float(foreground_deadline)
+        ):
+            raise ForegroundDeadlineExceeded("reconciliation", detail)
+        suffix = f": {detail}" if detail else ""
+        raise ReconcileBudgetExceeded(f"reconcile exceeded its budget{suffix}")
+
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
@@ -115,6 +176,7 @@ class ReconcileMixin:
             allow_redacted_preview_match=allow_redacted_preview_match,
             config=self._config,
             hermes_home=self._hermes_home,
+            deadline=getattr(self, "_reconcile_deadline", None),
         )
         if durable_content is None:
             return False
@@ -124,7 +186,27 @@ class ReconcileMixin:
                 return False
         return True
 
+    _IDENTITY_MEMO_MISS = object()
+
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+        self._reconcile_deadline_checkpoint("building replay identity")
+        # Per-ingest-call memo: reconciliation recomputes identities for every
+        # candidate prefix (O(N^2) call sites); within one ingest call the
+        # message dicts are held alive by the caller, so id(msg) keys are
+        # stable and the memo collapses the quadratic recompute to O(N).
+        memo = getattr(self, "_identity_memo", None)
+        if memo is None:
+            return self._compute_message_replay_identity(msg, stored_row=stored_row)
+        key = (id(msg), bool(stored_row))
+        hit = memo.get(key, ReconcileMixin._IDENTITY_MEMO_MISS)
+        if hit is not ReconcileMixin._IDENTITY_MEMO_MISS:
+            return hit
+        value = self._compute_message_replay_identity(msg, stored_row=stored_row)
+        self._reconcile_deadline_checkpoint("building replay identity")
+        memo[key] = value
+        return value
+
+    def _compute_message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if (
@@ -182,6 +264,7 @@ class ReconcileMixin:
                     allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
+                    deadline=getattr(self, "_reconcile_deadline", None),
                 )
             if durable_content is not None and (
                 recovered_content is None or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
@@ -197,6 +280,7 @@ class ReconcileMixin:
                     allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
+                    deadline=getattr(self, "_reconcile_deadline", None),
                 )
                 if (
                     stale_durable_content is not None
@@ -227,11 +311,13 @@ class ReconcileMixin:
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
         ref = extract_externalized_ref(content)
         if ref and "quarantined_assistant_output" not in content:
+            self._reconcile_deadline_checkpoint("loading externalized replay payload")
             payload = load_externalized_payload(
                 ref,
                 config=self._config,
                 hermes_home=self._hermes_home,
             )
+            self._reconcile_deadline_checkpoint("loading externalized replay payload")
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
@@ -412,7 +498,9 @@ class ReconcileMixin:
         assistant rows may be removed or have internal content stripped.
         """
         sanitized_tail: list[tuple[str, str, str, str]] = []
-        for identity in stored_tail:
+        for index, identity in enumerate(stored_tail):
+            if index % 32 == 0:
+                self._reconcile_deadline_checkpoint("sanitizing durable replay tail")
             cleaned_identity = self._active_cleanup_replay_identity(identity)
             if cleaned_identity is not None:
                 sanitized_tail.append(cleaned_identity)
@@ -445,55 +533,64 @@ class ReconcileMixin:
                     "tool_calls": decoded_tool_calls,
                 })
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
+        # The cursor search visits overlapping prefixes. Build expensive replay
+        # identities and filters once, then slice by precomputed prefix counts.
+        visible_messages = []
+        identity_messages = []
+        visible_identities = []
+        identities = []
+        visible_counts = [0]
+        identity_counts = [0]
+        scaffold_evidence = [False]
+        quarantine_evidence = [False]
+        for index, msg in enumerate(messages):
+            if index % 32 == 0:
+                self._reconcile_deadline_checkpoint("indexing active replay prefixes")
+            identity = self._message_replay_identity(msg)
+            scaffold = self._is_replayed_context_scaffold_message(msg)
+            quarantined = self._is_quarantined_assistant_replay_identity(identity)
+            if not scaffold and not self._matches_ignore_message_patterns(msg):
+                visible_messages.append(msg)
+                visible_identities.append(identity)
+                content = text_content_for_pattern_matching(msg.get("content")) or ""
+                placeholder = (
+                    self._is_volatile_ignored_quarantine_placeholder(msg, content)
+                    or self._is_ignored_active_replay_placeholder(msg, content)
+                    or (self._compiled_ignore_message_patterns and quarantined
+                        and self._matches_ignore_message_patterns(msg, stored_row=True))
+                )
+                if not placeholder:
+                    identity_messages.append(msg)
+                    identities.append(identity)
+            visible_counts.append(len(visible_messages))
+            identity_counts.append(len(identity_messages))
+            scaffold_evidence.append(scaffold_evidence[-1] or scaffold)
+            quarantine_evidence.append(quarantine_evidence[-1] or quarantined)
+        generationless_sanitized_tail = None
+        generationless_identities = None
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
+            self._reconcile_deadline_checkpoint(
+                f"cursor {cursor} of {len(messages)}"
+            )
             candidate_messages = messages[:cursor]
-            candidate_visible_messages = [
-                msg
-                for msg in candidate_messages
-                if not self._is_replayed_context_scaffold_message(msg)
-                and not self._matches_ignore_message_patterns(msg)
-            ]
-            candidate_non_placeholder_messages = [
-                msg
-                for msg in candidate_visible_messages
-                if not self._is_volatile_ignored_quarantine_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not (
-                    self._compiled_ignore_message_patterns
-                    and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
-                    )
-                    and self._matches_ignore_message_patterns(msg, stored_row=True)
-                )
-            ]
+            visible_count = visible_counts[cursor]
+            identity_count = identity_counts[cursor]
+            candidate_visible_messages = visible_messages[:visible_count]
+            candidate_non_placeholder_messages = identity_messages[:identity_count]
             filtered_candidate_placeholders = len(candidate_non_placeholder_messages) < len(candidate_visible_messages)
-            candidate_has_scaffold_evidence = any(
-                self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
-            )
-            candidate_has_quarantined_replay_evidence = any(
-                self._is_quarantined_assistant_replay_identity(self._message_replay_identity(msg))
-                for msg in candidate_messages
-            )
+            candidate_has_scaffold_evidence = scaffold_evidence[cursor]
+            candidate_has_quarantined_replay_evidence = quarantine_evidence[cursor]
             candidate_identity_messages = (
                 candidate_non_placeholder_messages
                 if candidate_non_placeholder_messages or filtered_candidate_placeholders
                 else candidate_visible_messages
             )
-            candidate_visible_prefix = [
-                self._message_replay_identity(msg)
-                for msg in candidate_visible_messages
-            ]
-            candidate_prefix = [
-                self._message_replay_identity(msg)
-                for msg in candidate_identity_messages
-            ]
+            candidate_visible_prefix = visible_identities[:visible_count]
+            candidate_prefix = identities[:identity_count]
+            self._reconcile_deadline_checkpoint(
+                f"cursor {cursor} of {len(messages)}"
+            )
             if not candidate_prefix:
                 empty_prefix_cursor = cursor
                 if allow_empty_prefix and (
@@ -542,6 +639,9 @@ class ReconcileMixin:
                 stored_tail,
                 stored_tail_rows,
             )
+            self._reconcile_deadline_checkpoint(
+                f"cursor {cursor} of {len(messages)}"
+            )
             candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
@@ -553,14 +653,18 @@ class ReconcileMixin:
             )
             matches_inline_generation_cleanup_tail = False
             if candidate_has_unrecoverable_persisted_marker:
-                generationless_sanitized_tail = [
-                    self._strip_inline_persisted_output_generation_identity(identity)
-                    for identity in sanitized_replay_tail
-                ]
-                generationless_candidate_prefix = [
-                    self._strip_inline_persisted_output_generation_identity(identity)
-                    for identity in candidate_prefix
-                ]
+                # Prefixes overlap throughout this search. Normalize each
+                # immutable identity once per search, not once per cursor.
+                if generationless_sanitized_tail is None:
+                    generationless_sanitized_tail = [
+                        self._strip_inline_persisted_output_generation_identity(identity)
+                        for identity in sanitized_replay_tail
+                    ]
+                    generationless_identities = [
+                        self._strip_inline_persisted_output_generation_identity(identity)
+                        for identity in identities
+                    ]
+                generationless_candidate_prefix = generationless_identities[:identity_count]
                 matches_inline_generation_cleanup_tail = self._matches_store_tail_suffix(
                     generationless_sanitized_tail,
                     generationless_candidate_prefix,
@@ -739,6 +843,9 @@ class ReconcileMixin:
                 or has_raw_cleanup_replay
             ):
                 return cursor
+            self._reconcile_deadline_checkpoint(
+                f"cursor {cursor} of {len(messages)}"
+            )
         return empty_prefix_cursor if allow_empty_prefix else None
 
     def _record_ingest_reconciliation(
@@ -801,23 +908,379 @@ class ReconcileMixin:
             return False
         return stored_head[: len(incoming_identities)] == incoming_identities
 
-    def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
+    def _reconcile_ingest_cursor_from_store(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> int:
+        # Budget wrapper: reconciliation runs synchronously inside the
+        # post-LLM ingest hook, so it must never run unbounded. On budget
+        # exhaustion the caller aborts the ingest batch (no duplicate rows)
+        # and retries next turn with a warm payload index. Automatic foreground
+        # work supplies the same absolute deadline used by the rest of the
+        # compression attempt; the configured reconcile budget may shorten but
+        # must never extend that caller-owned wall.
+        budget = float(getattr(self._config, "reconcile_budget_seconds", 45.0) or 0.0)
+        now = self._foreground_now()
+        configured_deadline = (now + budget) if budget > 0 else None
+        foreground_deadline = float(deadline) if deadline is not None else None
+        effective_deadline = configured_deadline
+        if foreground_deadline is not None:
+            effective_deadline = (
+                foreground_deadline
+                if effective_deadline is None
+                else min(effective_deadline, foreground_deadline)
+            )
+        if effective_deadline is None:
+            acquired = self._reconcile_lock.acquire()
+        else:
+            acquired = self._reconcile_lock.acquire(
+                timeout=max(0.0, effective_deadline - self._foreground_now())
+            )
+        if not acquired:
+            if (
+                foreground_deadline is not None
+                and self._foreground_now() >= foreground_deadline
+            ):
+                raise ForegroundDeadlineExceeded(
+                    "reconciliation",
+                    "lock wait exceeded the shared deadline",
+                )
+            raise ReconcileBudgetExceeded("reconcile lock wait exceeded its budget")
+        if (
+            effective_deadline is not None
+            and self._foreground_now() >= effective_deadline
+        ):
+            self._reconcile_lock.release()
+            if (
+                foreground_deadline is not None
+                and self._foreground_now() >= foreground_deadline
+            ):
+                raise ForegroundDeadlineExceeded(
+                    "reconciliation",
+                    "lock wait consumed the shared deadline",
+                )
+            raise ReconcileBudgetExceeded("reconcile lock wait consumed its budget")
+        self._reconcile_deadline = effective_deadline
+        self._reconcile_foreground_deadline = foreground_deadline
+        self._identity_memo = {}
+        try:
+            try:
+                timeout_ms = None
+                if effective_deadline is not None:
+                    timeout_ms = max(
+                        0,
+                        int(
+                            max(
+                                0.0,
+                                effective_deadline - self._foreground_now(),
+                            )
+                            * 1000
+                        ),
+                    )
+                with _temporary_sqlite_busy_timeout(
+                    [getattr(getattr(self, "_store", None), "_conn", None)],
+                    timeout_ms if timeout_ms is not None else 0,
+                ) if timeout_ms is not None else nullcontext():
+                    self._reconcile_deadline_checkpoint("before durable store scan")
+                    result = self._reconcile_ingest_cursor_from_store_impl(messages)
+                    self._reconcile_deadline_checkpoint("after durable store scan")
+                return result
+            except ExternalizedPayloadLookupBudgetExceeded as exc:
+                if (
+                    foreground_deadline is not None
+                    and self._foreground_now() >= foreground_deadline
+                ):
+                    raise ForegroundDeadlineExceeded(
+                        "reconciliation",
+                        "payload lookup exceeded the shared deadline",
+                    ) from exc
+                raise ReconcileBudgetExceeded(
+                    "reconcile payload lookup exceeded its budget"
+                ) from exc
+            except Exception as exc:
+                if _is_sqlite_locked_error(exc) and foreground_deadline is not None:
+                    raise ForegroundDeadlineExceeded(
+                        "reconciliation",
+                        "SQLite wait consumed the shared deadline",
+                    ) from exc
+                raise
+        finally:
+            self._identity_memo = None
+            self._reconcile_deadline = None
+            self._reconcile_foreground_deadline = None
+            self._reconcile_lock.release()
+
+    def _historical_projection_cursor(self, messages, stored_rows):
+        # Legacy archives contain gaps and host persistence transformations.
+        # Require the actual canonical summary and complete ordered coverage
+        # through the durable end, never merely a matching suffix.
+        if len(messages) < 8 or not stored_rows:
+            return None
+        deadline = getattr(self, '_reconcile_deadline', None)
+        roots = self._dag.get_active_frontier_nodes(self._session_id,
+            deadline=deadline, deadline_clock=self._foreground_now,
+            lock_timeout_seconds=self._foreground_deadline_remaining(deadline))
+        if not any(root.summary and any(root.summary in str(m.get('content') or '')
+                   for m in messages if self._is_replayed_context_scaffold_message(m))
+                   for root in roots):
+            return None
+        class View:
+            _last_compacted_store_id = 0
+            def __getattr__(_view, name):
+                return getattr(self, name)
+        mapping = ReconcileMixin._get_store_id_map_for_messages(
+            View(), messages,
+            deadline=getattr(self, '_reconcile_deadline', None),
+            excluded_source_prefixes=("historical_replay_gap:",),
+        )
+        end = int(stored_rows[-1]['store_id'])
+        matched = 0
+        previous = 0
+        canonical_gaps = []
+        canonical_gap_seen = False
+        last_host_row_id = 0
+        host_rows_monotonic = True
+        for index, message in enumerate(messages):
+            self._reconcile_deadline_checkpoint('historical coverage')
+            raw_host_row_id = message.get('_row_id', message.get('row_id'))
+            try:
+                host_row_id = int(raw_host_row_id) if raw_host_row_id is not None else 0
+            except (TypeError, ValueError):
+                host_row_id = 0
+            if host_row_id:
+                if host_row_id <= last_host_row_id:
+                    # Canonical SessionDB row ids are strictly increasing in a
+                    # replay projection.  Never trust caller-supplied gap hints
+                    # that break that durable ordering proof.
+                    canonical_gaps = []
+                    host_rows_monotonic = False
+                last_host_row_id = host_row_id
+            source = mapping.get(id(message))
+            if host_row_id in getattr(
+                self, "_recovered_historical_projection_row_ids", set()
+            ):
+                # Recovery rows live physically after the old archive end. For
+                # projection ordering they occupy their canonical host position,
+                # so exclude their later store id from the monotonic proof.
+                source = None
+            if source is None:
+                if (self._is_replayed_context_scaffold_message(message)
+                        or self._matches_ignore_message_patterns(message)):
+                    continue
+                if any(mapping.get(id(m)) == end for m in messages[index+1:]):
+                    if host_row_id > 0 and host_rows_monotonic:
+                        if host_row_id in getattr(
+                            self, "_recovered_historical_projection_row_ids", set()
+                        ):
+                            # This canonical gap was already appended by an
+                            # earlier recovery transaction. Its durable host id
+                            # ledger remains authoritative even when an unsafe
+                            # payload marker prevents manifest replay.
+                            canonical_gap_seen = True
+                            continue
+                        # The host's canonical SessionDB can contain rows that
+                        # LCM missed between two already-durable islands (for
+                        # example context-pruned tool projections persisted
+                        # while an earlier reconcile was deferred). Preserve
+                        # those rows below before advancing the cursor. A row
+                        # without the host's monotonic durable id still fails
+                        # closed as an unverified source.
+                        canonical_gaps.append(message)
+                        canonical_gap_seen = True
+                        continue
+                    raise ReconcileBudgetExceeded(
+                        'Historical replay contains an unverified source before the durable boundary')
+                return None
+            if source < previous:
+                return None
+            previous = source
+            matched += 1
+            if source == end:
+                cursor = index + 1
+                while cursor < len(messages) and mapping.get(id(messages[cursor])) == end:
+                    cursor += 1
+                if matched >= 8:
+                    if canonical_gap_seen and not host_rows_monotonic:
+                        raise ReconcileBudgetExceeded(
+                            'Historical replay host row ids are not monotonic'
+                        )
+                    self._pending_historical_projection_gaps = canonical_gaps
+                    return cursor
+                return None
+        return None
+
+    def _historical_projection_gap_ledger_key(self) -> str:
+        scope = json.dumps([self._session_id, self._conversation_id], separators=(",", ":"))
+        return "historical_projection_gap_row_ids_v1:" + hashlib.sha256(scope.encode()).hexdigest()
+
+    def _recover_historical_projection_gaps(self, messages, gaps, *, deadline=None):
+        """Atomically preserve canonical host rows omitted from the LCM archive.
+
+        The append is paired with the exact active-view manifest.  A restart
+        therefore proves the replay before considering physical store order,
+        while the recovered rows remain searchable and retain their original
+        host timestamps.  The operation is idempotent because the manifest is
+        checked before historical projection on every later bind.
+        """
+        if not gaps:
+            return []
+        self._foreground_deadline_checkpoint(deadline, "historical gap protection")
+        protected = protect_messages_for_ingest(
+            gaps,
+            config=self._config,
+            hermes_home=self._hermes_home,
+            session_id=self._session_id,
+        )
+        estimates = [count_message_tokens(message) for message in protected]
+        row_ids = []
+        for message in gaps:
+            try:
+                row_ids.append(int(message.get('_row_id', message.get('row_id'))))
+            except (TypeError, ValueError):
+                pass
+        source = (
+            f"historical_replay_gap:{min(row_ids)}-{max(row_ids)}"
+            if row_ids else "historical_replay_gap"
+        )
+        updates = [(
+            [self._active_ingest_manifest_key()],
+            json.dumps(self._active_ingest_manifest(messages, deadline=deadline)),
+            True,
+        )]
+        ledger_additions = [(
+            [self._historical_projection_gap_ledger_key()],
+            [str(row_id) for row_id in row_ids],
+            100000,
+        )]
+        remaining = self._foreground_deadline_remaining(deadline)
+        try:
+            ids = self._store._append_protected_batch(
+                self._session_id,
+                protected,
+                estimates,
+                source=source,
+                conversation_id=self._conversation_id,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+                lock_timeout_seconds=remaining,
+                busy_timeout_ms=(
+                    None if remaining is None else max(0, int(remaining * 1000))
+                ),
+                metadata_json_updates=updates,
+                metadata_json_list_additions=ledger_additions,
+            )
+        except TimeoutError as exc:
+            raise ReconcileBudgetExceeded(
+                "historical replay gap recovery exceeded its budget"
+            ) from exc
+        logger.warning(
+            "LCM recovered canonical historical replay gaps: session=%s rows=%d "
+            "host_row_ids=%s-%s",
+            self._session_id,
+            len(ids),
+            min(row_ids) if row_ids else "unknown",
+            max(row_ids) if row_ids else "unknown",
+        )
+        return ids
+
+
+    def _active_ingest_manifest_key(self) -> str:
+        scope = json.dumps([self._session_id, self._conversation_id], separators=(",", ":"))
+        return "active_ingest_manifest_v1:" + hashlib.sha256(scope.encode()).hexdigest()
+
+    def _active_ingest_fingerprints(self, messages, *, deadline=None):
+        fingerprints = []
+        for index, message in enumerate(messages):
+            if index % 32 == 0:
+                self._foreground_deadline_checkpoint(deadline, "ingest manifest")
+            identity = self._message_replay_identity(message)
+            fingerprints.append(hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest())
+        return fingerprints
+
+    def _active_ingest_policy_fingerprint(self):
+        encoded = json.dumps(vars(self._config), sort_keys=True, default=str)
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def _active_ingest_manifest(self, messages, *, deadline=None):
+        return {
+            "policy": self._active_ingest_policy_fingerprint(),
+            "fingerprints": self._active_ingest_fingerprints(messages, deadline=deadline),
+        }
+
+    def _reconcile_ingest_cursor_from_store_impl(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
+        self._reconcile_deadline_checkpoint("starting durable replay scan")
         if not self._session_id or not messages:
             return 0
 
+        # The append transaction records the exact admitted active ordering.
+        # After multiple rewrites that ordering need not be contiguous in the
+        # immutable archive. A bounded digest manifest proves replay without
+        # conflating genuinely new identical messages after its end.
+        deadline = getattr(self, "_reconcile_deadline", None)
+        manifest = self._store.read_metadata_json(
+            self._active_ingest_manifest_key(), deadline=deadline,
+            deadline_clock=self._foreground_now,
+            lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+        )
+        unproofed_marker = any(
+            str(msg.get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+            and recover_hermes_persisted_output_with_file_stat(normalize_content_value(msg.get("content")) or "") is None
+            for msg in messages
+        )
+        if isinstance(manifest, dict) and manifest.get("policy") == self._active_ingest_policy_fingerprint() and not unproofed_marker:
+            fingerprints = manifest.get("fingerprints")
+            # A short repeated message/exchange can be a new delta rather
+            # than a replay. Keep legacy conservative handling for those.
+            if isinstance(fingerprints, list) and len(fingerprints) >= 3:
+                incoming = self._active_ingest_fingerprints(messages[:len(fingerprints)], deadline=deadline)
+                if incoming == fingerprints:
+                    session_count = self._store.get_session_count(
+                        self._session_id, deadline=deadline,
+                        deadline_clock=self._foreground_now,
+                        lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+                    )
+                    if session_count > 0:
+                        self._record_ingest_reconciliation(
+                            action="advanced cursor", reason="replayed durable active manifest",
+                            cursor=len(fingerprints), incoming=len(messages),
+                            session_count=session_count, stored_tail_count=0,
+                            effective_incoming=len(incoming),
+                        )
+                        return len(fingerprints)
+
         try:
-            session_count = self._store.get_session_count(self._session_id)
+            session_count = self._store.get_session_count(
+                self._session_id,
+                lock_timeout_seconds=(
+                    None
+                    if getattr(self, "_reconcile_deadline", None) is None
+                    else max(
+                        0.0,
+                        float(self._reconcile_deadline) - self._foreground_now(),
+                    )
+                ),
+                deadline=getattr(self, "_reconcile_deadline", None),
+                deadline_clock=self._foreground_now,
+            )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
             return 0
+        self._reconcile_deadline_checkpoint("counting durable replay rows")
         if session_count <= 0:
             placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
             placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
             if placeholder_budget and placeholder_ordinals:
                 consumed: dict[str, int] = {}
                 cursor = 0
-                for msg in messages:
+                for index, msg in enumerate(messages):
+                    if index % 32 == 0:
+                        self._reconcile_deadline_checkpoint(
+                            "matching generated replay placeholders"
+                        )
                     text = text_content_for_pattern_matching(msg.get("content")) or ""
                     digest = self._active_replay_placeholder_digest(text)
                     if not digest:
@@ -842,7 +1305,22 @@ class ReconcileMixin:
             return 0
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
-        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        self._reconcile_deadline_checkpoint("reading durable replay tail")
+        stored_rows = self._store.get_session_tail(
+            self._session_id,
+            limit=tail_limit,
+            lock_timeout_seconds=(
+                None
+                if getattr(self, "_reconcile_deadline", None) is None
+                else max(
+                    0.0,
+                    float(self._reconcile_deadline) - self._foreground_now(),
+                )
+            ),
+            deadline=getattr(self, "_reconcile_deadline", None),
+            deadline_clock=self._foreground_now,
+        )
+        self._reconcile_deadline_checkpoint("reading durable replay tail")
         if not stored_rows:
             return 0
         stored_tail_rows = [
@@ -854,6 +1332,37 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
         ]
+        recovered_gap_row_ids = self._store.read_metadata_json(
+            self._historical_projection_gap_ledger_key(), deadline=deadline,
+            deadline_clock=self._foreground_now,
+            lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+        )
+        self._recovered_historical_projection_row_ids = {
+            int(row_id)
+            for row_id in (recovered_gap_row_ids or [])
+            if str(row_id).isdigit()
+        }
+        self._pending_historical_projection_gaps = []
+        historical_projection_rows = [
+            row for row in stored_rows
+            if not str(row.get("source") or "").startswith("historical_replay_gap:")
+        ]
+        historical_cursor = self._historical_projection_cursor(
+            messages, historical_projection_rows
+        )
+        if historical_cursor is not None:
+            gaps = list(getattr(self, '_pending_historical_projection_gaps', []) or [])
+            self._pending_historical_projection_gaps = []
+            if gaps:
+                self._recover_historical_projection_gaps(
+                    messages[:historical_cursor], gaps, deadline=deadline
+                )
+            self._record_ingest_reconciliation(
+                action="advanced cursor", reason="verified historical host projection",
+                cursor=historical_cursor, incoming=len(messages),
+                session_count=session_count, stored_tail_count=len(stored_tail),
+                effective_incoming=historical_cursor)
+            return historical_cursor
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
@@ -862,6 +1371,7 @@ class ReconcileMixin:
             session_count=len(stored_tail),
             raw_session_count=session_count,
         )
+        self._reconcile_deadline_checkpoint("matching durable replay tail")
         if cursor is not None and cursor > 0:
             reason = (
                 "skipped scaffold-only prefix"
@@ -889,11 +1399,24 @@ class ReconcileMixin:
             return cursor
 
         incoming_identities = self._effective_replay_identities(messages)
+        self._reconcile_deadline_checkpoint("reading durable replay head")
         stored_head_rows = self._store.get_session_messages(
             self._session_id,
             limit=tail_limit,
+            lock_timeout_seconds=(
+                None
+                if getattr(self, "_reconcile_deadline", None) is None
+                else max(
+                    0.0,
+                    float(self._reconcile_deadline) - self._foreground_now(),
+                )
+            ),
+            deadline=getattr(self, "_reconcile_deadline", None),
+            deadline_clock=self._foreground_now,
         )
+        self._reconcile_deadline_checkpoint("reading durable replay head")
         stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
+        self._reconcile_deadline_checkpoint("matching durable replay head")
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
         # filters may suppress noisy rows for tail reconciliation, but filtered
         # history alone must not create replay evidence for skipping a batch.
@@ -952,7 +1475,13 @@ class ReconcileMixin:
             str(msg.get("tool_call_id") or ""),
         )
 
-    def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+    def _get_store_id_map_for_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+        excluded_source_prefixes: tuple[str, ...] = (),
+    ) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
         Matching starts strictly after ``_last_compacted_store_id`` so repeated
@@ -963,20 +1492,83 @@ class ReconcileMixin:
         synthetic/carry-over and left unmapped so they cannot steal later stored
         literal copies with the same content.
         """
+        inherited_deadline = getattr(self, "_reconcile_deadline", None)
+        effective_deadline = (
+            float(deadline)
+            if deadline is not None
+            else inherited_deadline
+        )
+
+        def checkpoint(detail: str) -> None:
+            if deadline is not None:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "source mapping",
+                    detail,
+                )
+            elif inherited_deadline is not None:
+                self._reconcile_deadline_checkpoint(detail)
+
         candidates: list[Dict[str, Any]] = []
         next_candidate_after = self._last_compacted_store_id
         while True:
-            page = self._store.get_session_messages_after(
-                self._session_id,
-                after_store_id=next_candidate_after,
-            )
+            checkpoint("before durable source page")
+            remaining = self._foreground_deadline_remaining(effective_deadline)
+            try:
+                page = self._store.get_session_messages_after(
+                    self._session_id,
+                    after_store_id=next_candidate_after,
+                    lock_timeout_seconds=remaining,
+                    deadline=effective_deadline,
+                    deadline_clock=self._foreground_now,
+                    busy_timeout_ms=(
+                        max(0, int(remaining * 1000))
+                        if remaining is not None
+                        else None
+                    ),
+                )
+            except TimeoutError as exc:
+                if deadline is not None:
+                    raise ForegroundDeadlineExceeded(
+                        "source mapping",
+                        "message-store page read exceeded the shared deadline",
+                    ) from exc
+                raise
+            except Exception as exc:
+                if deadline is not None and _is_sqlite_locked_error(exc):
+                    raise ForegroundDeadlineExceeded(
+                        "source mapping",
+                        "SQLite contention prevented a bounded source page read",
+                    ) from exc
+                raise
+            checkpoint("after durable source page")
             if not page:
                 break
-            candidates.extend(page)
+            if excluded_source_prefixes:
+                candidates.extend(
+                    row for row in page
+                    if not str(row.get("source") or "").startswith(
+                        excluded_source_prefixes
+                    )
+                )
+            else:
+                candidates.extend(page)
             next_candidate_after = page[-1]["store_id"]
+        # Identity construction may decode large tool payloads. Keep it once
+        # per active object for this operation, never across mutable turns.
+        active_identities: dict[int, tuple[Any, ...]] = {}
+
+        def active_identity(message):
+            key = id(message)
+            if key not in active_identities:
+                active_identities[key] = self._message_replay_identity(message)
+            return active_identities[key]
+
         active_identity_counts: dict[tuple[Any, ...], int] = {}
-        for msg in messages:
-            identity = self._message_replay_identity(msg)
+        for message_index, msg in enumerate(messages):
+            if message_index % 32 == 0:
+                checkpoint("active source identities")
+            identity = active_identity(msg)
             active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
         stored_identity_counts: dict[tuple[Any, ...], int] = {}
         stored_cleanup_identity_counts: dict[tuple[Any, ...], int] = {}
@@ -991,8 +1583,23 @@ class ReconcileMixin:
         # the memo below) since most rows never need them.
         stored_identities: list[tuple[Any, ...]] = []
         stored_cleanup_identities: list[Optional[tuple[Any, ...]]] = []
-        for stored in candidates:
-            identity = self._message_replay_identity(stored, stored_row=True)
+        stored_value_identities = {}
+        for stored_index, stored in enumerate(candidates):
+            if stored_index % 32 == 0:
+                checkpoint("stored source identities")
+            # Replayed snapshots produce distinct row objects with identical
+            # immutable values. Memoize within this mapping operation only;
+            # a later operation must observe changed payload files/policy.
+            value_key = (
+                stored.get("session_id"), stored.get("role"),
+                stored.get("content"), stored.get("tool_call_id"),
+                json.dumps(stored.get("tool_calls"), sort_keys=True),
+            )
+            identity = stored_value_identities.get(value_key)
+            if identity is None:
+                identity = self._message_replay_identity(stored, stored_row=True)
+                if len(stored_value_identities) < 8192:
+                    stored_value_identities[value_key] = identity
             stored_identities.append(identity)
             cleanup_identity = self._active_cleanup_replay_identity(identity)
             stored_cleanup_identities.append(cleanup_identity)
@@ -1034,7 +1641,7 @@ class ReconcileMixin:
                         break
                     if id(msg) not in generated_placeholder_message_ids:
                         continue
-                    if self._message_replay_identity(msg) != identity:
+                    if active_identity(msg) != identity:
                         continue
                     generated_surplus_skip_message_ids.add(id(msg))
                     surplus_count -= 1
@@ -1068,7 +1675,7 @@ class ReconcileMixin:
                 if raw_match_idx is not None:
                     return raw_match_idx
 
-            message_identity = self._message_replay_identity(msg)
+            message_identity = active_identity(msg)
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = start_idx
             while probe_idx < len(candidates):
@@ -1103,7 +1710,7 @@ class ReconcileMixin:
                         matched_message_ids.add(id(remaining_msg))
                         probe_idx = raw_match_idx + 1
                         continue
-                message_identity = self._message_replay_identity(remaining_msg)
+                message_identity = active_identity(remaining_msg)
                 if id(remaining_msg) in generated_surplus_skip_message_ids:
                     continue
                 surplus = local_surplus_skips.get(message_identity, 0)
@@ -1120,6 +1727,8 @@ class ReconcileMixin:
         ids_by_message_id: dict[int, int] = {}
         store_idx = 0
         for msg_idx, msg in enumerate(messages):
+            if msg_idx % 32 == 0:
+                checkpoint("active source matching")
             msg_content = normalize_content_value(msg.get("content")) or ""
             if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
                 raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
@@ -1158,7 +1767,7 @@ class ReconcileMixin:
                         probe_idx -= 1
                 if id(msg) in ids_by_message_id:
                     continue
-            message_identity = self._message_replay_identity(msg)
+            message_identity = active_identity(msg)
             if id(msg) in generated_surplus_skip_message_ids:
                 continue
             surplus = active_surplus_skips.get(message_identity, 0)
@@ -1170,4 +1779,6 @@ class ReconcileMixin:
                 ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
                 store_idx = match_idx + 1
 
-        return ids_by_message_id
+        from .historical_projection import extend_projection_mapping
+        return extend_projection_mapping(messages, candidates, stored_identities,
+            active_identity, ids_by_message_id, checkpoint)

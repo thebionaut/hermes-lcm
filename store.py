@@ -15,9 +15,10 @@ import math
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -384,6 +385,144 @@ class MessageStore:
             "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
         )
 
+    @contextmanager
+    def _bounded_connection_access(
+        self,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+        force_lock: bool = False,
+        check_after: bool = True,
+    ) -> Iterator[sqlite3.Connection]:
+        """Borrow the shared connection without escaping a caller deadline.
+
+        Every operation using the shared connection serializes through the same
+        process-local lock. No-deadline callers still wait indefinitely, while
+        deadline-aware callers cap lock acquisition at their remaining wall.
+        This prevents a legacy read from holding SQLite's C-level connection
+        mutex before a bounded caller can install its timeout/checkpoints.
+        """
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, float(deadline) - float(clock()))
+
+        def checkpoint(detail: str) -> None:
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError(f"message store deadline exceeded {detail}")
+
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("message store is closed")
+
+        checkpoint("before connection lock")
+        remaining = remaining_seconds()
+        effective_lock_timeout = lock_timeout_seconds
+        if remaining is not None:
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+        if effective_lock_timeout is None:
+            acquired = bool(self._write_lock.acquire())
+        else:
+            acquired = bool(
+                self._write_lock.acquire(
+                    timeout=max(0.0, float(effective_lock_timeout))
+                )
+            )
+        if not acquired:
+            raise TimeoutError("message store connection lock deadline exceeded")
+
+        prior_busy_timeout: int | None = None
+        primary_error: BaseException | None = None
+        try:
+            checkpoint("after connection lock")
+            effective_busy_timeout_ms = busy_timeout_ms
+            remaining = remaining_seconds()
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            if effective_busy_timeout_ms is not None:
+                prior_busy_timeout = int(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                )
+                conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+                )
+            yield conn
+            if check_after:
+                checkpoint("after connection operation")
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                if prior_busy_timeout is not None and self._conn is conn:
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={prior_busy_timeout}")
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                        logger.warning(
+                            "LCM could not restore SQLite busy_timeout after a failed "
+                            "message store operation",
+                            exc_info=True,
+                        )
+            finally:
+                self._write_lock.release()
+
+    @contextmanager
+    def _explicit_transaction(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        operation: str,
+    ) -> Iterator[sqlite3.Connection]:
+        """Commit or safely poison a bounded mutation transaction.
+
+        ``sqlite3.Connection`` context management can replace the primary
+        deadline/error when its implicit rollback also fails, while leaving the
+        failed transaction open for a later caller to commit. Keep rollback
+        explicit so the primary exception survives. If rollback fails, close and
+        detach the connection under ``_write_lock`` before another operation can
+        reuse it.
+        """
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+            except BaseException:
+                logger.warning(
+                    "LCM could not roll back a failed message store %s; closing "
+                    "the message store connection",
+                    operation,
+                    exc_info=True,
+                )
+                try:
+                    conn.close()
+                except BaseException:
+                    logger.warning(
+                        "LCM could not close the poisoned message store connection",
+                        exc_info=True,
+                    )
+                if self._conn is conn:
+                    self._conn = None
+            raise
+
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
@@ -452,7 +591,18 @@ class MessageStore:
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
-                                conversation_id: str = "") -> List[int]:
+                                conversation_id: str = "",
+                                *,
+                                deadline: float | None = None,
+                                deadline_clock: Callable[[], float] | None = None,
+                                lock_timeout_seconds: float | None = None,
+                                busy_timeout_ms: int | None = None,
+                                metadata_json_updates: list[
+                                    tuple[list[str], str, bool]
+                                ] | None = None,
+                                metadata_json_list_additions: list[
+                                    tuple[list[str], list[str], int]
+                                ] | None = None) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
@@ -463,38 +613,175 @@ class MessageStore:
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
+        clock = deadline_clock or time.monotonic
+
+        def checkpoint(detail: str) -> None:
+            if deadline is not None and float(clock()) >= float(deadline):
+                raise TimeoutError(f"message store append deadline exceeded {detail}")
+
         ids = []
-        with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
-                tc = msg.get("tool_calls")
-                tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
-                observed_at = _normalize_observed_at(msg.get("timestamp"))
-                cur = self._conn.execute(
-                    """INSERT INTO messages
-                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                        tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        _normalize_source_value(source),
-                        _normalize_conversation_id_value(conversation_id),
-                        msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
-                        msg.get("tool_call_id"),
-                        tc_json,
-                        msg.get("tool_name"),
-                        ts,
-                        est,
-                        0,
-                        ts,
-                        observed_at,
-                        "host_message_timestamp" if observed_at is not None else None,
-                    ),
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+            force_lock=True,
+            check_after=False,
+        ) as conn:
+            # The explicit transaction rolls the entire raw batch back on every
+            # deadline or SQLite failure and poisons the connection if rollback
+            # itself fails. The last checkpoint remains inside the transaction.
+            with self._explicit_transaction(conn, operation="raw append"):
+                for msg, est in zip(messages, token_estimates):
+                    checkpoint("before row")
+                    tc = msg.get("tool_calls")
+                    tc_json = json.dumps(tc) if tc else None
+                    ts = time.time()
+                    observed_at = _normalize_observed_at(msg.get("timestamp"))
+                    cur = conn.execute(
+                        """INSERT INTO messages
+                           (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                            tool_name, timestamp, token_estimate, pinned, ingested_at,
+                            observed_at, observed_at_source)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            session_id,
+                            _normalize_source_value(source),
+                            _normalize_conversation_id_value(conversation_id),
+                            msg.get("role", "unknown"),
+                            _normalize_content_value(msg.get("content")),
+                            msg.get("tool_call_id"),
+                            tc_json,
+                            msg.get("tool_name"),
+                            ts,
+                            est,
+                            0,
+                            ts,
+                            observed_at,
+                            (
+                                "host_message_timestamp"
+                                if observed_at is not None
+                                else None
+                            ),
+                        ),
+                    )
+                    ids.append(cur.lastrowid)
+                self._apply_metadata_json_mutations_on_connection(
+                    conn,
+                    metadata_json_updates=metadata_json_updates,
+                    metadata_json_list_additions=metadata_json_list_additions,
+                    checkpoint=checkpoint,
                 )
-                ids.append(cur.lastrowid)
+                checkpoint("before commit")
         return ids
+
+    @staticmethod
+    def _apply_metadata_json_mutations_on_connection(
+        conn: sqlite3.Connection,
+        *,
+        metadata_json_updates: list[tuple[list[str], str, bool]] | None,
+        metadata_json_list_additions: list[
+            tuple[list[str], list[str], int]
+        ] | None,
+        checkpoint: Callable[[str], None],
+    ) -> bool:
+        wrote = False
+        for keys, serialized, skip_unchanged in metadata_json_updates or ():
+            for key in keys:
+                checkpoint("before metadata row")
+                if skip_unchanged:
+                    existing = conn.execute(
+                        "SELECT value FROM metadata WHERE key = ?",
+                        (key,),
+                    ).fetchone()
+                    checkpoint("after metadata lookup")
+                    if existing is not None and existing[0] == serialized:
+                        continue
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, serialized),
+                )
+                wrote = True
+                checkpoint("after metadata row")
+        for keys, additions, max_items in metadata_json_list_additions or ():
+            clean_additions = [str(item) for item in additions]
+            for key in keys:
+                checkpoint("before metadata merge")
+                existing = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                checkpoint("after metadata merge lookup")
+                ordered: list[str] = []
+                if existing is not None and existing[0]:
+                    try:
+                        decoded = json.loads(str(existing[0]))
+                    except (TypeError, ValueError):
+                        decoded = []
+                    if isinstance(decoded, list):
+                        ordered = [str(item) for item in decoded]
+                for item in clean_additions:
+                    ordered = [value for value in ordered if value != item]
+                    ordered.append(item)
+                if max_items > 0:
+                    ordered = ordered[-max_items:]
+                serialized = json.dumps(ordered)
+                if existing is not None and existing[0] == serialized:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, serialized),
+                )
+                wrote = True
+                checkpoint("after metadata merge")
+        return wrote
+
+    def write_metadata_json_batch_bounded(
+        self,
+        *,
+        metadata_json_updates: list[tuple[list[str], str, bool]] | None = None,
+        metadata_json_list_additions: list[
+            tuple[list[str], list[str], int]
+        ] | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> bool:
+        """Commit derived metadata with the same bounded transaction contract."""
+        clock = deadline_clock or time.monotonic
+
+        def checkpoint(detail: str) -> None:
+            if deadline is not None and float(clock()) >= float(deadline):
+                raise TimeoutError(
+                    f"message store metadata deadline exceeded {detail}"
+                )
+
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+            force_lock=True,
+            check_after=False,
+        ) as conn:
+            with self._explicit_transaction(conn, operation="metadata write"):
+                wrote = self._apply_metadata_json_mutations_on_connection(
+                    conn,
+                    metadata_json_updates=metadata_json_updates,
+                    metadata_json_list_additions=metadata_json_list_additions,
+                    checkpoint=checkpoint,
+                )
+                checkpoint("before commit")
+        return wrote
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
         """Move all persisted messages from one session_id to another."""
@@ -525,6 +812,10 @@ class MessageStore:
         placeholder: str,
         *,
         before_commit: "Callable[[sqlite3.Connection, int], None] | None" = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> bool:
         """Rewrite one unpinned tool-result row to a compact GC placeholder.
 
@@ -535,30 +826,51 @@ class MessageStore:
         later batch archive would slice the new (short) content at the old chunk
         offsets, returning a garbled fragment (F2).
         """
-        with self._write_lock:
-            row = self._conn.execute(
-                "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
-                (store_id,),
-            ).fetchone()
-            if row is None:
-                return False
-            role, pinned, current_content, tool_call_id = row
-            if role != "tool" or bool(pinned) or current_content == placeholder:
-                return False
-            placeholder_tokens = count_message_tokens(
-                {
-                    "role": "tool",
-                    "content": placeholder,
-                    "tool_call_id": tool_call_id,
-                }
-            )
-            self._conn.execute(
-                "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
-                (placeholder, placeholder_tokens, store_id),
-            )
-            if before_commit is not None:
-                before_commit(self._conn, store_id)
-            self._conn.commit()
+        clock = deadline_clock or time.monotonic
+
+        def checkpoint(detail: str) -> None:
+            if deadline is not None and float(clock()) >= float(deadline):
+                raise TimeoutError(
+                    f"message store transcript GC deadline exceeded {detail}"
+                )
+
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+            force_lock=True,
+            check_after=False,
+        ) as conn:
+            with self._explicit_transaction(conn, operation="transcript GC"):
+                checkpoint("before row lookup")
+                row = conn.execute(
+                    "SELECT role, pinned, content, tool_call_id "
+                    "FROM messages WHERE store_id = ?",
+                    (store_id,),
+                ).fetchone()
+                checkpoint("after row lookup")
+                if row is None:
+                    return False
+                role, pinned, current_content, tool_call_id = row
+                if role != "tool" or bool(pinned) or current_content == placeholder:
+                    return False
+                placeholder_tokens = count_message_tokens(
+                    {
+                        "role": "tool",
+                        "content": placeholder,
+                        "tool_call_id": tool_call_id,
+                    }
+                )
+                checkpoint("before row rewrite")
+                conn.execute(
+                    "UPDATE messages SET content = ?, token_estimate = ? "
+                    "WHERE store_id = ?",
+                    (placeholder, placeholder_tokens, store_id),
+                )
+                if before_commit is not None:
+                    before_commit(conn, store_id)
+                checkpoint("before commit")
             return True
 
     def pin(self, store_id: int) -> None:
@@ -579,14 +891,37 @@ class MessageStore:
 
     # -- Read operations ----------------------------------------------------
 
-    def get(self, store_id: int) -> Optional[Dict[str, Any]]:
+    def get(
+        self,
+        store_id: int,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
-        row = self._conn.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
-        ).fetchone()
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
+                f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?",
+                (store_id,),
+            ).fetchone()
         return self._row_to_dict(row) if row else None
 
-    def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    def get_batch(
+        self,
+        store_ids: List[int],
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> Dict[int, Dict[str, Any]]:
         """Retrieve multiple messages by store_id in a single query.
 
         Returns a dict mapping store_id → message dict.
@@ -594,10 +929,16 @@ class MessageStore:
         if not store_ids:
             return {}
         placeholders = ",".join("?" for _ in store_ids)
-        rows = self._conn.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
-            store_ids,
-        ).fetchall()
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            rows = conn.execute(
+                f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
+                store_ids,
+            ).fetchall()
         return {row[0]: self._row_to_dict(row) for row in rows}
 
     def scan_evidence_rows(self, *, limit: int = 4096) -> Dict[str, Any]:
@@ -610,22 +951,23 @@ class MessageStore:
         coverage.  Callers must treat ``truncated`` as an honest fallback.
         """
         bounded_limit = min(4096, max(1, int(limit)))
-        rows = self._conn.execute(
-            f"""
-            WITH snapshot AS (
-                SELECT {_MESSAGE_SELECT_COLUMNS},
-                       COUNT(*) OVER () AS snapshot_total_rows,
-                       MAX(store_id) OVER () AS snapshot_max_store_id,
-                       SUM(CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END)
-                           OVER () AS snapshot_observed_at_missing_rows
-                FROM messages
-            )
-            SELECT * FROM snapshot
-            ORDER BY store_id
-            LIMIT ?
-            """,
-            (bounded_limit,),
-        ).fetchall()
+        with self._bounded_connection_access() as conn:
+            rows = conn.execute(
+                f"""
+                WITH snapshot AS (
+                    SELECT {_MESSAGE_SELECT_COLUMNS},
+                           COUNT(*) OVER () AS snapshot_total_rows,
+                           MAX(store_id) OVER () AS snapshot_max_store_id,
+                           SUM(CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END)
+                               OVER () AS snapshot_observed_at_missing_rows
+                    FROM messages
+                )
+                SELECT * FROM snapshot
+                ORDER BY store_id
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
         if not rows:
             return {
                 "rows": [],
@@ -664,12 +1006,13 @@ class MessageStore:
             where.append("store_id <= ?")
             args.append(end_id)
         args.append(limit)
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE {' AND '.join(where)}
-               ORDER BY store_id LIMIT ?""",
-            args,
-        ).fetchall()
+        with self._bounded_connection_access() as conn:
+            rows = conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE {' AND '.join(where)}
+                   ORDER BY store_id LIMIT ?""",
+                args,
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def _session_load_where(
@@ -709,12 +1052,12 @@ class MessageStore:
             time_from=time_from,
             time_to=time_to,
         )
-        return int(
-            self._conn.execute(
+        with self._bounded_connection_access() as conn:
+            row = conn.execute(
                 f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(where)}",
                 args,
-            ).fetchone()[0]
-        )
+            ).fetchone()
+        return int(row[0])
 
     def load_session_page(
         self,
@@ -739,12 +1082,13 @@ class MessageStore:
         )
         where.append("store_id > ?")
         args.extend([after_store_id, limit])
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE {' AND '.join(where)}
-               ORDER BY store_id LIMIT ?""",
-            args,
-        ).fetchall()
+        with self._bounded_connection_access() as conn:
+            rows = conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE {' AND '.join(where)}
+                   ORDER BY store_id LIMIT ?""",
+                args,
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def load_session_window(
@@ -758,78 +1102,148 @@ class MessageStore:
         """Load one bounded ordered window around an exact message anchor."""
         before = min(12, max(0, int(before)))
         after = min(12, max(0, int(after)))
-        prior = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                FROM messages
-                WHERE session_id = ? AND store_id < ?
-                ORDER BY store_id DESC LIMIT ?""",
-            (session_id, anchor_store_id, before),
-        ).fetchall()
-        following = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                FROM messages
-                WHERE session_id = ? AND store_id >= ?
-                ORDER BY store_id LIMIT ?""",
-            (session_id, anchor_store_id, after + 1),
-        ).fetchall()
+        with self._bounded_connection_access() as conn:
+            prior = conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                    FROM messages
+                    WHERE session_id = ? AND store_id < ?
+                    ORDER BY store_id DESC LIMIT ?""",
+                (session_id, anchor_store_id, before),
+            ).fetchall()
+            following = conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                    FROM messages
+                    WHERE session_id = ? AND store_id >= ?
+                    ORDER BY store_id LIMIT ?""",
+                (session_id, anchor_store_id, after + 1),
+            ).fetchall()
         rows = list(reversed(prior)) + list(following)
         return [self._row_to_dict(row) for row in rows]
 
-    def get_session_messages(self, session_id: str,
-                             limit: int = 10000) -> List[Dict[str, Any]]:
+    def get_session_messages(
+        self,
+        session_id: str,
+        limit: int = 10000,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ?
-               ORDER BY store_id LIMIT ?""",
-            (session_id, limit),
-        ).fetchall()
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            rows = conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE session_id = ?
+                   ORDER BY store_id LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_messages_after(self, session_id: str,
-                                   after_store_id: int = 0,
-                                   limit: int = 10000) -> List[Dict[str, Any]]:
+    def get_session_messages_after(
+        self,
+        session_id: str,
+        after_store_id: int = 0,
+        limit: int = 10000,
+        conversation_id: str | None = None,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ? AND store_id > ?
-               ORDER BY store_id LIMIT ?""",
-            (session_id, after_store_id, limit),
-        ).fetchall()
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            if conversation_id is None:
+                rows = conn.execute(
+                    f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                       WHERE session_id = ? AND store_id > ?
+                       ORDER BY store_id LIMIT ?""",
+                    (session_id, after_store_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                       WHERE session_id = ? AND store_id > ?
+                         AND (conversation_id = ? OR conversation_id = ''
+                              OR conversation_id IS NULL)
+                       ORDER BY store_id LIMIT ?""",
+                    (session_id, after_store_id, str(conversation_id), limit),
+                ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
+    def get_session_tail(
+        self,
+        session_id: str,
+        limit: int = 1000,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-               FROM (
-                   SELECT {_MESSAGE_SELECT_COLUMNS}
-                   FROM messages
-                   WHERE session_id = ?
-                   ORDER BY store_id DESC
-                   LIMIT ?
-               )
-               ORDER BY store_id""",
-            (session_id, limit),
-        ).fetchall()
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            rows = conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                   FROM (
+                       SELECT {_MESSAGE_SELECT_COLUMNS}
+                       FROM messages
+                       WHERE session_id = ?
+                       ORDER BY store_id DESC
+                       LIMIT ?
+                   )
+                   ORDER BY store_id""",
+                (session_id, limit),
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_count(self, session_id: str) -> int:
+    def get_session_count(
+        self,
+        session_id: str,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> int:
         """Count messages in a session."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
         return row[0] if row else 0
 
     def get_session_token_total(self, session_id: str) -> int:
         """Sum of token estimates for a session."""
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        with self._bounded_connection_access() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
         return row[0] if row else 0
 
     def get_source_stats(self, session_id: str | None = None) -> Dict[str, int]:
@@ -850,7 +1264,8 @@ class MessageStore:
             {where}
             """
         query_args: list[Any] = [_UNKNOWN_SOURCE, _UNKNOWN_SOURCE, *args]
-        row = self._conn.execute(query, query_args).fetchone()
+        with self._bounded_connection_access() as conn:
+            row = conn.execute(query, query_args).fetchone()
 
         messages_total = int(row[0] or 0) if row else 0
         normalized_unknown = int(row[1] or 0) if row else 0
@@ -868,95 +1283,98 @@ class MessageStore:
         """Per-session ``(session_id, message_count, token_total, node_count)``
         rows across messages and summary nodes, for ``/lcm doctor clean``
         candidate scanning. Callers own the pattern/protection policy."""
-        return self._conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id, COUNT(*) AS node_count
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            ORDER BY s.session_id
-            """
-        ).fetchall()
+        with self._bounded_connection_access() as conn:
+            return conn.execute(
+                """
+                WITH session_ids AS (
+                    SELECT session_id FROM messages
+                    UNION
+                    SELECT session_id FROM summary_nodes
+                ),
+                message_stats AS (
+                    SELECT session_id,
+                           COUNT(*) AS message_count,
+                           COALESCE(SUM(token_estimate), 0) AS token_total
+                    FROM messages
+                    GROUP BY session_id
+                ),
+                node_stats AS (
+                    SELECT session_id, COUNT(*) AS node_count
+                    FROM summary_nodes
+                    GROUP BY session_id
+                )
+                SELECT s.session_id,
+                       COALESCE(m.message_count, 0) AS message_count,
+                       COALESCE(m.token_total, 0) AS token_total,
+                       COALESCE(n.node_count, 0) AS node_count
+                FROM session_ids s
+                LEFT JOIN message_stats m ON m.session_id = s.session_id
+                LEFT JOIN node_stats n ON n.session_id = s.session_id
+                ORDER BY s.session_id
+                """
+            ).fetchall()
 
     def scan_session_retention_stats(self, session_id: str) -> List[tuple]:
         """Per-session activity/token stats for one session (messages + summary
         nodes), for ``/lcm doctor retention`` scanning. Callers own the
         staleness/protection policy."""
-        return self._conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total,
-                       MIN(timestamp) AS first_message_at,
-                       MAX(timestamp) AS last_message_at
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS node_count,
-                       COALESCE(SUM(token_count), 0) AS node_token_total,
-                       MIN(COALESCE(earliest_at, created_at)) AS first_node_at,
-                       MAX(COALESCE(latest_at, created_at)) AS last_node_at
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count,
-                   COALESCE(n.node_token_total, 0) AS node_token_total,
-                   m.first_message_at,
-                   m.last_message_at,
-                   n.first_node_at,
-                   n.last_node_at
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            WHERE s.session_id = ?
-            ORDER BY s.session_id
-            """,
-            (session_id,),
-        ).fetchall()
+        with self._bounded_connection_access() as conn:
+            return conn.execute(
+                """
+                WITH session_ids AS (
+                    SELECT session_id FROM messages
+                    UNION
+                    SELECT session_id FROM summary_nodes
+                ),
+                message_stats AS (
+                    SELECT session_id,
+                           COUNT(*) AS message_count,
+                           COALESCE(SUM(token_estimate), 0) AS token_total,
+                           MIN(timestamp) AS first_message_at,
+                           MAX(timestamp) AS last_message_at
+                    FROM messages
+                    GROUP BY session_id
+                ),
+                node_stats AS (
+                    SELECT session_id,
+                           COUNT(*) AS node_count,
+                           COALESCE(SUM(token_count), 0) AS node_token_total,
+                           MIN(COALESCE(earliest_at, created_at)) AS first_node_at,
+                           MAX(COALESCE(latest_at, created_at)) AS last_node_at
+                    FROM summary_nodes
+                    GROUP BY session_id
+                )
+                SELECT s.session_id,
+                       COALESCE(m.message_count, 0) AS message_count,
+                       COALESCE(m.token_total, 0) AS token_total,
+                       COALESCE(n.node_count, 0) AS node_count,
+                       COALESCE(n.node_token_total, 0) AS node_token_total,
+                       m.first_message_at,
+                       m.last_message_at,
+                       n.first_node_at,
+                       n.last_node_at
+                FROM session_ids s
+                LEFT JOIN message_stats m ON m.session_id = s.session_id
+                LEFT JOIN node_stats n ON n.session_id = s.session_id
+                WHERE s.session_id = ?
+                ORDER BY s.session_id
+                """,
+                (session_id,),
+            ).fetchall()
 
     def get_source_normalization_plan(self) -> Dict[str, Any]:
         """Return a dry-run plan for normalizing legacy blank source values."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        row = self._conn.execute(
-            f"""
-            SELECT COUNT(*) AS would_update_messages,
-                   COUNT(DISTINCT session_id) AS affected_sessions
-            FROM messages
-            WHERE {blank_clause}
-            """
-        ).fetchone()
+        with self._bounded_connection_access() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS would_update_messages,
+                       COUNT(DISTINCT session_id) AS affected_sessions
+                FROM messages
+                WHERE {blank_clause}
+                """
+            ).fetchone()
         would_update = int(row[0] or 0) if row else 0
         affected_sessions = int(row[1] or 0) if row else 0
         return {
@@ -984,37 +1402,59 @@ class MessageStore:
             "stats_after": stats_after,
         }
 
-    def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
+    def get_time_bounds(
+        self,
+        store_ids: List[int],
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> tuple[float | None, float | None]:
         if not store_ids:
             return None, None
         placeholders = ",".join("?" * len(store_ids))
-        row = self._conn.execute(
-            f"SELECT MIN(timestamp), MAX(timestamp) FROM messages WHERE store_id IN ({placeholders})",
-            store_ids,
-        ).fetchone()
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
+                f"SELECT MIN(timestamp), MAX(timestamp) FROM messages WHERE store_id IN ({placeholders})",
+                store_ids,
+            ).fetchone()
         if not row:
             return None, None
         return row[0], row[1]
 
     # -- Metadata key/value JSON --------------------------------------------
 
-    def read_metadata_json(self, key: str) -> Any:
+    def read_metadata_json(
+        self, key: str, *, deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+    ) -> Any:
         """Return the JSON-decoded value stored under ``key`` in the metadata table.
 
         Returns ``None`` when the connection is closed, the key is absent, or the
         stored value is empty. JSON decoding is deliberately *not* wrapped: a
         malformed value raises, so callers keep the ``try``/``except`` scoping
         that decides whether one bad key aborts a multi-key load or is skipped.
-        Reads are unlocked, matching the store's other read paths (``_write_lock``
-        guards writes only).
+        Reads share the connection lock with writes and deadline-aware calls so
+        no thread can strand another behind SQLite's per-connection C mutex.
         """
         conn = self._conn
         if conn is None:
             return None
-        row = conn.execute(
-            "SELECT value FROM metadata WHERE key = ?",
-            (key,),
-        ).fetchone()
+        with self._bounded_connection_access(
+            deadline=deadline, deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds, force_lock=True,
+        ) as conn:
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
         if not row or not row[0]:
             return None
         return json.loads(str(row[0]))
@@ -1175,18 +1615,19 @@ class MessageStore:
                     where.append("m.timestamp <= ?")
                     args.append(time_to)
                 args.extend([fetch_limit, offset])
-                rows = self._conn.execute(
-                    f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
-                              m.ingested_at, m.observed_at, m.observed_at_source,
-                              rank as search_rank,
-                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                       FROM messages_fts fts
-                       JOIN messages m ON m.store_id = fts.rowid
-                       WHERE {' AND '.join(where)}
-                       ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                    args,
-                ).fetchall()
+                with self._write_lock:
+                    rows = self._conn.execute(
+                        f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
+                                  m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
+                                  m.ingested_at, m.observed_at, m.observed_at_source,
+                                  rank as search_rank,
+                                  snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                           FROM messages_fts fts
+                           JOIN messages m ON m.store_id = fts.rowid
+                           WHERE {' AND '.join(where)}
+                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                        args,
+                    ).fetchall()
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
@@ -1377,14 +1818,15 @@ class MessageStore:
                 batch_limit = min(fetch_limit, candidate_cap - scanned_rows)
                 if batch_limit <= 0:
                     break
-                rows = self._conn.execute(
-                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                        FROM messages
-                        WHERE {' AND '.join(where)}
-                        {order_by}
-                        LIMIT ? OFFSET ?""",
-                    [*base_args, *order_args, batch_limit, offset],
-                ).fetchall()
+                with self._write_lock:
+                    rows = self._conn.execute(
+                        f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                            FROM messages
+                            WHERE {' AND '.join(where)}
+                            {order_by}
+                            LIMIT ? OFFSET ?""",
+                        [*base_args, *order_args, batch_limit, offset],
+                    ).fetchall()
                 scanned_rows += len(rows)
                 add_rows(rows)
                 offset += len(rows)
@@ -1394,14 +1836,15 @@ class MessageStore:
                     boundary_timestamp = rows[-1][8]
                     boundary_role_bias = _message_role_bias(rows[-1][3])
                     while True:
-                        tie_rows = self._conn.execute(
-                            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                                FROM messages
-                                WHERE {' AND '.join(where)}
-                                {order_by}
-                                LIMIT ? OFFSET ?""",
-                            [*base_args, *order_args, fetch_limit, offset],
-                        ).fetchall()
+                        with self._write_lock:
+                            tie_rows = self._conn.execute(
+                                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                                    FROM messages
+                                    WHERE {' AND '.join(where)}
+                                    {order_by}
+                                    LIMIT ? OFFSET ?""",
+                                [*base_args, *order_args, fetch_limit, offset],
+                            ).fetchall()
                         if not tie_rows:
                             break
                         matching_tie_rows = []
@@ -1454,14 +1897,15 @@ class MessageStore:
             offset = 0
             while offset < candidate_cap:
                 batch_limit = min(fetch_limit, candidate_cap - offset)
-                rows = self._conn.execute(
-                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                        FROM messages
-                        WHERE {' AND '.join(where)}
-                        {order_by}
-                        LIMIT ? OFFSET ?""",
-                    [*base_args, *order_args, *exact_args, batch_limit, offset],
-                ).fetchall()
+                with self._write_lock:
+                    rows = self._conn.execute(
+                        f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                            FROM messages
+                            WHERE {' AND '.join(where)}
+                            {order_by}
+                            LIMIT ? OFFSET ?""",
+                        [*base_args, *order_args, *exact_args, batch_limit, offset],
+                    ).fetchall()
                 if not rows:
                     break
                 add_rows(rows)
@@ -1511,6 +1955,12 @@ class MessageStore:
 
     # -- Connection access --------------------------------------------------
 
+    @contextmanager
+    def connection_access(self) -> Iterator[sqlite3.Connection]:
+        """Borrow the legacy connection under its shared serialization lock."""
+        with self._bounded_connection_access() as conn:
+            yield conn
+
     @property
     def connection(self) -> sqlite3.Connection | None:
         """The live SQLite connection, or ``None`` once :meth:`close` has run.
@@ -1530,7 +1980,8 @@ class MessageStore:
         the private connection. Requires a live connection: a closed store
         raises, matching direct ``_conn.commit()`` use.
         """
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.commit()
 
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.
@@ -1539,22 +1990,24 @@ class MessageStore:
         store without reaching its private connection. Requires a live
         connection, matching direct ``_conn.backup(dest)`` use.
         """
-        self._conn.backup(dest)
+        with self._write_lock:
+            self._conn.backup(dest)
 
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
-            conn.close()
-            self._conn = None
+        with self._write_lock:
+            conn = getattr(self, "_conn", None)
+            if conn:
+                # Graceful shutdown hygiene: checkpoint committed WAL frames before
+                # releasing the connection.  This does not run on crash/kill, and
+                # PASSIVE can leave frames behind when another reader is active.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass  # best-effort only; don't let this mask the real close()
+                conn.close()
+                self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

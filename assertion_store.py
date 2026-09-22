@@ -15,9 +15,11 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+import sys
 import threading
 import time
-from typing import Any, Iterable, Sequence
+from contextlib import contextmanager
+from typing import Any, Callable, Iterable, Iterator, Sequence
 from urllib.parse import quote
 
 from .db_bootstrap import (
@@ -89,6 +91,16 @@ class SourceSnapshot:
     content: str
     timestamp: float
     content_sha256: str
+
+
+@dataclass(frozen=True)
+class AssertionSchemaReadyToken:
+    """Opaque proof that one database inode passed full startup validation."""
+
+    database_path: str
+    device: int
+    inode: int
+    schema_cookie: int
 
 
 @dataclass(frozen=True)
@@ -215,45 +227,189 @@ def _bounded_probability(value: float | None, field: str) -> float | None:
 class AssertionStore:
     """SQLite assertion store bound to the same physical DB as ``MessageStore``."""
 
-    def __init__(self, db_path: str | Path, *, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        read_only: bool = False,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+        initialize_schema: bool | None = None,
+        schema_ready_token: AssertionSchemaReadyToken | None = None,
+    ):
         self.db_path = Path(db_path)
         self.read_only = bool(read_only)
+        self._open_deadline = deadline
+        self._open_deadline_clock = deadline_clock or time.monotonic
+        self._open_busy_timeout_ms = busy_timeout_ms
+        self._schema_ready_token = schema_ready_token
+        self._initialize_schema = (
+            self._open_deadline is None
+            if initialize_schema is None
+            else bool(initialize_schema)
+        )
+        if (
+            not self.read_only
+            and self._open_deadline is not None
+            and self._initialize_schema
+        ):
+            raise ValueError(
+                "deadline-owned AssertionStore opens must use "
+                "initialize_schema=False"
+            )
+        if not self._initialize_schema and self._schema_ready_token is None:
+            raise ValueError(
+                "initialize_schema=False requires a startup-issued "
+                "schema_ready_token"
+            )
         self._write_lock = threading.RLock()
         self._conn = self._open_connection()
         try:
             self._init_db()
-        except Exception:
+        except BaseException:
             self._conn.close()
             self._conn = None  # type: ignore[assignment]
             raise
 
+    def _require_open_deadline(self) -> float | None:
+        if self._open_deadline is None:
+            return None
+        remaining = float(self._open_deadline) - float(self._open_deadline_clock())
+        if remaining <= 0:
+            raise TimeoutError("assertion store open deadline exceeded")
+        return remaining
+
+    def _cap_open_busy_timeout(self, conn: sqlite3.Connection) -> float | None:
+        """Recalculate the SQLite wait cap before one constructor phase."""
+        remaining = self._require_open_deadline()
+        effective_busy_timeout_ms = self._open_busy_timeout_ms
+        if remaining is not None:
+            remaining_ms = max(0, int(remaining * 1000))
+            effective_busy_timeout_ms = (
+                remaining_ms
+                if effective_busy_timeout_ms is None
+                else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+            )
+        if effective_busy_timeout_ms is not None:
+            conn.execute(
+                f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+            )
+            self._require_open_deadline()
+        return remaining
+
     def _open_connection(self) -> sqlite3.Connection:
         if self.read_only:
+            remaining = self._require_open_deadline()
             uri = f"file:{quote(str(self.db_path), safe='/')}?mode=ro"
             conn = sqlite3.connect(
                 uri,
                 uri=True,
-                timeout=5.0,
+                timeout=(5.0 if remaining is None else min(5.0, remaining)),
                 check_same_thread=False,
                 isolation_level=None,
             )
-            conn.execute("PRAGMA query_only=ON")
-            conn.execute("PRAGMA busy_timeout=30000")
+            try:
+                conn.execute("PRAGMA query_only=ON")
+                busy_timeout_ms = 30_000
+                if remaining is not None:
+                    busy_timeout_ms = min(
+                        busy_timeout_ms,
+                        max(0, int(remaining * 1000)),
+                    )
+                conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+                self._require_open_deadline()
+            except BaseException:
+                conn.close()
+                raise
         else:
-            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            remaining = self._require_open_deadline()
+            connection_target = str(self.db_path)
+            connection_is_uri = False
+            if self._initialize_schema:
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                # mode=rw is the fail-closed half of schema-ready operation:
+                # a late/misdirected worker must not create an empty database
+                # (or its parent directory) before discovering no schema.
+                connection_target = (
+                    f"file:{quote(str(self.db_path), safe='/')}?mode=rw"
+                )
+                connection_is_uri = True
             conn = sqlite3.connect(
-                str(self.db_path),
-                timeout=5.0,
+                connection_target,
+                uri=connection_is_uri,
+                timeout=(5.0 if remaining is None else min(5.0, remaining)),
                 check_same_thread=False,
                 isolation_level=None,
             )
-            refuse_schema_version_too_new(conn)
-            configure_connection(conn)
+            try:
+                self._cap_open_busy_timeout(conn)
+                if self._initialize_schema:
+                    refuse_schema_version_too_new(conn)
+                    configure_connection(conn)
+                else:
+                    # The foreground-owned assertion daemon must never enter the
+                    # 30-second first-boot WAL conversion/migration path.  The
+                    # engine's primary store initialized this schema before work
+                    # can be scheduled; this connection only validates that fact.
+                    journal_mode = str(
+                        conn.execute("PRAGMA journal_mode").fetchone()[0]
+                    ).strip().casefold()
+                    self._require_open_deadline()
+                    if journal_mode != "wal":
+                        raise AssertionSchemaUnavailableError(
+                            "schema-ready assertion worker requires an existing WAL database"
+                        )
+                    self._cap_open_busy_timeout(conn)
+                    conn.execute("PRAGMA synchronous=FULL")
+                    self._require_open_deadline()
+            except BaseException:
+                conn.close()
+                raise
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _verify_schema_ready(self) -> None:
+        """Validate an exact startup proof without migration or schema scans."""
+        token = self._schema_ready_token
+        if token is None:  # Constructor validation keeps this defensive only.
+            raise AssertionSchemaUnavailableError(
+                "schema-ready assertion worker is missing its startup proof"
+            )
+
+        self._require_open_deadline()
+        try:
+            resolved_path = self.db_path.resolve(strict=True)
+            file_stat = resolved_path.stat()
+        except OSError as exc:
+            raise AssertionSchemaUnavailableError(
+                "schema-ready assertion database is unavailable"
+            ) from exc
+        self._require_open_deadline()
+        if (
+            str(resolved_path) != token.database_path
+            or int(file_stat.st_dev) != token.device
+            or int(file_stat.st_ino) != token.inode
+        ):
+            raise AssertionSchemaUnavailableError(
+                "schema-ready assertion worker database does not match its startup proof"
+            )
+
+        self._cap_open_busy_timeout(self._conn)
+        row = self._conn.execute("PRAGMA schema_version").fetchone()
+        self._require_open_deadline()
+        schema_cookie = int(row[0]) if row is not None else -1
+        if schema_cookie != token.schema_cookie:
+            raise AssertionSchemaUnavailableError(
+                "assertion schema changed after startup validation"
+            )
+
     def _init_db(self) -> None:
         if self.read_only:
+            if self._open_deadline is not None:
+                self._verify_schema_ready()
+                return
             findings = verify_assertion_schema(self._conn)
             if findings:
                 raise AssertionSchemaUnavailableError(
@@ -262,10 +418,18 @@ class AssertionStore:
                 )
             return
 
+        self._require_open_deadline()
+        if not self._initialize_schema:
+            self._verify_schema_ready()
+            return
+
         run_versioned_migrations(self._conn)
-        ensure_assertion_tables(self._conn)
         findings = verify_assertion_schema(self._conn)
         if findings:
+            # Avoid unconditional DROP/CREATE churn on an already-valid
+            # schema. The gateway and dashboard are independent processes;
+            # a no-op second startup must not change SQLite's schema cookie
+            # and invalidate a worker proof issued by the first process.
             ensure_assertion_tables(self._conn)
             findings = verify_assertion_schema(self._conn)
             if findings:
@@ -279,20 +443,50 @@ class AssertionStore:
         ).fetchone()
         if marker is None:
             mark_migration_step_complete(self._conn, ASSERTION_MIGRATION_STEP)
+        self._require_open_deadline()
         self._conn.commit()
+        self._require_open_deadline()
 
     @property
     def connection(self) -> sqlite3.Connection:
         return self._conn
 
-    def close(self) -> None:
+    def issue_schema_ready_token(self) -> AssertionSchemaReadyToken:
+        """Issue an opaque worker proof after full, non-deadline startup validation."""
+        if self._open_deadline is not None or not self._initialize_schema:
+            raise AssertionStoreError(
+                "schema-ready tokens may only be issued by the startup owner"
+            )
+        with self._write_lock:
+            conn = self._conn
+            if conn is None:
+                raise AssertionStoreError("assertion store is closed")
+            findings = verify_assertion_schema(conn)
+            if findings:
+                raise AssertionSchemaUnavailableError(
+                    "cannot issue schema-ready token: " + "; ".join(findings)
+                )
+            resolved_path = self.db_path.resolve(strict=True)
+            file_stat = resolved_path.stat()
+            row = conn.execute("PRAGMA schema_version").fetchone()
+            return AssertionSchemaReadyToken(
+                database_path=str(resolved_path),
+                device=int(file_stat.st_dev),
+                inode=int(file_stat.st_ino),
+                schema_cookie=int(row[0]) if row is not None else -1,
+            )
+
+    def close(self, *, commit: bool = True) -> None:
         with self._write_lock:
             conn = self._conn
             if conn is None:
                 return
             try:
                 if not self.read_only:
-                    conn.commit()
+                    if commit:
+                        conn.commit()
+                    elif conn.in_transaction:
+                        conn.rollback()
             finally:
                 conn.close()
                 self._conn = None  # type: ignore[assignment]
@@ -311,16 +505,183 @@ class AssertionStore:
         self._require_writable()
         self._conn.execute("BEGIN IMMEDIATE")
 
-    def _source_row(self, store_id: int) -> sqlite3.Row | None:
-        return self._conn.execute(
-            """
-            SELECT store_id, session_id, source, role, content, timestamp,
-                   observed_at
-            FROM messages
-            WHERE store_id = ?
-            """,
-            (int(store_id),),
-        ).fetchone()
+    @contextmanager
+    def _bounded_read_connection(
+        self,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Borrow the shared assertion connection within an absolute deadline."""
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, float(deadline) - float(clock()))
+
+        remaining = remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("assertion store read deadline exceeded")
+        effective_lock_timeout = lock_timeout_seconds
+        if remaining is not None:
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+        if effective_lock_timeout is None:
+            acquired = bool(self._write_lock.acquire())
+        else:
+            acquired = bool(
+                self._write_lock.acquire(
+                    timeout=max(0.0, float(effective_lock_timeout))
+                )
+            )
+        if not acquired:
+            raise TimeoutError("assertion store lock deadline exceeded")
+
+        conn = self._conn
+        prior_busy_timeout: int | None = None
+        try:
+            if conn is None:
+                raise RuntimeError("assertion store is closed")
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("assertion store read deadline exceeded")
+            effective_busy_timeout_ms = busy_timeout_ms
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            if effective_busy_timeout_ms is not None:
+                prior_busy_timeout = int(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                )
+                conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+                )
+            yield conn
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("assertion store read deadline exceeded")
+        finally:
+            try:
+                if conn is not None and prior_busy_timeout is not None:
+                    primary_error_active = sys.exc_info()[0] is not None
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={prior_busy_timeout}")
+                    except Exception:
+                        if not primary_error_active:
+                            raise
+            finally:
+                self._write_lock.release()
+
+    @contextmanager
+    def _bounded_write_connection(
+        self,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Borrow the writer within one absolute caller deadline."""
+        clock = deadline_clock or time.monotonic
+
+        def require_active() -> float | None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TimeoutError("assertion publication was cancelled")
+            if deadline is None:
+                return None
+            remaining = float(deadline) - float(clock())
+            if remaining <= 0:
+                raise TimeoutError("assertion publication deadline exceeded")
+            return remaining
+
+        remaining = require_active()
+        effective_lock_timeout = lock_timeout_seconds
+        if remaining is not None:
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+        if effective_lock_timeout is None:
+            acquired = bool(self._write_lock.acquire())
+        else:
+            acquired = bool(
+                self._write_lock.acquire(
+                    timeout=max(0.0, float(effective_lock_timeout))
+                )
+            )
+        if not acquired:
+            raise TimeoutError("assertion publication lock deadline exceeded")
+
+        conn = self._conn
+        prior_busy_timeout: int | None = None
+        try:
+            if conn is None:
+                raise RuntimeError("assertion store is closed")
+            remaining = require_active()
+            effective_busy_timeout_ms = busy_timeout_ms
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            if effective_busy_timeout_ms is not None:
+                prior_busy_timeout = int(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                )
+                conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+                )
+            yield conn
+        finally:
+            try:
+                if conn is not None and prior_busy_timeout is not None:
+                    primary_error_active = sys.exc_info()[0] is not None
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={prior_busy_timeout}")
+                    except Exception:
+                        if not primary_error_active:
+                            raise
+            finally:
+                self._write_lock.release()
+
+    def _source_row(
+        self,
+        store_id: int,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> sqlite3.Row | None:
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            return conn.execute(
+                """
+                SELECT store_id, session_id, source, role, content, timestamp,
+                       observed_at
+                FROM messages
+                WHERE store_id = ?
+                """,
+                (int(store_id),),
+            ).fetchone()
 
     @staticmethod
     def _snapshot_from_row(row: sqlite3.Row) -> SourceSnapshot:
@@ -339,8 +700,22 @@ class AssertionStore:
             content_sha256=_sha256_text(content),
         )
 
-    def snapshot_source(self, store_id: int) -> SourceSnapshot:
-        row = self._source_row(store_id)
+    def snapshot_source(
+        self,
+        store_id: int,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> SourceSnapshot:
+        row = self._source_row(
+            store_id,
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        )
         if row is None:
             raise KeyError(f"message store_id {store_id} does not exist")
         return self._snapshot_from_row(row)
@@ -350,18 +725,28 @@ class AssertionStore:
         snapshot: SourceSnapshot,
         *,
         extraction_version: str = CURRENT_EXTRACTION_VERSION,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> bool:
         """Return whether this exact source hash already has an active receipt."""
         version = _validated_version(extraction_version)
-        return self._conn.execute(
-            """
-            SELECT 1
-            FROM lcm_assertion_sources
-            WHERE source_store_id = ? AND extraction_version = ?
-              AND source_content_sha256 = ? AND invalidated_at IS NULL
-            """,
-            (snapshot.store_id, version, snapshot.content_sha256),
-        ).fetchone() is not None
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            return conn.execute(
+                """
+                SELECT 1
+                FROM lcm_assertion_sources
+                WHERE source_store_id = ? AND extraction_version = ?
+                  AND source_content_sha256 = ? AND invalidated_at IS NULL
+                """,
+                (snapshot.store_id, version, snapshot.content_sha256),
+            ).fetchone() is not None
 
     def plan_rebuild(
         self,
@@ -525,6 +910,11 @@ class AssertionStore:
         *,
         relations: Sequence[AssertionRelationCandidate] = (),
         extraction_version: str = CURRENT_EXTRACTION_VERSION,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> PublishResult:
         """Atomically publish one already-derived source generation.
 
@@ -535,6 +925,15 @@ class AssertionStore:
         extraction version.
         """
         self._require_writable()
+        clock = deadline_clock or time.monotonic
+
+        def require_active() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise TimeoutError("assertion publication was cancelled")
+            if deadline is not None and float(clock()) >= float(deadline):
+                raise TimeoutError("assertion publication deadline exceeded")
+
+        require_active()
         version = _validated_version(extraction_version)
         if len(candidates) > _MAX_CANDIDATES_PER_SOURCE:
             raise ValueError(
@@ -566,10 +965,26 @@ class AssertionStore:
         assertion_ids = tuple(str(row["assertion_id"]) for row in assertion_rows)
         relation_ids = tuple(str(row["relation_id"]) for row in relation_rows)
 
-        with self._write_lock:
-            self._begin_write()
+        require_active()
+        with self._bounded_write_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+            cancel_event=cancel_event,
+        ) as conn:
             try:
-                current_row = self._source_row(snapshot.store_id)
+                self._begin_write()
+                require_active()
+                current_row = conn.execute(
+                    """
+                    SELECT store_id, session_id, source, role, content, timestamp,
+                           observed_at
+                    FROM messages
+                    WHERE store_id = ?
+                    """,
+                    (int(snapshot.store_id),),
+                ).fetchone()
                 if current_row is None:
                     raise AssertionSourceStaleError(
                         f"source store_id {snapshot.store_id} was deleted before publication"
@@ -579,7 +994,7 @@ class AssertionStore:
                     raise AssertionSourceStaleError(
                         f"source store_id {snapshot.store_id} changed before publication"
                     )
-                existing = self._conn.execute(
+                existing = conn.execute(
                     """
                     SELECT source_content_sha256, candidate_digest, assertion_count, relation_count
                     FROM lcm_assertion_sources
@@ -595,7 +1010,8 @@ class AssertionStore:
                         and int(existing["assertion_count"]) == len(assertion_rows)
                         and int(existing["relation_count"]) == len(relation_rows)
                     ):
-                        self._conn.execute("COMMIT")
+                        require_active()
+                        conn.execute("COMMIT")
                         return PublishResult(
                             source_store_id=snapshot.store_id,
                             extraction_version=version,
@@ -610,7 +1026,7 @@ class AssertionStore:
                         "and extraction version; bump the extraction version"
                     )
 
-                historical = self._conn.execute(
+                historical = conn.execute(
                     """
                     SELECT candidate_digest, assertion_count, relation_count
                     FROM lcm_assertion_sources
@@ -629,7 +1045,7 @@ class AssertionStore:
                             "historical output differs for this source hash and extraction "
                             "version; bump the extraction version"
                         )
-                    self._conn.execute(
+                    conn.execute(
                         """
                         UPDATE lcm_assertion_sources
                            SET source_session_id = ?, source_role = ?, source_name = ?,
@@ -649,7 +1065,8 @@ class AssertionStore:
                             snapshot.content_sha256,
                         ),
                     )
-                    self._conn.execute("COMMIT")
+                    require_active()
+                    conn.execute("COMMIT")
                     return PublishResult(
                         source_store_id=snapshot.store_id,
                         extraction_version=version,
@@ -660,7 +1077,7 @@ class AssertionStore:
                         already_current=True,
                     )
 
-                self._conn.execute(
+                conn.execute(
                     """
                     INSERT INTO lcm_assertion_sources(
                         source_store_id, extraction_version, source_content_sha256,
@@ -683,7 +1100,7 @@ class AssertionStore:
                     ),
                 )
                 for row in assertion_rows:
-                    self._conn.execute(
+                    conn.execute(
                         """
                         INSERT INTO lcm_assertions(
                             assertion_id, source_store_id, extraction_version,
@@ -706,7 +1123,7 @@ class AssertionStore:
                 for row in relation_rows:
                     endpoints = (row["from_assertion_id"], row["to_assertion_id"])
                     for endpoint in endpoints:
-                        active_endpoint = self._conn.execute(
+                        active_endpoint = conn.execute(
                             """
                             SELECT 1
                             FROM lcm_assertions AS a
@@ -723,7 +1140,7 @@ class AssertionStore:
                             raise ValueError(
                                 f"relation endpoint {endpoint} is missing or invalidated"
                             )
-                    self._conn.execute(
+                    conn.execute(
                         """
                         INSERT INTO lcm_assertion_relations(
                             relation_id, source_store_id, extraction_version,
@@ -739,9 +1156,11 @@ class AssertionStore:
                         """,
                         {**row, "created_at": time.time()},
                     )
-                self._conn.execute("COMMIT")
+                require_active()
+                conn.execute("COMMIT")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 raise
 
         return PublishResult(
@@ -791,6 +1210,10 @@ class AssertionStore:
         as_of: float | None = None,
         include_invalidated: bool = False,
         limit: int = 100,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> list[dict[str, Any]]:
         """Query source-valid assertions with bitemporal historical filtering."""
         version = _validated_version(extraction_version)
@@ -838,43 +1261,51 @@ class AssertionStore:
             ])
             args.extend([boundary, boundary, boundary])
         args.append(bounded_limit)
-        rows = self._conn.execute(
-            f"""
-            SELECT a.*, s.source_session_id, s.source_role, s.source_name,
-                   s.source_timestamp, s.invalidated_at, s.invalidation_reason,
-                   m.content AS current_source_content,
-                   m.session_id AS current_source_session_id
-            FROM lcm_assertions AS a
-            JOIN lcm_assertion_sources AS s
-              ON s.source_store_id = a.source_store_id
-             AND s.extraction_version = a.extraction_version
-             AND s.source_content_sha256 = a.source_content_sha256
-            LEFT JOIN messages AS m ON m.store_id = a.source_store_id
-            WHERE {' AND '.join(where)}
-            ORDER BY a.observed_at DESC, a.assertion_id ASC
-            LIMIT ?
-            """,
-            args,
-        ).fetchall()
-        output: list[dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            content = item.pop("current_source_content", None)
-            if item.get("invalidated_at") is None:
-                self._validate_source_provenance(
-                    content=content,
-                    expected_sha256=item["source_content_sha256"],
-                    span_start=item["source_span_start"],
-                    span_end=item["source_span_end"],
-                    quote=item["source_quote"],
-                    label=f"assertion source {item['source_store_id']}",
-                )
-            try:
-                item["object_value"] = json.loads(str(item.pop("object_json")))
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise AssertionStoreError("stored assertion object_json is invalid") from exc
-            output.append(item)
-        return output
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT a.*, s.source_session_id, s.source_role, s.source_name,
+                       s.source_timestamp, s.invalidated_at, s.invalidation_reason,
+                       m.content AS current_source_content,
+                       m.session_id AS current_source_session_id
+                FROM lcm_assertions AS a
+                JOIN lcm_assertion_sources AS s
+                  ON s.source_store_id = a.source_store_id
+                 AND s.extraction_version = a.extraction_version
+                 AND s.source_content_sha256 = a.source_content_sha256
+                LEFT JOIN messages AS m ON m.store_id = a.source_store_id
+                WHERE {' AND '.join(where)}
+                ORDER BY a.observed_at DESC, a.assertion_id ASC
+                LIMIT ?
+                """,
+                args,
+            ).fetchall()
+            output: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                content = item.pop("current_source_content", None)
+                if item.get("invalidated_at") is None:
+                    self._validate_source_provenance(
+                        content=content,
+                        expected_sha256=item["source_content_sha256"],
+                        span_start=item["source_span_start"],
+                        span_end=item["source_span_end"],
+                        quote=item["source_quote"],
+                        label=f"assertion source {item['source_store_id']}",
+                    )
+                try:
+                    item["object_value"] = json.loads(str(item.pop("object_json")))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise AssertionStoreError(
+                        "stored assertion object_json is invalid"
+                    ) from exc
+                output.append(item)
+            return output
 
     def query_relations(
         self,

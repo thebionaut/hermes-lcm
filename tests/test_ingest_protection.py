@@ -970,6 +970,7 @@ def test_tool_result_ingest_preserves_active_context_while_protecting_storage(tm
 
 
 def test_preflight_storage_protection_does_not_force_noop_compaction(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         large_output_externalization_path=str(tmp_path / "externalized"),
@@ -2892,6 +2893,7 @@ def test_repetitive_assistant_output_is_quarantined_before_sqlite_and_fts(tmp_pa
 
 
 def test_quarantined_assistant_output_does_not_enter_summaries_or_active_context(tmp_path, monkeypatch):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=1,
@@ -2931,6 +2933,7 @@ def test_quarantined_assistant_output_does_not_enter_summaries_or_active_context
 
 
 def test_quarantined_assistant_output_does_not_enter_summaries_or_active_context_after_preflight(tmp_path, monkeypatch):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=1,
@@ -2971,6 +2974,7 @@ def test_quarantined_assistant_output_does_not_enter_summaries_or_active_context
 
 
 def test_preflight_quarantined_assistant_rebind_keeps_durable_placeholder(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
@@ -3021,6 +3025,7 @@ def test_preflight_quarantined_assistant_rebind_keeps_durable_placeholder(tmp_pa
 
 
 def test_dynamic_quarantined_assistant_pressure_continues_after_first_leaf_pass(tmp_path, monkeypatch):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=1,
@@ -3063,6 +3068,7 @@ def test_dynamic_quarantined_assistant_pressure_continues_after_first_leaf_pass(
 
 
 def test_quarantined_assistant_tool_call_content_does_not_enter_summarization(tmp_path, monkeypatch):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=1,
@@ -3106,6 +3112,7 @@ def test_quarantined_assistant_tool_call_content_does_not_enter_summarization(tm
 
 
 def test_quarantined_assistant_tool_call_content_is_removed_from_noop_active_replay(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
@@ -3140,6 +3147,7 @@ def test_quarantined_assistant_tool_call_content_is_removed_from_noop_active_rep
 
 
 def test_quarantined_assistant_rebind_reconciliation_does_not_duplicate_rows(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
@@ -3293,6 +3301,7 @@ def test_ignore_message_patterns_remain_storage_only_for_compress_replay(tmp_pat
 
 
 def test_quarantined_assistant_preflight_requests_cleanup_when_no_compaction_needed(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
@@ -3409,6 +3418,7 @@ def test_ignored_quarantined_assistant_rebind_reconciliation_does_not_duplicate_
 
 
 def test_existing_quarantined_assistant_row_rebinds_after_ignore_pattern_added(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
@@ -3452,6 +3462,7 @@ def test_existing_quarantined_assistant_row_rebinds_after_ignore_pattern_added(t
 
 
 def test_nonmatching_ignore_pattern_preserves_existing_quarantine_rebind_prefix(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
@@ -3497,6 +3508,7 @@ def test_nonmatching_ignore_pattern_preserves_existing_quarantine_rebind_prefix(
 
 
 def test_singleton_quarantined_assistant_row_rebinds_after_ignore_pattern_added(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
@@ -3534,6 +3546,7 @@ def test_singleton_quarantined_assistant_row_rebinds_after_ignore_pattern_added(
 
 
 def test_singleton_quarantined_assistant_rebind_reconciliation_does_not_duplicate_row(tmp_path):
+    (tmp_path / "externalized").mkdir()
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,

@@ -333,11 +333,19 @@ class PlaceholderLedgerMixin:
     def _generated_placeholder_digest_ordinals_for_active_replay(
         self,
         active_replay_messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
     ) -> dict[str, set[int]]:
         generated_hashes = self._load_generated_ignored_placeholder_hashes()
         if not generated_hashes or not active_replay_messages:
             return {}
-        stored_message_ids = set(self._get_store_id_map_for_messages(active_replay_messages))
+        stored_message_ids = set(
+            self._call_with_foreground_deadline(
+                self._get_store_id_map_for_messages,
+                active_replay_messages,
+                deadline=deadline,
+            )
+        )
         occurrence_by_digest: dict[str, int] = {}
         ordinals: dict[str, set[int]] = {}
         for msg in active_replay_messages:
@@ -354,11 +362,19 @@ class PlaceholderLedgerMixin:
     def _generated_placeholder_digest_budget_for_active_replay(
         self,
         active_replay_messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
     ) -> dict[str, int]:
         generated_hashes = self._load_generated_ignored_placeholder_hashes()
         if not generated_hashes or not active_replay_messages:
             return {}
-        stored_message_ids = set(self._get_store_id_map_for_messages(active_replay_messages))
+        stored_message_ids = set(
+            self._call_with_foreground_deadline(
+                self._get_store_id_map_for_messages,
+                active_replay_messages,
+                deadline=deadline,
+            )
+        )
         budget: dict[str, int] = {}
         for msg in active_replay_messages:
             if id(msg) in stored_message_ids:
@@ -408,7 +424,23 @@ class PlaceholderLedgerMixin:
                 adjusted[digest] = remaining
         return adjusted
 
-    def _remember_generated_ignored_placeholder_hash(self, digest: str) -> None:
+    def _remember_generated_ignored_placeholder_hash(
+        self,
+        digest: str,
+        *,
+        persist: bool = True,
+    ) -> None:
+        if not persist:
+            if re.fullmatch(r"[0-9a-f]{16}", digest):
+                hashes = getattr(
+                    self,
+                    "_generated_ignored_active_replay_placeholder_hashes",
+                    set(),
+                )
+                self._generated_ignored_active_replay_placeholder_hashes = (
+                    set(hashes) | {digest}
+                )
+            return
         ordered_hashes = self._remember_hash_for_metadata_keys(
             digest,
             self._ignored_placeholder_metadata_keys(),
@@ -593,11 +625,19 @@ class PlaceholderLedgerMixin:
         self,
         messages: List[Dict[str, Any]],
         records: list[dict[str, str]],
+        *,
+        deadline: float | None = None,
     ) -> List[Dict[str, Any]]:
         if not records or not messages:
             return messages
         previous_store_id_map = self._current_compress_store_ids_by_message_id
-        self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(messages)
+        self._current_compress_store_ids_by_message_id = (
+            self._call_with_foreground_deadline(
+                self._get_store_id_map_for_messages,
+                messages,
+                deadline=deadline,
+            )
+        )
         try:
             drop_from = len(messages)
             idx = len(messages) - 1
@@ -637,6 +677,7 @@ class PlaceholderLedgerMixin:
         *,
         scan_start: int = 0,
         ignored_messages: Optional[List[bool]] = None,
+        persist_metadata: bool = True,
     ) -> List[Dict[str, Any]]:
         if not self._compiled_ignore_message_patterns:
             return replay_messages
@@ -681,7 +722,10 @@ class PlaceholderLedgerMixin:
             else:
                 active_message = {"role": "user", "content": placeholder}
             digest = hashlib.sha256(original_text.encode("utf-8")).hexdigest()[:16]
-            self._remember_generated_ignored_placeholder_hash(digest)
+            self._remember_generated_ignored_placeholder_hash(
+                digest,
+                persist=persist_metadata,
+            )
             self._generated_ignored_active_replay_placeholder_message_ids.add(id(active_message))
             active_replay_messages[idx] = active_message
         return active_replay_messages

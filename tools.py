@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -30,6 +33,7 @@ from .diagnostics import (
     doctor_guidance_for_checks,
 )
 from .dag import build_nodes_fts_spec
+from .background_compaction import background_policy_fingerprint
 from .db_bootstrap import (
     check_external_content_fts_integrity,
     inspect_lcm_schema_health,
@@ -44,6 +48,7 @@ from .ingest_protection import (
     scan_sqlite_payload_risks,
     sensitive_pattern_status,
 )
+from .invariant_audit import audit_compaction_invariants
 from .model_routing import apply_lcm_model_route
 from .assertion_state import query_assertion_state
 from .assertion_store import ASSERTION_KINDS
@@ -555,6 +560,7 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
         "runtime_identity",
         "lineage",
         "messages",
+        "background_compaction",
         "compaction",
         "dag",
         "externalized_refs",
@@ -595,6 +601,567 @@ def _bounded_inspect_json(response: dict[str, Any]) -> str:
         compact["truncation"]["omitted_top_level_sections"] = omitted
         encoded = json.dumps(compact, ensure_ascii=False)
     return encoded
+
+
+_BACKGROUND_DIAGNOSTIC_REASONS = frozenset({
+    "background_summary_prepared",
+    "prepared_summary_published",
+    "degraded_reference_published",
+    "prepared_summary_superseded",
+    "foreground_emergency_compaction",
+    "provider_timeout",
+    "lease_expiration",
+    "sqlite_lock_contention",
+    "worker_unavailable",
+    "no_eligible_raw_range",
+    "session_reset_fence",
+    "canonical_prefix_adopted",
+    "partial_atomic_repair_pending",
+    "partial_atomic_repair_published",
+    "insufficient_compressible_source",
+    "non_compressing_output",
+    "provider_connection_error",
+    "provider_auth_error",
+    "provider_quota",
+    "provider_rate_limit",
+    "invalid_provider_response",
+    "provider_circuit_open",
+    "provider_spend_guard",
+    "reasoning_only_output",
+    "foreground_deadline_exhausted",
+    "stale_lease",
+})
+
+_BACKGROUND_COMPATIBILITY_BLOCKERS = frozenset({
+    "file_extraction_requires_foreground_compaction",
+    "assertion_extraction_requires_foreground_compaction",
+})
+
+
+def _opaque_operator_hint(value: object) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _sanitize_background_error(value: object) -> tuple[str, bool]:
+    """Bound and redact common credential shapes in worker/provider errors."""
+    text, truncated = _bounded_operator_field(value)
+    text = re.sub(
+        r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+",
+        r"\1 [redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password|authorization)\b"
+        r"\s*[:=]\s*[^\s,;]+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:sk-ant-|sk-|gh[pousr]_|xox[baprs]-)[a-z0-9._=-]{8,}",
+        "[redacted credential]",
+        text,
+    )
+    private_key_at = text.lower().find("-----begin ")
+    if private_key_at >= 0 and "private key-----" in text[private_key_at:].lower():
+        text = text[:private_key_at] + "[redacted private key]"
+        truncated = True
+    return text, truncated
+
+
+def _sanitize_persisted_background_error(value: object) -> tuple[str, bool]:
+    """Expose only the allowlisted durable error format from current builds."""
+    text = str(value or "").strip()
+    if not text:
+        return "", False
+    if re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,64}:"
+        r"(?:timeout|connection_error|auth_error|quota|rate_limit|"
+        r"invalid_response|sqlite_busy|provider_error|circuit_open|spend_guard|"
+        r"reasoning_only|non_compressing|insufficient_source|stale_lease)"
+        r"(?::http_[1-9][0-9]{2})?",
+        text,
+    ):
+        return text, False
+    return "background_error:redacted", True
+
+
+def _background_result_payload(value: Any) -> Any:
+    if not isinstance(value, dict):
+        bounded, _truncated = _sanitize_background_error(value)
+        return bounded or None
+    result = {
+        key: value.get(key)
+        for key in (
+            "status",
+            "reason",
+            "at",
+            "duration_ms",
+            "expected_frontier_store_id",
+            "captured_watermark_store_id",
+            "frontier_store_id",
+            "debt_tokens",
+        )
+        if key in value
+    }
+    if value.get("job_id"):
+        result["job_hint"] = _opaque_operator_hint(value.get("job_id"))
+    for key in ("status", "reason"):
+        if key in result:
+            result[key], _truncated = _sanitize_background_error(result[key])
+    bounded, truncated = _bound_operator_strings(result)
+    if truncated:
+        bounded["truncated"] = True
+    return bounded
+
+
+def _background_compaction_status_payload(engine: "LCMEngine") -> dict[str, Any]:
+    """Return bounded background status without raw job or lease identifiers."""
+    configured_enabled = bool(
+        getattr(engine._config, "background_compaction_enabled", False)
+    )
+    configured_workers = max(
+        0, int(getattr(engine._config, "background_compaction_workers", 1) or 0)
+    )
+    configured_global_limit = min(
+        2,
+        max(
+            0,
+            int(
+                getattr(engine._config, "background_compaction_global_limit", 2)
+                or 0
+            ),
+        ),
+    )
+    configured_backlog = max(
+        0,
+        int(
+            getattr(engine._config, "background_compaction_backlog_tokens", 32_000)
+            or 0
+        ),
+    )
+    configured_minimum_provider_source = max(
+        1,
+        int(
+            getattr(
+                engine._config,
+                "background_compaction_min_provider_source_tokens",
+                256,
+            )
+            or 256
+        ),
+    )
+    try:
+        configured_prepare_ratio = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    getattr(engine._config, "background_compaction_prepare_ratio", 0.55)
+                    or 0.0
+                ),
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        configured_prepare_ratio = 0.55
+    try:
+        raw = engine.get_background_compaction_status() or {}
+        if not isinstance(raw, dict):
+            raise TypeError("background status is not a mapping")
+    except Exception as exc:  # pragma: no cover - defensive diagnostics path
+        error = (
+            re.sub(r"[^A-Za-z0-9_.-]", "", type(exc).__name__)[:64]
+            or "BackgroundStatusError"
+        ) + ":status_unavailable"
+        truncated = False
+        return {
+            "configured_enabled": configured_enabled,
+            "enabled": False,
+            "compatibility_blocked_reason": None,
+            "worker_count": configured_workers,
+            "global_limit": configured_global_limit,
+            "worker_available": False,
+            "queued_jobs": 0,
+            "running_jobs": 0,
+            "prepared_jobs": 0,
+            "retry_jobs": 0,
+            "published_jobs": 0,
+            "published_summary_jobs": 0,
+            "published_reference_jobs": 0,
+            "superseded_jobs": 0,
+            "failed_jobs": 0,
+            "active_provider_permits": 0,
+            "active_non_timed_out_provider_permits": 0,
+            "timed_out_provider_permits": 0,
+            "provider_permit_oldest_age_seconds": None,
+            "provider_permit_min_lease_remaining_seconds": None,
+            "oldest_queued_job_age_seconds": None,
+            "current_job": None,
+            "publication_fence": None,
+            "current_debt_tokens": 0,
+            "last_preparation_result": None,
+            "last_publication_result": None,
+            "last_publication_telemetry": None,
+            "last_provider_attempt": None,
+            "recent_provider_outcomes": {},
+            "provider_attribution": {
+                "prepared_nodes": 0,
+                "attributed_nodes": 0,
+                "coverage_ratio": 0.0,
+            },
+            "range_dispositions": {},
+            "durable_event_counts": {},
+            "durable_event_reasons": [],
+            "backlog_trigger_tokens": configured_backlog,
+            "minimum_provider_source_tokens": configured_minimum_provider_source,
+            "prepare_ratio": configured_prepare_ratio,
+            "publication_trigger_tokens": 0,
+            "emergency_trigger_tokens": 0,
+            "durable_frontier_store_id": 0,
+            "active_coverage": "raw",
+            "diagnostic_reasons": (
+                ["worker_unavailable"] if configured_enabled else []
+            ),
+            "status_error": error,
+            **({"truncated": True} if truncated else {}),
+        }
+
+    def _integer(mapping: dict[str, Any], key: str, fallback: str = "") -> int:
+        value = mapping.get(key)
+        if value is None and fallback:
+            value = mapping.get(fallback)
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _number(mapping: dict[str, Any], key: str) -> float | int | None:
+        value = mapping.get(key)
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        return int(parsed) if parsed.is_integer() else round(parsed, 3)
+
+    current_job_raw = raw.get("current_job")
+    current_job = None
+    if isinstance(current_job_raw, dict):
+        last_error, error_truncated = _sanitize_persisted_background_error(
+            current_job_raw.get("last_error") or ""
+        )
+        current_job = {
+            "job_hint": _opaque_operator_hint(current_job_raw.get("job_id")),
+            "state": str(current_job_raw.get("state") or "")[:64],
+            "expected_frontier_store_id": _integer(
+                current_job_raw, "expected_frontier_store_id"
+            ),
+            "captured_watermark_store_id": _integer(
+                current_job_raw, "captured_watermark_store_id"
+            ),
+            "debt_tokens": _integer(
+                current_job_raw, "debt_tokens", "current_debt_tokens"
+            ),
+            "attempt_count": _integer(current_job_raw, "attempt_count"),
+            "lease_owner_hint": _opaque_operator_hint(
+                current_job_raw.get("lease_owner_hint")
+                or current_job_raw.get("lease_owner")
+            ),
+            "lease_remaining_seconds": _number(
+                current_job_raw, "lease_remaining_seconds"
+            ),
+            "next_retry_at": _number(current_job_raw, "next_retry_at"),
+            "last_error": last_error,
+        }
+        if error_truncated:
+            current_job["last_error_truncated"] = True
+
+    publication_fence_raw = raw.get("publication_fence")
+    publication_fence = None
+    if isinstance(publication_fence_raw, dict):
+        publication_fence = {
+            "generation": _integer(publication_fence_raw, "generation"),
+            "publishable": bool(publication_fence_raw.get("publishable")),
+            "updated_at": _number(publication_fence_raw, "updated_at"),
+        }
+
+    publication_telemetry_raw = raw.get("last_publication_telemetry")
+    publication_telemetry = None
+    if isinstance(publication_telemetry_raw, dict):
+        publication_telemetry = {
+            "job_hint": _opaque_operator_hint(publication_telemetry_raw.get("job_id")),
+            "range_identity_hint": _opaque_operator_hint(
+                publication_telemetry_raw.get("range_identity")
+            ),
+            "publication_fence_generation": _integer(
+                publication_telemetry_raw, "publication_fence_generation"
+            ),
+            "observed_active_tokens": _integer(
+                publication_telemetry_raw, "observed_active_tokens"
+            ),
+            "effective_context_window": _integer(
+                publication_telemetry_raw, "effective_context_window"
+            ),
+            "publication_trigger_tokens": _integer(
+                publication_telemetry_raw, "publication_trigger_tokens"
+            ),
+            "emergency_trigger_tokens": _integer(
+                publication_telemetry_raw, "emergency_trigger_tokens"
+            ),
+            "trigger_policy": str(
+                publication_telemetry_raw.get("trigger_policy") or ""
+            )[:64],
+            "prepared_to_published_seconds": _number(
+                publication_telemetry_raw, "prepared_to_published_seconds"
+            ),
+            "source_token_count": _integer(
+                publication_telemetry_raw, "source_token_count"
+            ),
+            "summary_token_count": _integer(
+                publication_telemetry_raw, "summary_token_count"
+            ),
+            "provider": str(publication_telemetry_raw.get("provider") or "")[:64],
+            "model": str(publication_telemetry_raw.get("model") or "")[:160],
+            "published_at": _number(publication_telemetry_raw, "published_at"),
+        }
+
+    provider_attempt_raw = raw.get("last_provider_attempt")
+    provider_attempt = None
+    if isinstance(provider_attempt_raw, dict):
+        provider_attempt = {
+            "job_hint": _opaque_operator_hint(provider_attempt_raw.get("job_id")),
+            "attempt_number": _integer(provider_attempt_raw, "attempt_number"),
+            "chunk_ordinal": _integer(provider_attempt_raw, "chunk_ordinal"),
+            "escalation_level": _integer(provider_attempt_raw, "escalation_level"),
+            "logical_route_ordinal": _integer(
+                provider_attempt_raw, "logical_route_ordinal"
+            ),
+            "provider": str(provider_attempt_raw.get("provider") or "")[:64],
+            "model": str(provider_attempt_raw.get("model") or "")[:160],
+            "attribution_available": bool(
+                provider_attempt_raw.get("attribution_available")
+            ),
+            "fallback_used": provider_attempt_raw.get("fallback_used"),
+            "outcome": str(provider_attempt_raw.get("outcome") or "")[:64],
+            "failure_reason": str(
+                provider_attempt_raw.get("failure_reason") or ""
+            )[:64],
+            "source_token_count": _integer(
+                provider_attempt_raw, "source_token_count"
+            ),
+            "summary_token_count": _integer(
+                provider_attempt_raw, "summary_token_count"
+            ),
+            "latency_ms": _integer(provider_attempt_raw, "latency_ms"),
+            "finished_at": _number(provider_attempt_raw, "finished_at"),
+        }
+
+    recent_outcomes_raw = raw.get("recent_provider_outcomes")
+    recent_provider_outcomes = {}
+    for reason, count in (
+        recent_outcomes_raw.items()
+        if isinstance(recent_outcomes_raw, dict)
+        else []
+    ):
+        reason_text = str(reason)
+        if reason_text not in _BACKGROUND_DIAGNOSTIC_REASONS and reason_text != "success":
+            continue
+        try:
+            recent_provider_outcomes[reason_text[:64]] = max(0, int(count or 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+    attribution_raw = raw.get("provider_attribution")
+    if not isinstance(attribution_raw, dict):
+        attribution_raw = {}
+    prepared_nodes = _integer(attribution_raw, "prepared_nodes")
+    attributed_nodes = min(
+        prepared_nodes,
+        _integer(attribution_raw, "attributed_nodes"),
+    )
+    provider_attribution = {
+        "prepared_nodes": prepared_nodes,
+        "attributed_nodes": attributed_nodes,
+        "coverage_ratio": (
+            round(attributed_nodes / prepared_nodes, 4) if prepared_nodes else 0.0
+        ),
+    }
+
+    dispositions_raw = raw.get("range_dispositions")
+    range_dispositions = {}
+    for reason, count in (
+        dispositions_raw.items() if isinstance(dispositions_raw, dict) else []
+    ):
+        reason_text = str(reason)
+        if reason_text not in _BACKGROUND_DIAGNOSTIC_REASONS:
+            continue
+        try:
+            range_dispositions[reason_text[:64]] = max(0, int(count or 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+    durable_counts_raw = raw.get("durable_event_counts")
+    if not isinstance(durable_counts_raw, dict):
+        durable_counts_raw = {}
+    durable_event_counts = {
+        reason: _integer(durable_counts_raw, reason)
+        for reason in sorted(_BACKGROUND_DIAGNOSTIC_REASONS)
+        if reason in durable_counts_raw
+    }
+    durable_event_reasons = sorted({
+        str(reason)
+        for reason in (raw.get("durable_event_reasons") or [])
+        if str(reason) in _BACKGROUND_DIAGNOSTIC_REASONS
+    })
+
+    reasons = {
+        str(reason)
+        for reason in (raw.get("diagnostic_reasons") or [])
+        if str(reason) in _BACKGROUND_DIAGNOSTIC_REASONS
+    }
+    reasons.update(durable_event_reasons)
+    reason_counts = {
+        "foreground_emergency_count": "foreground_emergency_compaction",
+        "provider_timeout_count": "provider_timeout",
+        "lease_expiration_count": "lease_expiration",
+        "sqlite_lock_contention_count": "sqlite_lock_contention",
+        "worker_unavailable_count": "worker_unavailable",
+        "no_eligible_raw_range_count": "no_eligible_raw_range",
+    }
+    for count_key, reason in reason_counts.items():
+        if _integer(raw, count_key):
+            reasons.add(reason)
+    if bool(raw.get("enabled")) and raw.get("worker_available") is False:
+        reasons.add("worker_unavailable")
+
+    result_reason_map = {
+        "timeout": "provider_timeout",
+        "connection_error": "provider_connection_error",
+        "auth_error": "provider_auth_error",
+        "quota": "provider_quota",
+        "rate_limit": "provider_rate_limit",
+        "invalid_response": "invalid_provider_response",
+        "circuit_open": "provider_circuit_open",
+        "spend_guard": "provider_spend_guard",
+        "reasoning_only": "reasoning_only_output",
+        "non_compressing": "non_compressing_output",
+        "insufficient": "insufficient_compressible_source",
+        "sqlite_locked": "sqlite_lock_contention",
+        "lock_contention": "sqlite_lock_contention",
+        "worker_unavailable": "worker_unavailable",
+        "no_eligible_raw_range": "no_eligible_raw_range",
+        "foreground_emergency": "foreground_emergency_compaction",
+        "superseded": "prepared_summary_superseded",
+        "published": "prepared_summary_published",
+        "prepared": "background_summary_prepared",
+        "lease_expired": "lease_expiration",
+        "lease_lost": "lease_expiration",
+        "stale_lease": "stale_lease",
+    }
+    for result_key in ("last_preparation_result", "last_publication_result"):
+        result = raw.get(result_key)
+        if isinstance(result, dict):
+            result_text = " ".join(
+                str(result.get(key) or "") for key in ("status", "reason")
+            ).lower()
+        else:
+            result_text = str(result or "").lower()
+        if "degraded_reference" in result_text:
+            reasons.add("degraded_reference_published")
+            continue
+        for needle, reason in result_reason_map.items():
+            if needle in result_text:
+                reasons.add(reason)
+
+    compatibility_blocker = str(
+        raw.get("compatibility_blocked_reason") or ""
+    )
+    if compatibility_blocker not in _BACKGROUND_COMPATIBILITY_BLOCKERS:
+        compatibility_blocker = ""
+    prepare_ratio = _number(raw, "prepare_ratio")
+    payload = {
+        "configured_enabled": bool(
+            raw.get("configured_enabled", configured_enabled)
+        ),
+        "enabled": bool(raw.get("enabled")),
+        "compatibility_blocked_reason": compatibility_blocker or None,
+        "worker_count": _integer(raw, "worker_count"),
+        "global_limit": _integer(raw, "global_limit"),
+        "worker_available": raw.get("worker_available"),
+        "queued_jobs": _integer(raw, "queued_jobs"),
+        "running_jobs": _integer(raw, "running_jobs"),
+        "prepared_jobs": _integer(raw, "prepared_jobs"),
+        "retry_jobs": _integer(raw, "retry_jobs"),
+        "published_jobs": _integer(raw, "published_jobs"),
+        "published_summary_jobs": _integer(raw, "published_summary_jobs"),
+        "published_reference_jobs": _integer(raw, "published_reference_jobs"),
+        "superseded_jobs": _integer(raw, "superseded_jobs"),
+        "failed_jobs": _integer(raw, "failed_jobs"),
+        "active_provider_permits": _integer(raw, "active_provider_permits"),
+        "active_non_timed_out_provider_permits": _integer(
+            raw, "active_non_timed_out_provider_permits"
+        ),
+        "timed_out_provider_permits": _integer(
+            raw, "timed_out_provider_permits"
+        ),
+        "provider_permit_oldest_age_seconds": _number(
+            raw, "provider_permit_oldest_age_seconds"
+        ),
+        "provider_permit_min_lease_remaining_seconds": _number(
+            raw, "provider_permit_min_lease_remaining_seconds"
+        ),
+        "oldest_queued_job_age_seconds": _number(
+            raw, "oldest_queued_job_age_seconds"
+        ),
+        "current_job": current_job,
+        "publication_fence": publication_fence,
+        "current_debt_tokens": _integer(raw, "current_debt_tokens"),
+        "last_preparation_result": _background_result_payload(
+            raw.get("last_preparation_result")
+        ),
+        "last_publication_result": _background_result_payload(
+            raw.get("last_publication_result")
+        ),
+        "last_publication_telemetry": publication_telemetry,
+        "last_provider_attempt": provider_attempt,
+        "recent_provider_outcomes": recent_provider_outcomes,
+        "provider_attribution": provider_attribution,
+        "range_dispositions": range_dispositions,
+        "durable_event_counts": durable_event_counts,
+        "durable_event_reasons": durable_event_reasons,
+        "backlog_trigger_tokens": _integer(raw, "backlog_trigger_tokens")
+        if "backlog_trigger_tokens" in raw
+        else configured_backlog,
+        "minimum_provider_source_tokens": (
+            _integer(raw, "minimum_provider_source_tokens")
+            if "minimum_provider_source_tokens" in raw
+            else configured_minimum_provider_source
+        ),
+        "prepare_ratio": (
+            max(0.0, min(1.0, float(prepare_ratio)))
+            if prepare_ratio is not None
+            else configured_prepare_ratio
+        ),
+        "publication_trigger_tokens": _integer(raw, "publication_trigger_tokens"),
+        "emergency_trigger_tokens": _integer(raw, "emergency_trigger_tokens"),
+        "durable_frontier_store_id": _integer(
+            raw, "durable_frontier_store_id"
+        ),
+        "active_coverage": str(raw.get("active_coverage") or "raw")[:64],
+        "diagnostic_reasons": sorted(reasons),
+    }
+    for count_key in reason_counts:
+        if count_key in raw:
+            payload[count_key] = _integer(raw, count_key)
+    bounded, truncated = _bound_operator_strings(payload)
+    if truncated:
+        bounded["truncated"] = True
+    return bounded
 
 
 def _compute_stage(
@@ -1960,11 +2527,10 @@ def _session_has_window_content(
     the window (earliest < end AND latest >= start), matching the leaf-fallback's
     overlap semantics rather than newest-timestamp-only.
     """
-    connection = engine._dag.connection
-    if connection is None or not session_id:
+    if not session_id:
         return False
     try:
-        with engine._dag._db_lock:
+        with engine._dag.connection_access() as connection:
             row = connection.execute(
                 """
                 SELECT 1
@@ -2029,7 +2595,11 @@ def _recent_ready_rollups(
             store.close()
 
 
-def _recent_conversation_scope_session_ids(engine: "LCMEngine") -> list[str]:
+def _recent_conversation_scope_session_ids(
+    engine: "LCMEngine",
+    *,
+    deadline: float | None = None,
+) -> list[str]:
     """Session ids that make up the current conversation family for fallback.
 
     Rotation reassigns retained higher-depth/carry-forward summaries into the
@@ -2046,7 +2616,13 @@ def _recent_conversation_scope_session_ids(engine: "LCMEngine") -> list[str]:
     conversation_id = getattr(engine, "current_conversation_id", None)
     if lifecycle is not None and conversation_id:
         try:
-            state = lifecycle.get_by_conversation(conversation_id)
+            state = _call_recall_bounded_read(
+                lifecycle.get_by_conversation,
+                conversation_id,
+                deadline=deadline,
+            )
+        except TimeoutError:
+            raise
         except Exception:  # pragma: no cover - defensive read-only degradation
             state = None
         if state is not None:
@@ -2063,16 +2639,14 @@ def _recent_leaf_sections(
     limit: int,
 ) -> list[dict[str, Any]]:
     """Load fallback nodes without retaining their TEMP-staging snapshot."""
-    with engine._dag._db_lock:
-        connection = engine._dag.connection
-        if connection is None:
-            return []
+    with engine._dag.connection_access() as connection:
         with _sqlite_savepoint(connection):
             return _recent_leaf_sections_staged(
                 engine,
                 window,
                 requested_scope,
                 limit,
+                connection=connection,
             )
 
 
@@ -2081,10 +2655,9 @@ def _recent_leaf_sections_staged(
     window: RecentPeriodWindow,
     requested_scope: str,
     limit: int,
+    *,
+    connection,
 ) -> list[dict[str, Any]]:
-    connection = engine._dag.connection
-    if connection is None:
-        return []
     # Include retained higher-depth/carry-forward summaries, not just depth-0
     # current-session leaves, mirroring how lcm_grep/describe select across
     # depths and retained lineage (maintainer #389 blocker 2).
@@ -2779,6 +3352,11 @@ _lcm_semantic_worker_slots = threading.BoundedSemaphore(_LCM_SEMANTIC_MAX_WORKER
 # consume the capacity required to degrade safely.
 _LCM_FULL_TEXT_MAX_WORKERS = 4
 _lcm_full_text_worker_slots = threading.BoundedSemaphore(_LCM_FULL_TEXT_MAX_WORKERS)
+# Recall has post-arm lifecycle, hydration, and response work of its own. Keep
+# its outer hard-wall workers separate from the arm lanes so a timed-out read
+# cannot consume the capacity needed for full-text degradation.
+_LCM_RECALL_MAX_WORKERS = 4
+_lcm_recall_worker_slots = threading.BoundedSemaphore(_LCM_RECALL_MAX_WORKERS)
 
 
 class _WorkerCapacityError(RuntimeError):
@@ -2826,6 +3404,48 @@ def _run_within_deadline(
     succeeded, value = outcome[0]
     if not succeeded:
         raise value
+    return value
+
+
+def _recall_deadline_checkpoint(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= float(deadline):
+        raise TimeoutError("recall latency budget exhausted")
+
+
+def _call_recall_bounded_read(operation, *args, deadline: float | None):
+    """Use native bounded-read keywords when the target supports them.
+
+    Test doubles and older embedders may expose the historical positional-only
+    shape. They remain hard-bounded by the outer recall worker, while current
+    stores additionally cap lock and SQLite busy waits to the same deadline.
+    """
+    _recall_deadline_checkpoint(deadline)
+    kwargs: dict[str, Any] = {}
+    if deadline is not None:
+        try:
+            parameters = inspect.signature(operation).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        names = {parameter.name for parameter in parameters}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if accepts_kwargs or {
+            "deadline",
+            "deadline_clock",
+            "lock_timeout_seconds",
+            "busy_timeout_ms",
+        }.issubset(names):
+            remaining = max(0.0, float(deadline) - time.monotonic())
+            kwargs = {
+                "deadline": deadline,
+                "deadline_clock": time.monotonic,
+                "lock_timeout_seconds": remaining,
+                "busy_timeout_ms": max(0, int(remaining * 1000)),
+            }
+    value = operation(*args, **kwargs)
+    _recall_deadline_checkpoint(deadline)
     return value
 
 
@@ -3768,6 +4388,7 @@ class _LcmRecallStrictSelector:
         per_session_limit: int,
         expanded_limit: int,
         wave_size: int = _LCM_RECALL_STRICT_READ_WAVE,
+        deadline: float | None = None,
     ) -> None:
         self._ordered = ordered
         self._engine = engine
@@ -3775,6 +4396,7 @@ class _LcmRecallStrictSelector:
         self._per_session_limit = per_session_limit
         self._expanded_limit = expanded_limit
         self._wave_size = max(1, wave_size)
+        self._deadline = deadline
         # How far the ranking is known to be SETTLED. Monotone: an entry the
         # ledger knows, or one rejected in-budget, can never become admissible
         # again, so this only ever advances. It is a scan hint, never a source
@@ -3858,7 +4480,11 @@ class _LcmRecallStrictSelector:
         ]
         if wanted:
             self.batched_reads += 1
-            fetched = self._engine._store.get_batch(wanted)
+            fetched = _call_recall_bounded_read(
+                self._engine._store.get_batch,
+                wanted,
+                deadline=self._deadline,
+            )
             # A row the store does not have is remembered as MISSING, or the walk
             # cannot tell "not fetched yet" from "fetched and absent" and keeps
             # calling for windows that can never contain it. Rows merely evicted
@@ -4075,6 +4701,7 @@ def _lcm_recall_answer_ready_content(
     query: str,
     expanded_limit: int = _LCM_RECALL_ANSWER_READY_EXPANDED_HIT_LIMIT,
     rows_by_id: dict[int, dict[str, Any]] | None = None,
+    deadline: float | None = None,
 ) -> dict[tuple, dict[str, Any]]:
     """Hydrate selected exact refs with bounded reads and no retrieval search.
 
@@ -4091,19 +4718,28 @@ def _lcm_recall_answer_ready_content(
         if entry["hit"].get("kind") == "message_excerpt"
         and entry["hit"].get("store_id") is not None
     ]
-    stored_by_id = (
-        rows_by_id if rows_by_id is not None else engine._store.get_batch(store_ids)
-    )
+    stored_by_id = rows_by_id
+    if stored_by_id is None:
+        stored_by_id = _call_recall_bounded_read(
+            engine._store.get_batch,
+            store_ids,
+            deadline=deadline,
+        )
     hydrated: dict[tuple, dict[str, Any]] = {}
 
     for entry in selected:
+        _recall_deadline_checkpoint(deadline)
         hit = entry["hit"]
         identity = _hit_identity(hit)
         if hit.get("kind") == "summary":
             raw_node_id = hit.get("node_id")
             if raw_node_id is None:
                 continue
-            node = engine._dag.get_node(int(raw_node_id))
+            node = _call_recall_bounded_read(
+                engine._dag.get_node,
+                int(raw_node_id),
+                deadline=deadline,
+            )
             if node is None:
                 continue
             content = node.summary or ""
@@ -4147,6 +4783,7 @@ def _lcm_recall_answer_ready_content(
             "role": stored.get("role"),
             "source": stored.get("source") or "",
         }
+    _recall_deadline_checkpoint(deadline)
     return hydrated
 
 
@@ -4574,7 +5211,79 @@ def _lcm_recall_rerank(
     return reordered, "applied"
 
 
+def _lcm_recall_timeout_response(
+    args: Dict[str, Any],
+    *,
+    reason: str,
+) -> str:
+    raw_limit = _parse_int_value(
+        args.get("limit", _LCM_RECALL_DEFAULT_LIMIT),
+        _LCM_RECALL_DEFAULT_LIMIT,
+    )
+    limit = min(max(1, raw_limit), _LCM_RECALL_LIMIT_CAP)
+    return json.dumps(
+        {
+            "query": str(args.get("query", "")).strip(),
+            "limit": limit,
+            "scope_bias": _LCM_RECALL_DEFAULT_SCOPE_BIAS,
+            "include": str(args.get("include") or "all").strip().lower(),
+            "total_results": 0,
+            "hits": [],
+            "provenance": {
+                "arms_run": [],
+                "arm_weights": {},
+                "coverage": {},
+                "rerank": "skipped: recall deadline exceeded",
+            },
+            "metrics": {
+                "embedding_query_calls": 0,
+                "embedding_query_tokens": 0,
+                "embedding_query_tokens_complete": True,
+                "embedding_queries": [],
+            },
+            "degraded": True,
+            "degraded_reason": reason,
+            "timeout": True,
+        }
+    )
+
+
 def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
+    """Run all recall stages inside one configured/caller absolute wall."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    request_started = time.monotonic()
+    timeout_s = max(
+        0.001,
+        float(getattr(engine._config, "recall_query_timeout_s", 8.0)),
+    )
+    deadline = request_started + timeout_s
+    caller_deadline = kwargs.get("deadline")
+    if caller_deadline is not None:
+        deadline = min(deadline, float(caller_deadline))
+
+    try:
+        return _run_within_deadline(
+            lambda: _lcm_recall_impl(
+                args,
+                _recall_request_started=request_started,
+                _recall_deadline=deadline,
+                **kwargs,
+            ),
+            remaining_s=deadline - time.monotonic(),
+            name="lcm-recall",
+            worker_slots=_lcm_recall_worker_slots,
+        )
+    except (_WorkerCapacityError, TimeoutError) as exc:
+        return _lcm_recall_timeout_response(
+            args,
+            reason=f"recall deadline exceeded: {exc}",
+        )
+
+
+def _lcm_recall_impl(args: Dict[str, Any], **kwargs) -> str:
     """Search the agent's entire memory (all conversations, all time) by meaning.
 
     Fuses three arms over the whole local database — FTS raw messages, embedded
@@ -4582,7 +5291,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     scope/recency prior and (optionally) a cross-encoder rerank. The current
     conversation is only ever a ranking BOOST, never a hard filter.
     """
-    request_started = time.monotonic()
+    request_started = float(
+        kwargs.pop("_recall_request_started", time.monotonic())
+    )
+    enforced_deadline = kwargs.pop("_recall_deadline", None)
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
@@ -4636,6 +5348,11 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # (larger) budget rather than lcm_grep's single-arm query deadline (sprint-opt-2).
     timeout_s = max(0.001, float(getattr(engine._config, "recall_query_timeout_s", 8.0)))
     deadline = request_started + timeout_s
+    caller_deadline = kwargs.get("deadline")
+    if caller_deadline is not None:
+        deadline = min(deadline, float(caller_deadline))
+    if enforced_deadline is not None:
+        deadline = min(deadline, float(enforced_deadline))
 
     candidate_limit = min(_LCM_GREP_HYBRID_CANDIDATE_CAP, max(50, limit * 4))
     rerank_window = min(50, max(1, limit * 4))
@@ -4817,6 +5534,8 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         coverage["chunk"] = "none"
                         degraded_reasons.append(f"chunk arm failed: {exc}")
 
+    _recall_deadline_checkpoint(deadline)
+
     # -- RRF fusion over the arms that produced hits (order fixes base-hit win) --
     # Per-arm weights down-weight the weak FTS arm so the 3-arm hybrid is never
     # dragged below its best arm (measured −21 R@5 on LongMemEval for naive
@@ -4829,6 +5548,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         k=_LCM_RECALL_RRF_K,
         weights=arm_weights,
     )
+    _recall_deadline_checkpoint(deadline)
 
     # Merge chunk-arm provenance onto a message whose store_id also surfaced via
     # FTS. The chunk list is best-first, so keep the BEST-ranked chunk per store
@@ -4840,7 +5560,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # message. arm_order fixes the fused base object to the earliest arm, so we
     # compare per-arm ranks explicitly rather than trusting insertion order.
     chunk_by_store: dict[Any, dict[str, Any]] = {}
-    for chunk_hit in arm_hits.get("chunk", []):
+    for hit_index, chunk_hit in enumerate(arm_hits.get("chunk", [])):
+        if hit_index % 32 == 0:
+            _recall_deadline_checkpoint(deadline)
         chunk_by_store.setdefault(chunk_hit.get("store_id"), chunk_hit)
     # Every OTHER arm's representation of the same row is kept alongside the
     # fused base rather than discarded. Fusion picks one base per identity (the
@@ -4852,7 +5574,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # that the row actually supports.
     alternates_by_store: dict[Any, list[dict[str, Any]]] = {}
     for arm_name in ("summary", "chunk"):
-        for other_hit in arm_hits.get(arm_name, []):
+        for hit_index, other_hit in enumerate(arm_hits.get(arm_name, [])):
+            if hit_index % 32 == 0:
+                _recall_deadline_checkpoint(deadline)
             if other_hit.get("kind") != "message_excerpt":
                 continue
             alternates_by_store.setdefault(other_hit.get("store_id"), []).append(
@@ -4860,7 +5584,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             )
     chunk_arm_index = arm_order.index("chunk") if "chunk" in arm_order else None
     fts_arm_index = arm_order.index("fts") if "fts" in arm_order else None
-    for entry in ordered:
+    for entry_index, entry in enumerate(ordered):
+        if entry_index % 32 == 0:
+            _recall_deadline_checkpoint(deadline)
         hit = entry["hit"]
         if hit.get("kind") != "message_excerpt":
             continue
@@ -4893,9 +5619,15 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     #    actually reranked (RERANK-1). Boost eligibility spans the whole
     #    conversation-scope session set, not a single session-id equality, so a
     #    mid-conversation session rotation keeps the boost (SCOPE-1). --
+    _recall_deadline_checkpoint(deadline)
     now = time.time()
-    scope_session_ids = set(_recent_conversation_scope_session_ids(engine))
-    for entry in ordered:
+    scope_session_ids = set(
+        _recent_conversation_scope_session_ids(engine, deadline=deadline)
+    )
+    _recall_deadline_checkpoint(deadline)
+    for entry_index, entry in enumerate(ordered):
+        if entry_index % 32 == 0:
+            _recall_deadline_checkpoint(deadline)
         hit = entry["hit"]
         rank_score = float(entry.get("rrf_score", 0.0))
         is_current = 1.0 if hit.get("session_id") in scope_session_ids else 0.0
@@ -4908,12 +5640,14 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             _hit_identity(entry["hit"]),
         )
     )
+    _recall_deadline_checkpoint(deadline)
 
     # -- Optional rerank stage (default OFF): a pure rank-REORDER within the top
     #    window of the post-prior order (no score splicing onto the RRF scale). --
     ordered, rerank_status = _lcm_recall_rerank(
         provider, query, ordered, window=rerank_window, deadline=deadline, config=engine._config
     )
+    _recall_deadline_checkpoint(deadline)
 
     # -- Response shaping (char-capped). The default snippets path retains the
     # historical order and serialized response exactly. answer_ready applies
@@ -4937,6 +5671,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                 engine=engine,
                 per_session_limit=_LCM_RECALL_ANSWER_READY_PER_SESSION_LIMIT,
                 expanded_limit=expanded_limit,
+                deadline=deadline,
             )
             selected_entries = strict_selector.take(selection_limit)
             strict_rows = strict_selector.rows
@@ -4953,6 +5688,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             query=query,
             expanded_limit=expanded_limit,
             rows_by_id=strict_rows,
+            deadline=deadline,
         )
         if delta_requested:
             def _novel(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4998,6 +5734,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         query=query,
                         expanded_limit=len(more),
                         rows_by_id=strict_selector.rows,
+                        deadline=deadline,
                     )
                 )
                 selected_entries.extend(_novel(more))
@@ -5010,7 +5747,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     response_chars = 0
     response_cap_truncated = False
     unreferenced_omitted = 0
-    for entry in selected_entries:
+    for entry_index, entry in enumerate(selected_entries):
+        if entry_index % 16 == 0:
+            _recall_deadline_checkpoint(deadline)
         hit = entry["hit"]
         arms = sorted({arm_order[index] for index in entry["ranks"].keys()})
         item: dict[str, Any] = {
@@ -5045,7 +5784,11 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     item["exact_ref"] = exact_ref
             if include_occurrence_time and hit.get("kind") != "summary":
                 session_dates = getattr(engine, "_session_occurrence_dates", {}) or {}
-                source_row = engine._store.get(int(hit.get("store_id") or 0))
+                source_row = _call_recall_bounded_read(
+                    engine._store.get,
+                    int(hit.get("store_id") or 0),
+                    deadline=deadline,
+                )
                 source_row = source_row or {}
                 source_observed_at = source_row.get("observed_at")
                 session_date = session_dates.get(str(hit.get("session_id")))
@@ -5101,6 +5844,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         if len(hits_out) >= limit:
             break
 
+    _recall_deadline_checkpoint(deadline)
     degraded = bool(degraded_reasons)
     response: dict[str, Any] = {
         "query": query,
@@ -5192,11 +5936,13 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                 "observation_is_not_occurrence": True,
             }
 
+        _recall_deadline_checkpoint(deadline)
         encoded = json.dumps(response, ensure_ascii=False)
         if len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP:
             original_query = response["query"]
             response["query"] = original_query[:4_096]
             expansion["query_truncated"] = len(response["query"]) < len(original_query)
+            _recall_deadline_checkpoint(deadline)
             encoded = json.dumps(response, ensure_ascii=False)
         while len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP and (
             response["hits"] or expansion.get("summary_leads")
@@ -5228,7 +5974,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                 }
             )
             encoded = json.dumps(response, ensure_ascii=False)
+        _recall_deadline_checkpoint(deadline)
         return encoded
+    _recall_deadline_checkpoint(deadline)
     return json.dumps(response)
 
 
@@ -5761,40 +6509,38 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
 
 def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, Any]:
     """Return read-only summary compression quality diagnostics for one session."""
-    conn = engine._dag.connection
-    if conn is None:
-        raise RuntimeError("LCM DAG connection is not initialized")
-    rows = conn.execute(
-        """
-        SELECT node_id, session_id, depth, token_count, source_token_count
-        FROM summary_nodes
-        WHERE session_id = ? AND source_token_count > 0
-        ORDER BY
-            CASE WHEN token_count <= 0 THEN 1 ELSE 0 END DESC,
-            CASE WHEN token_count > 0
-                 THEN CAST(source_token_count AS REAL) / token_count
-                 ELSE source_token_count
-            END DESC
-        LIMIT 5
-        """,
-        (session_id,),
-    ).fetchall()
-    totals = conn.execute(
-        """
-        SELECT
-            COUNT(*),
-            COALESCE(SUM(source_token_count), 0),
-            COALESCE(SUM(token_count), 0),
-            SUM(CASE WHEN source_token_count >= 100000
-                      AND token_count < 500 THEN 1 ELSE 0 END),
-            SUM(CASE WHEN token_count > 0
-                      AND CAST(source_token_count AS REAL) / token_count >= 400
-                     THEN 1 ELSE 0 END)
-        FROM summary_nodes
-        WHERE session_id = ?
-        """,
-        (session_id,),
-    ).fetchone()
+    with engine._dag.connection_access() as conn:
+        rows = conn.execute(
+            """
+            SELECT node_id, session_id, depth, token_count, source_token_count
+            FROM summary_nodes
+            WHERE session_id = ? AND source_token_count > 0
+            ORDER BY
+                CASE WHEN token_count <= 0 THEN 1 ELSE 0 END DESC,
+                CASE WHEN token_count > 0
+                     THEN CAST(source_token_count AS REAL) / token_count
+                     ELSE source_token_count
+                END DESC
+            LIMIT 5
+            """,
+            (session_id,),
+        ).fetchall()
+        totals = conn.execute(
+            """
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(source_token_count), 0),
+                COALESCE(SUM(token_count), 0),
+                SUM(CASE WHEN source_token_count >= 100000
+                          AND token_count < 500 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN token_count > 0
+                          AND CAST(source_token_count AS REAL) / token_count >= 400
+                         THEN 1 ELSE 0 END)
+            FROM summary_nodes
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
     total_nodes = int(totals[0] or 0)
     total_source_tokens = int(totals[1] or 0)
     total_summary_tokens = int(totals[2] or 0)
@@ -5930,14 +6676,15 @@ def _inspect_lifecycle_state(engine: "LCMEngine", session_id: str, conversation_
 
 def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: str) -> int:
     highest = 0
-    rows = engine._dag.connection.execute(
-        """
-        SELECT source_ids
-        FROM summary_nodes
-        WHERE session_id = ? AND source_type = 'messages'
-        """,
-        (session_id,),
-    ).fetchall()
+    with engine._dag.connection_access() as connection:
+        rows = connection.execute(
+            """
+            SELECT source_ids
+            FROM summary_nodes
+            WHERE session_id = ? AND source_type = 'messages'
+            """,
+            (session_id,),
+        ).fetchall()
     for (raw_source_ids,) in rows:
         try:
             source_ids = json.loads(raw_source_ids or "[]")
@@ -6144,75 +6891,76 @@ def _temporal_rollups_status(engine: "LCMEngine") -> dict[str, Any]:
     if not enabled or not scope:
         return payload
 
-    conn = engine._dag.connection
-    if conn is None:
-        return payload
     try:
-        rows = conn.execute(
-            """
-            SELECT period_kind, status, COUNT(*)
-            FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
-            WHERE period_kind IN ('day', 'week', 'month') AND scope = ?
-            GROUP BY period_kind, status
-            """,
-            (scope,),
-        ).fetchall()
-        for period_kind, status, count in rows:
-            kind_key = str(period_kind)
-            status_key = str(status)
-            if kind_key in payload["counts"] and status_key in payload["counts"][kind_key]:
-                payload["counts"][kind_key][status_key] = int(count or 0)
+        with engine._dag.connection_access() as conn:
+            rows = conn.execute(
+                """
+                SELECT period_kind, status, COUNT(*)
+                FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
+                WHERE period_kind IN ('day', 'week', 'month') AND scope = ?
+                GROUP BY period_kind, status
+                """,
+                (scope,),
+            ).fetchall()
+            for period_kind, status, count in rows:
+                kind_key = str(period_kind)
+                status_key = str(status)
+                if (
+                    kind_key in payload["counts"]
+                    and status_key in payload["counts"][kind_key]
+                ):
+                    payload["counts"][kind_key][status_key] = int(count or 0)
 
-        oldest_stale = conn.execute(
-            """
-            SELECT period_start
-            FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
-            WHERE period_kind IN ('day', 'week', 'month')
-              AND scope = ? AND status = 'stale'
-            ORDER BY period_start
-            LIMIT 1
-            """,
-            (scope,),
-        ).fetchone()
-        if oldest_stale and oldest_stale[0]:
-            stale_start = datetime.combine(
-                datetime.fromisoformat(str(oldest_stale[0])).date(),
-                datetime.min.time(),
-                tzinfo=timezone.utc,
-            )
-            payload["oldest_stale_age_seconds"] = max(
-                0, int((datetime.now(timezone.utc) - stale_start).total_seconds())
-            )
+            oldest_stale = conn.execute(
+                """
+                SELECT period_start
+                FROM lcm_rollups INDEXED BY sqlite_autoindex_lcm_rollups_1
+                WHERE period_kind IN ('day', 'week', 'month')
+                  AND scope = ? AND status = 'stale'
+                ORDER BY period_start
+                LIMIT 1
+                """,
+                (scope,),
+            ).fetchone()
+            if oldest_stale and oldest_stale[0]:
+                stale_start = datetime.combine(
+                    datetime.fromisoformat(str(oldest_stale[0])).date(),
+                    datetime.min.time(),
+                    tzinfo=timezone.utc,
+                )
+                payload["oldest_stale_age_seconds"] = max(
+                    0, int((datetime.now(timezone.utc) - stale_start).total_seconds())
+                )
 
-        cursor_rows = conn.execute(
-            """
-            SELECT period_kind, last_build_cursor, last_built_at
-            FROM lcm_rollup_state
-            WHERE period_kind IN ('day', 'week', 'month') AND scope = ?
-            """,
-            (scope,),
-        ).fetchall()
-        for period_kind, cursor, built_at in cursor_rows:
-            kind_key = str(period_kind)
-            if kind_key in payload["last_build_cursors"]:
-                payload["last_build_cursors"][kind_key] = cursor
-                payload["last_built_at"][kind_key] = built_at
+            cursor_rows = conn.execute(
+                """
+                SELECT period_kind, last_build_cursor, last_built_at
+                FROM lcm_rollup_state
+                WHERE period_kind IN ('day', 'week', 'month') AND scope = ?
+                """,
+                (scope,),
+            ).fetchall()
+            for period_kind, cursor, built_at in cursor_rows:
+                kind_key = str(period_kind)
+                if kind_key in payload["last_build_cursors"]:
+                    payload["last_build_cursors"][kind_key] = cursor
+                    payload["last_built_at"][kind_key] = built_at
 
-        error_row = conn.execute(
-            """
-            SELECT substr(error, 1, ?)
-            FROM lcm_rollups
-            WHERE scope = ? AND error IS NOT NULL AND error != ''
-            ORDER BY rollup_id DESC
-            LIMIT 1
-            """,
-            (_OPERATOR_TEXT_FIELD_MAX_CHARS + 1, scope),
-        ).fetchone()
-        if error_row:
-            last_error, was_truncated = _bounded_operator_field(error_row[0])
-            payload["last_error"] = last_error
-            if was_truncated:
-                payload.setdefault("truncated_fields", []).append("last_error")
+            error_row = conn.execute(
+                """
+                SELECT substr(error, 1, ?)
+                FROM lcm_rollups
+                WHERE scope = ? AND error IS NOT NULL AND error != ''
+                ORDER BY rollup_id DESC
+                LIMIT 1
+                """,
+                (_OPERATOR_TEXT_FIELD_MAX_CHARS + 1, scope),
+            ).fetchone()
+            if error_row:
+                last_error, was_truncated = _bounded_operator_field(error_row[0])
+                payload["last_error"] = last_error
+                if was_truncated:
+                    payload.setdefault("truncated_fields", []).append("last_error")
     except Exception as exc:  # pragma: no cover - defensive legacy-schema degradation
         logger.debug("LCM temporal rollup status query failed", exc_info=True)
         query_error, was_truncated = _bounded_operator_field(
@@ -6241,6 +6989,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
 
     session_id = engine.current_session_id
     conversation_id = engine.current_conversation_id
+    background_compaction = _background_compaction_status_payload(engine)
     if not session_id:
         full_status = engine.get_status()
         return _bounded_inspect_json({
@@ -6249,20 +6998,22 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "runtime_identity": full_status.get("runtime_identity") or engine.get_runtime_identity(),
             "ingest_protection": full_status.get("ingest_protection"),
             "temporal_rollups": _temporal_rollups_status(engine),
+            "background_compaction": background_compaction,
         })
 
     full_status = engine.get_status()
     runtime_identity = full_status.get("runtime_identity") or engine.get_runtime_identity()
     lifecycle = _inspect_lifecycle_state(engine, session_id, conversation_id)
 
-    store_totals_row = engine._store.connection.execute(
-        """
-        SELECT COUNT(*), MIN(store_id), MAX(store_id), COALESCE(SUM(token_estimate), 0)
-        FROM messages
-        WHERE session_id = ?
-        """,
-        (session_id,),
-    ).fetchone()
+    with engine._store.connection_access() as connection:
+        store_totals_row = connection.execute(
+            """
+            SELECT COUNT(*), MIN(store_id), MAX(store_id), COALESCE(SUM(token_estimate), 0)
+            FROM messages
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
     message_total = int(store_totals_row[0] or 0) if store_totals_row else 0
     min_store_id = store_totals_row[1] if store_totals_row else None
     max_store_id = store_totals_row[2] if store_totals_row else None
@@ -6279,17 +7030,18 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     total_dag_nodes = sum(info["count"] for info in depth_stats.values())
     total_dag_tokens = sum(info["tokens"] for info in depth_stats.values())
     total_dag_source_tokens = sum(info["source_tokens"] for info in depth_stats.values())
-    latest_node_rows = engine._dag.connection.execute(
-        """
-        SELECT node_id, session_id, depth, token_count, source_token_count,
-               source_type, created_at, earliest_at, latest_at, expand_hint
-        FROM summary_nodes
-        WHERE session_id = ?
-        ORDER BY created_at DESC, node_id DESC
-        LIMIT ?
-        """,
-        (session_id, limit),
-    ).fetchall()
+    with engine._dag.connection_access() as connection:
+        latest_node_rows = connection.execute(
+            """
+            SELECT node_id, session_id, depth, token_count, source_token_count,
+                   source_type, created_at, earliest_at, latest_at, expand_hint
+            FROM summary_nodes
+            WHERE session_id = ?
+            ORDER BY created_at DESC, node_id DESC
+            LIMIT ?
+            """,
+            (session_id, limit),
+        ).fetchall()
     latest_nodes = [
         {
             "node_id": int(row[0]),
@@ -6366,6 +7118,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
                 "lifecycle_last_finalized_frontier_store_id": lifecycle_finalized_frontier,
             },
         },
+        "background_compaction": background_compaction,
         "dag": {
             "total_nodes": total_dag_nodes,
             "total_tokens": total_dag_tokens,
@@ -6406,10 +7159,12 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     # been bound, so cron-only or stateless-only deployments still report
     # something usable.
     session_id = engine.current_session_id
+    background_compaction = _background_compaction_status_payload(engine)
     if not session_id:
         return json.dumps({
             "error": "No active session",
             "runtime_identity": engine.get_runtime_identity(),
+            "background_compaction": background_compaction,
         })
 
     # Store stats
@@ -6443,6 +7198,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "compression_count": engine.compression_count,
         "last_compression_status": full_status.get("last_compression_status", "idle"),
         "last_compression_noop_reason": full_status.get("last_compression_noop_reason", ""),
+        "last_foreground_deadline": full_status.get("last_foreground_deadline"),
         "threshold_full_sweep": full_status.get("threshold_full_sweep"),
         "model": full_status.get("model", ""),
         "provider": full_status.get("provider", ""),
@@ -6453,6 +7209,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "context_length_source": full_status.get("context_length_source", ""),
         "configured_context_threshold": full_status.get("configured_context_threshold", engine._config.context_threshold),
         "context_threshold": full_status.get("context_threshold", engine._config.context_threshold),
+        "context_reserve_tokens": full_status.get("context_reserve_tokens", engine._config.context_reserve_tokens),
+        "threshold_policy": full_status.get("threshold_policy", "ratio"),
         "context_threshold_source": full_status.get("context_threshold_source", ""),
         "context_threshold_autoraised": full_status.get("context_threshold_autoraised"),
         "threshold_tokens": engine.threshold_tokens,
@@ -6476,6 +7234,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
                 f"d{depth}": info for depth, info in sorted(depths.items())
             },
         },
+        "background_compaction": background_compaction,
         "config": {
             "fresh_tail_count": engine._config.fresh_tail_count,
             "fresh_tail_max_tokens": engine._config.fresh_tail_max_tokens,
@@ -6489,9 +7248,12 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "critical_budget_pressure_ratio": engine._config.critical_budget_pressure_ratio,
             "threshold_full_sweep_enabled": engine._config.threshold_full_sweep_enabled,
             "summary_prefix_target_tokens": engine._config.summary_prefix_target_tokens,
-            "threshold_full_sweep_max_passes": 12,
-            "threshold_full_sweep_max_seconds": 120,
+            "automatic_foreground_max_passes": 1,
+            "automatic_foreground_max_seconds": 15,
+            "manual_full_sweep_max_passes": 12,
+            "manual_full_sweep_max_seconds": 120,
             "context_threshold": engine._config.context_threshold,
+            "context_reserve_tokens": engine._config.context_reserve_tokens,
             "max_depth": engine._config.incremental_max_depth,
             "condensation_fanin": engine._config.condensation_fanin,
             "summary_model": engine._config.summary_model or "(auxiliary)",
@@ -6499,6 +7261,20 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "summary_spend_max_calls": engine._config.summary_spend_max_calls,
             "summary_spend_window_seconds": engine._config.summary_spend_window_seconds,
             "summary_spend_backoff_seconds": engine._config.summary_spend_backoff_seconds,
+            "background_compaction_enabled": getattr(
+                engine._config, "background_compaction_enabled", False
+            ),
+            "background_compaction_workers": getattr(
+                engine._config, "background_compaction_workers", 1
+            ),
+            "background_compaction_global_limit": getattr(
+                engine._config, "background_compaction_global_limit", 2
+            ),
+            "background_compaction_min_provider_source_tokens": getattr(
+                engine._config,
+                "background_compaction_min_provider_source_tokens",
+                256,
+            ),
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "proactive_recall": {
@@ -6547,6 +7323,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "LCM engine not initialized"})
 
     checks: list[dict] = []
+    invariant_audit: dict[str, Any] | None = None
+    background_compaction = _background_compaction_status_payload(engine)
     # Diagnose the foreground session, not whatever side-channel session
     # currently owns engine._session_id. Falls back to the bound id when no
     # foreground has ever been bound.
@@ -6554,7 +7332,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 1. Database integrity
     try:
-        result = engine._store.connection.execute("PRAGMA integrity_check").fetchone()
+        with engine._store.connection_access() as conn:
+            result = conn.execute("PRAGMA integrity_check").fetchone()
         ok = result and result[0] == "ok"
         checks.append({
             "check": "database_integrity",
@@ -6604,13 +7383,11 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     })
 
     try:
-        conn = engine._store.connection
-        if conn is None:
-            raise RuntimeError("LCM store connection is not initialized")
-        schema_health = inspect_lcm_schema_health(
-            conn,
-            database_path=str(engine._store.db_path),
-        )
+        with engine._store.connection_access() as conn:
+            schema_health = inspect_lcm_schema_health(
+                conn,
+                database_path=str(engine._store.db_path),
+            )
         missing_tables = schema_health.get("missing_tables")
         has_missing = isinstance(missing_tables, list) and bool(missing_tables)
         checks.append({
@@ -6627,47 +7404,58 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 1b. FTS5 integrity, separated from generic SQLite integrity so malformed
     # inverted indexes point at the exact table and repair path.
-    for check_name, conn, spec in (
-        ("messages_fts_integrity", engine._store.connection, build_message_fts_spec()),
-        ("nodes_fts_integrity", engine._dag.connection, build_nodes_fts_spec()),
+    with (
+        engine._store.connection_access() as store_conn,
+        engine._dag.connection_access() as dag_conn,
     ):
-        try:
-            fts_integrity = check_external_content_fts_integrity(conn, spec)
-            status = fts_integrity["status"]
-            checks.append({
-                "check": check_name,
-                "status": "warn" if status == "unchecked" else status,
-                "detail": fts_integrity if status == "unchecked" else fts_integrity["detail"],
-            })
-        except Exception as e:
-            checks.append({
-                "check": check_name,
-                "status": "fail",
-                "detail": str(e),
-            })
-        # A prior non-blocking background integrity scan records a persisted
-        # ``fts_integrity_failed:<table>`` flag when it finds corruption
-        # without rebuilding. Surface it even when this run's live check is
-        # throttled/unchecked, mirroring the /lcm doctor text path.
-        try:
-            failed_flag = load_integrity_failed(conn, spec)
-        except Exception:  # pragma: no cover - defensive
-            failed_flag = None
-        if failed_flag:
-            checks.append({
-                "check": f"{check_name}_background_flag",
-                "status": "fail",
-                "detail": {
-                    "flagged_at": failed_flag.get("at"),
-                    "detail": failed_flag.get("detail"),
-                    "guidance": "background integrity scan flagged this index; run `/lcm doctor repair apply`",
-                },
-            })
+        for check_name, conn, spec in (
+            ("messages_fts_integrity", store_conn, build_message_fts_spec()),
+            ("nodes_fts_integrity", dag_conn, build_nodes_fts_spec()),
+        ):
+            try:
+                fts_integrity = check_external_content_fts_integrity(conn, spec)
+                status = fts_integrity["status"]
+                checks.append({
+                    "check": check_name,
+                    "status": "warn" if status == "unchecked" else status,
+                    "detail": fts_integrity if status == "unchecked" else fts_integrity["detail"],
+                })
+            except Exception as e:
+                checks.append({
+                    "check": check_name,
+                    "status": "fail",
+                    "detail": str(e),
+                })
+            # A prior non-blocking background integrity scan records a persisted
+            # ``fts_integrity_failed:<table>`` flag when it finds corruption
+            # without rebuilding. Surface it even when this run's live check is
+            # throttled/unchecked, mirroring the /lcm doctor text path.
+            try:
+                failed_flag = load_integrity_failed(conn, spec)
+            except Exception:  # pragma: no cover - defensive
+                failed_flag = None
+            if failed_flag:
+                checks.append({
+                    "check": f"{check_name}_background_flag",
+                    "status": "fail",
+                    "detail": {
+                        "flagged_at": failed_flag.get("at"),
+                        "detail": failed_flag.get("detail"),
+                        "guidance": "background integrity scan flagged this index; run `/lcm doctor repair apply`",
+                    },
+                })
 
     # 2. SQLite storage posture and payload diagnostics
     try:
-        journal_mode_row = engine._store.connection.execute("PRAGMA journal_mode").fetchone()
-        quick_check_row = engine._store.connection.execute("PRAGMA quick_check").fetchone()
+        with engine._store.connection_access() as conn:
+            journal_mode_row = conn.execute("PRAGMA journal_mode").fetchone()
+            quick_check_row = conn.execute("PRAGMA quick_check").fetchone()
+            payload_risks = scan_sqlite_payload_risks(conn)
+            externalized_integrity = scan_externalized_payload_integrity(
+                conn,
+                engine._config,
+                hermes_home=engine._hermes_home,
+            )
         db_path = Path(engine._store.db_path)
         wal_path = Path(str(db_path) + "-wal")
         checks.append({
@@ -6682,13 +7470,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 "wal_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
             },
         })
-        payload_risks = scan_sqlite_payload_risks(engine._store.connection)
         externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
-        externalized_integrity = scan_externalized_payload_integrity(
-            engine._store.connection,
-            engine._config,
-            hermes_home=engine._hermes_home,
-        )
         suspicious_count = (
             len(payload_risks["suspicious_data_uri_content_rows"])
             + len(payload_risks["suspicious_data_uri_tool_calls_rows"])
@@ -6734,18 +7516,19 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     # 3. FTS index sync
     try:
-        msg_count = engine._store.connection.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
-        ).fetchone()[0]
-        fts_count = engine._store.connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM messages_fts
-            JOIN messages ON messages_fts.rowid = messages.store_id
-            WHERE messages.session_id = ?
-            """,
-            (session_id,),
-        ).fetchone()[0]
+        with engine._store.connection_access() as conn:
+            msg_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
+            fts_count = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM messages_fts
+                JOIN messages ON messages_fts.rowid = messages.store_id
+                WHERE messages.session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()[0]
         checks.append({
             "check": "fts_index_sync",
             "status": "pass" if fts_count >= msg_count else "warn",
@@ -6864,13 +7647,116 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 7. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
-        runtime_threshold = float(getattr(engine, "context_threshold", c.context_threshold))
-        threshold_pct = round(runtime_threshold * 100, 1)
+        trigger_tokens = max(0, int(engine.threshold_tokens or 0))
+        threshold_pct = round(trigger_tokens / engine.context_length * 100, 1)
         checks.append({
             "check": "context_pressure",
-            "status": "pass" if usage_pct < threshold_pct else "warn",
+            "status": "pass" if engine.last_prompt_tokens < trigger_tokens else "warn",
             "detail": f"{usage_pct}% used, compaction triggers at {threshold_pct}%",
         })
+
+    # 8. Durable background-compaction worker and queue health. Prepared,
+    # published, and superseded outcomes are observable states rather than
+    # failures; retry/worker/lease/provider/SQLite problems warrant review.
+    # The event ledger is historical. Do not leave doctor permanently yellow
+    # because a provider timed out or a lease expired days ago; current retry
+    # state and the bounded 24-hour attempt window are the operational signals.
+    recent_provider_failures = sum(
+        int(count or 0)
+        for outcome, count in (
+            background_compaction.get("recent_provider_outcomes") or {}
+        ).items()
+        if outcome != "success"
+    )
+    background_enabled = bool(background_compaction.get("enabled"))
+    worker_unavailable = (
+        background_enabled
+        and background_compaction.get("worker_available") is False
+    )
+    timed_out_provider_permits = int(
+        background_compaction.get("timed_out_provider_permits", 0) or 0
+    )
+    if background_compaction.get("status_error") or timed_out_provider_permits > 0:
+        background_check_status = "warn"
+    elif not background_enabled:
+        background_check_status = "pass"
+    elif (
+        worker_unavailable
+        or int(background_compaction.get("retry_jobs", 0) or 0) > 0
+        or recent_provider_failures > 0
+    ):
+        background_check_status = "warn"
+    else:
+        background_check_status = "pass"
+    checks.append({
+        "check": "background_compaction",
+        "status": background_check_status,
+        "detail": background_compaction,
+    })
+
+    if bool(args.get("integrity_audit", False)):
+        helper = getattr(engine, "_background_compaction", None)
+        if helper is None:
+            invariant_audit = {
+                "status": "unknown",
+                "complete": False,
+                "error": "background_compaction_store_unavailable",
+            }
+        else:
+            try:
+                audit_deadline = time.monotonic() + min(
+                    15.0, max(0.25, float(args.get("audit_timeout_seconds", 5.0)))
+                )
+                with helper._bounded_read_connection(
+                    lock_timeout_seconds=1.0,
+                    deadline=audit_deadline,
+                    busy_timeout_ms=1_000,
+                ) as conn:
+                    opened_snapshot = not conn.in_transaction
+                    if opened_snapshot:
+                        conn.execute("BEGIN")
+                    try:
+                        invariant_audit = audit_compaction_invariants(
+                            conn,
+                            current_policy_fingerprint=background_policy_fingerprint(
+                                engine._config
+                            ),
+                            scope=str(args.get("audit_scope") or "session"),
+                            session_id=str(
+                                args.get("session_id") or engine.current_session_id or ""
+                            ),
+                            job_id=str(args.get("job_id") or ""),
+                            fence_generation=(
+                                int(args["fence_generation"])
+                                if args.get("fence_generation") is not None
+                                else None
+                            ),
+                            cursor=str(args.get("cursor") or ""),
+                            limit=int(args.get("limit") or 100),
+                            example_limit=int(args.get("example_limit") or 10),
+                            snapshot_kind="bounded_live_read_transaction",
+                        )
+                    finally:
+                        if opened_snapshot and conn.in_transaction:
+                            conn.execute("ROLLBACK")
+            except Exception as exc:
+                invariant_audit = {
+                    "status": "unknown",
+                    "complete": False,
+                    "error": type(exc).__name__,
+                }
+        audit_status = str(invariant_audit.get("status") or "unknown")
+        checks.append(
+            {
+                "check": "compaction_invariants",
+                "status": (
+                    "pass" if audit_status == "pass"
+                    else "fail" if audit_status == "fail"
+                    else "warn"
+                ),
+                "detail": invariant_audit,
+            }
+        )
 
     overall = "healthy"
     if any(ch["status"] == "fail" for ch in checks):
@@ -6878,9 +7764,12 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     elif any(ch["status"] == "warn" for ch in checks):
         overall = "warnings"
 
-    return json.dumps({
+    payload = {
         "overall": overall,
         "runtime_identity": engine.get_runtime_identity(),
         "checks": checks,
         "guidance": doctor_guidance_for_checks(checks),
-    })
+    }
+    if invariant_audit is not None:
+        payload["compaction_invariant_audit"] = invariant_audit
+    return json.dumps(payload)

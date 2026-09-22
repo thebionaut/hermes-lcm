@@ -1,5 +1,6 @@
 """LCM configuration with defaults and env var overrides."""
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,6 +98,23 @@ def _parse_bool_env(key: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _parse_bool_env_with_source(
+    key: str,
+    default: bool,
+    *,
+    default_source: str = "default",
+) -> tuple[bool, str, str | None]:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default, default_source, None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True, f"env:{key}", None
+    if normalized in {"0", "false", "no", "off"}:
+        return False, f"env:{key}", None
+    return default, default_source, f"invalid env {key}={raw!r} ignored"
 
 
 def _parse_str_env(key: str, default):
@@ -311,8 +329,14 @@ class _EnvFieldSpec:
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
+    _EnvFieldSpec(
+        "reconcile_budget_seconds",
+        "LCM_RECONCILE_BUDGET_SECONDS",
+        float,
+    ),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
+    _EnvFieldSpec("context_reserve_tokens", "LCM_CONTEXT_RESERVE_TOKENS", int),
     _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
     _EnvFieldSpec("condensation_fanin", "LCM_CONDENSATION_FANIN", int),
     _EnvFieldSpec("dynamic_leaf_chunk_enabled", "LCM_DYNAMIC_LEAF_CHUNK_ENABLED", bool),
@@ -324,10 +348,76 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
+    _EnvFieldSpec("compaction_payback_enabled", "LCM_COMPACTION_PAYBACK_ENABLED", bool),
+    _EnvFieldSpec("compaction_payback_expected_calls", "LCM_COMPACTION_PAYBACK_EXPECTED_CALLS", int),
+    _EnvFieldSpec("compaction_payback_min_reclaim_tokens", "LCM_COMPACTION_PAYBACK_MIN_RECLAIM_TOKENS", int),
+    _EnvFieldSpec("compaction_payback_summary_ratio", "LCM_COMPACTION_PAYBACK_SUMMARY_RATIO", float),
+    _EnvFieldSpec(
+        "background_compaction_enabled",
+        "LCM_BACKGROUND_COMPACTION_ENABLED",
+        bool,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_workers",
+        "LCM_BACKGROUND_COMPACTION_WORKERS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_global_limit",
+        "LCM_BACKGROUND_COMPACTION_GLOBAL_LIMIT",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_max_passes",
+        "LCM_BACKGROUND_COMPACTION_MAX_PASSES",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_job_timeout_seconds",
+        "LCM_BACKGROUND_COMPACTION_JOB_TIMEOUT_SECONDS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_lease_seconds",
+        "LCM_BACKGROUND_COMPACTION_LEASE_SECONDS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_backlog_tokens",
+        "LCM_BACKGROUND_COMPACTION_BACKLOG_TOKENS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_min_provider_source_tokens",
+        "LCM_BACKGROUND_COMPACTION_MIN_PROVIDER_SOURCE_TOKENS",
+        int,
+    ),
+    _EnvFieldSpec(
+        "background_compaction_prepare_ratio",
+        "LCM_BACKGROUND_COMPACTION_PREPARE_RATIO",
+        float,
+    ),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
+    _EnvFieldSpec("focused_working_set_enabled", "LCM_FOCUSED_WORKING_SET_ENABLED", bool),
+    _EnvFieldSpec("focused_working_set_target_tokens", "LCM_FOCUSED_WORKING_SET_TARGET_TOKENS", int),
+    _EnvFieldSpec("focused_working_set_trigger_tokens", "LCM_FOCUSED_WORKING_SET_TRIGGER_TOKENS", int),
+    _EnvFieldSpec("focused_working_set_min_reclaim_tokens", "LCM_FOCUSED_WORKING_SET_MIN_RECLAIM_TOKENS", int),
+    _EnvFieldSpec("focused_working_set_min_reclaim_ratio", "LCM_FOCUSED_WORKING_SET_MIN_RECLAIM_RATIO", float),
+    _EnvFieldSpec("focused_working_set_payback_calls", "LCM_FOCUSED_WORKING_SET_PAYBACK_CALLS", int),
+    _EnvFieldSpec("focused_working_set_ingest_timeout_seconds", "LCM_FOCUSED_WORKING_SET_INGEST_TIMEOUT_SECONDS", float),
+    _EnvFieldSpec("active_replay_preview_enabled", "LCM_ACTIVE_REPLAY_PREVIEW_ENABLED", bool),
+    _EnvFieldSpec(
+        "active_replay_preview_policy_version",
+        "LCM_ACTIVE_REPLAY_PREVIEW_POLICY_VERSION",
+        str,
+    ),
+    _EnvFieldSpec("active_replay_preview_min_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_MIN_TOKENS", int),
+    _EnvFieldSpec("active_replay_preview_head_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_HEAD_TOKENS", int),
+    _EnvFieldSpec("active_replay_preview_tail_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_TAIL_TOKENS", int),
+    _EnvFieldSpec("active_replay_preview_max_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_MAX_TOKENS", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
     _EnvFieldSpec("extraction_enabled", "LCM_EXTRACTION_ENABLED", bool),
     _EnvFieldSpec("extraction_model", "LCM_EXTRACTION_MODEL", str),
@@ -418,6 +508,24 @@ _PARSER_BY_TYPE = {
     str: _parse_str_env,
 }
 
+_PARSER_WITH_SOURCE_BY_TYPE = {
+    int: _parse_int_env_with_source,
+    float: _parse_float_env_with_source,
+    bool: _parse_bool_env_with_source,
+}
+
+_BACKGROUND_COMPACTION_ENV_FIELDS = frozenset({
+    "background_compaction_enabled",
+    "background_compaction_workers",
+    "background_compaction_global_limit",
+    "background_compaction_max_passes",
+    "background_compaction_job_timeout_seconds",
+    "background_compaction_lease_seconds",
+    "background_compaction_backlog_tokens",
+    "background_compaction_min_provider_source_tokens",
+    "background_compaction_prepare_ratio",
+})
+
 # Fields whose env reading needs provenance tracking or a computed default;
 # ``from_env`` handles these explicitly, so the uniform loop skips them.
 _SOURCE_TRACKED_ENV_FIELDS = frozenset({
@@ -429,7 +537,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
     "summary_timeout_ms",
-})
+}) | _BACKGROUND_COMPACTION_ENV_FIELDS
 
 # Fields exposed as runtime preset overrides (consumed by presets.py).
 _PRESET_ENV_FIELDS = frozenset({
@@ -449,12 +557,19 @@ class LCMConfig:
     fresh_tail_count: int = 32
     # Optional token cap for the protected suffix (0 = disabled)
     fresh_tail_max_tokens: int = 0
+    # Wall-clock budget for ingest-cursor reconciliation (0 = disabled).
+    # Reconcile runs inside the synchronous post-LLM ingest hook; without a
+    # budget a pathological session can wedge turn finalization indefinitely.
+    reconcile_budget_seconds: float = 45.0
 
     # -- Compaction thresholds ---
     # Max source tokens in a leaf chunk before summarization triggers
     leaf_chunk_tokens: int = 20_000
     # Fraction of context window that triggers compaction (0.0–1.0)
     context_threshold: float = 0.35
+    # Optional fixed reserve. When positive, compaction triggers at
+    # effective_context_length - context_reserve_tokens instead of a ratio.
+    context_reserve_tokens: int = 0
     # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
     # when LCM is inheriting the host compression threshold. Explicit LCM
     # threshold overrides remain authoritative.
@@ -486,6 +601,29 @@ class LCMConfig:
     threshold_full_sweep_enabled: bool = False
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
+    # Require useful aggregate reclaim before elective summary work. Emergency
+    # provider-limit recovery always bypasses this gate.
+    compaction_payback_enabled: bool = False
+    compaction_payback_expected_calls: int = 16
+    compaction_payback_min_reclaim_tokens: int = 8_000
+    compaction_payback_summary_ratio: float = 0.20
+
+    # -- Durable background compaction ---
+    # Explicit opt-in keeps disabled deployments byte-for-byte foreground-only.
+    background_compaction_enabled: bool = False
+    # Worker count is process-local; the durable global limit coordinates all
+    # enabled Hermes processes sharing the same SQLite database.
+    background_compaction_workers: int = 1
+    background_compaction_global_limit: int = 2
+    background_compaction_max_passes: int = 4
+    background_compaction_job_timeout_seconds: int = 120
+    background_compaction_lease_seconds: int = 300
+    background_compaction_backlog_tokens: int = 32_000
+    # Smaller isolated ranges cost more provider prompt/output overhead than
+    # they can safely remove. They become deterministic lossless projections
+    # rather than provider jobs.
+    background_compaction_min_provider_source_tokens: int = 256
+    background_compaction_prepare_ratio: float = 0.55
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1
@@ -499,6 +637,32 @@ class LCMConfig:
     # Reserve this many tokens from the model context window before assembly
     # (0 = disabled). Effective cap becomes context_length - reserve_tokens_floor.
     reserve_tokens_floor: int = 0
+
+    # -- Request-only focused phase working sets ---
+    # Opt-in until the integrated Hermes candidate is qualified. Complete raw
+    # history remains in LCM; only the provider-visible request is selected.
+    focused_working_set_enabled: bool = False
+    focused_working_set_target_tokens: int = 64_000
+    focused_working_set_trigger_tokens: int = 80_000
+    focused_working_set_min_reclaim_tokens: int = 16_000
+    focused_working_set_min_reclaim_ratio: float = 0.30
+    # Estimated remaining calls in the current phase used for hot-cache
+    # reseed payback. A cold/unknown request has no cache-displacement charge.
+    focused_working_set_payback_calls: int = 4
+    # Lossless pre-selection/post-turn ingest shares a bounded foreground wait.
+    focused_working_set_ingest_timeout_seconds: float = 5.0
+    # Optional lossless provider-visible preview of old, durably externalized
+    # textual tool results. Policy is snapshotted per session; disabled by
+    # default until the frozen fixture gate qualifies it.
+    active_replay_preview_enabled: bool = False
+    # Empty means all newly bound sessions once the master flag is enabled;
+    # otherwise only exact session IDs in this list can enter a canary.
+    active_replay_preview_session_allowlist: list[str] = field(default_factory=list)
+    active_replay_preview_policy_version: str = "externalized-tool-preview-v1"
+    active_replay_preview_min_tokens: int = 2_000
+    active_replay_preview_head_tokens: int = 256
+    active_replay_preview_tail_tokens: int = 256
+    active_replay_preview_max_tokens: int = 768
 
     # -- Session and message filtering ---
     # Sessions to exclude from LCM storage entirely.
@@ -776,6 +940,136 @@ class LCMConfig:
     config_source_warnings: list[str] = field(default_factory=list)
     ignored_config_yaml_lcm_keys: list[str] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        self._normalize_reconcile_budget()
+        self._normalize_background_compaction()
+
+    def _normalize_reconcile_budget(self) -> None:
+        """Restore the bounded default for invalid reconcile budgets.
+
+        Zero explicitly disables the guard. Negative and non-finite values
+        would disable it accidentally, so they fail safe to the default.
+        """
+        try:
+            budget = float(self.reconcile_budget_seconds)
+        except (TypeError, ValueError):
+            budget = 45.0
+        if not math.isfinite(budget) or budget < 0:
+            budget = 45.0
+        self.reconcile_budget_seconds = budget
+
+    def _normalize_background_compaction(self) -> None:
+        """Keep worker and trigger settings within safe operational bounds."""
+
+        defaults = {
+            "background_compaction_workers": 1,
+            "background_compaction_global_limit": 2,
+            "background_compaction_max_passes": 4,
+            "background_compaction_job_timeout_seconds": 120,
+            "background_compaction_lease_seconds": 300,
+            "background_compaction_backlog_tokens": 32_000,
+            "background_compaction_min_provider_source_tokens": 256,
+        }
+        for field_name, default in defaults.items():
+            try:
+                value = int(getattr(self, field_name))
+            except (TypeError, ValueError):
+                value = default
+            minimum = 0 if field_name == "background_compaction_workers" else 1
+            value = max(minimum, value)
+            if field_name == "background_compaction_workers":
+                value = min(1, value)
+            elif field_name == "background_compaction_global_limit":
+                value = min(2, value)
+            setattr(self, field_name, value)
+
+        try:
+            ratio = float(self.background_compaction_prepare_ratio)
+        except (TypeError, ValueError):
+            ratio = 0.55
+        if not math.isfinite(ratio):
+            ratio = 0.55
+        self.background_compaction_prepare_ratio = min(1.0, max(0.0, ratio))
+
+    def _normalize_focused_working_set(self) -> None:
+        """Clamp request-selection limits to finite, operational values."""
+        integer_defaults = {
+            "focused_working_set_target_tokens": 64_000,
+            "focused_working_set_trigger_tokens": 80_000,
+            "focused_working_set_min_reclaim_tokens": 16_000,
+            "focused_working_set_payback_calls": 4,
+        }
+        for field_name, default in integer_defaults.items():
+            try:
+                value = int(getattr(self, field_name))
+            except (TypeError, ValueError):
+                value = default
+            setattr(self, field_name, max(1, value))
+        self.focused_working_set_trigger_tokens = max(
+            self.focused_working_set_target_tokens,
+            self.focused_working_set_trigger_tokens,
+        )
+        try:
+            ratio = float(self.focused_working_set_min_reclaim_ratio)
+        except (TypeError, ValueError):
+            ratio = 0.30
+        if not math.isfinite(ratio):
+            ratio = 0.30
+        self.focused_working_set_min_reclaim_ratio = min(1.0, max(0.0, ratio))
+        try:
+            timeout = float(self.focused_working_set_ingest_timeout_seconds)
+        except (TypeError, ValueError):
+            timeout = 5.0
+        if not math.isfinite(timeout):
+            timeout = 5.0
+        self.focused_working_set_ingest_timeout_seconds = min(30.0, max(0.1, timeout))
+        preview_defaults = {
+            "active_replay_preview_min_tokens": 2_000,
+            "active_replay_preview_head_tokens": 256,
+            "active_replay_preview_tail_tokens": 256,
+            "active_replay_preview_max_tokens": 768,
+        }
+        for field_name, default in preview_defaults.items():
+            try:
+                value = int(getattr(self, field_name))
+            except (TypeError, ValueError, OverflowError):
+                value = default
+            setattr(self, field_name, max(1, value))
+        self.active_replay_preview_max_tokens = max(
+            self.active_replay_preview_max_tokens,
+            self.active_replay_preview_head_tokens
+            + self.active_replay_preview_tail_tokens
+            + 64,
+        )
+        preview_allowlist = self.active_replay_preview_session_allowlist
+        if isinstance(preview_allowlist, str):
+            preview_allowlist = _parse_pattern_list(preview_allowlist)
+        self.active_replay_preview_session_allowlist = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (preview_allowlist or [])
+                if str(value).strip()
+            )
+        )
+
+        try:
+            expected_calls = int(self.compaction_payback_expected_calls)
+        except (TypeError, ValueError):
+            expected_calls = 16
+        self.compaction_payback_expected_calls = max(1, expected_calls)
+        try:
+            reclaim = int(self.compaction_payback_min_reclaim_tokens)
+        except (TypeError, ValueError):
+            reclaim = 8_000
+        self.compaction_payback_min_reclaim_tokens = max(1, reclaim)
+        try:
+            summary_ratio = float(self.compaction_payback_summary_ratio)
+        except (TypeError, ValueError):
+            summary_ratio = 0.20
+        if not math.isfinite(summary_ratio):
+            summary_ratio = 0.20
+        self.compaction_payback_summary_ratio = min(0.90, max(0.01, summary_ratio))
+
     @classmethod
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
@@ -785,7 +1079,7 @@ class LCMConfig:
 
         def _record(field: str, source: str, warning: str | None = None) -> None:
             config_sources[field] = source
-            if warning:
+            if warning and warning not in config_source_warnings:
                 config_source_warnings.append(warning)
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
@@ -839,7 +1133,32 @@ class LCMConfig:
             summary_timeout_default,
             default_source=summary_timeout_source,
         )
+        if c.summary_timeout_ms <= 0:
+            warning = (
+                "nonpositive LCM_SUMMARY_TIMEOUT_MS ignored; using "
+                f"{summary_timeout_default}ms from {summary_timeout_source}"
+            )
+            c.summary_timeout_ms = summary_timeout_default
+            source = summary_timeout_source
+        elif (
+            source == "env:LCM_SUMMARY_TIMEOUT_MS"
+            and summary_timeout_source.startswith("config_yaml:")
+            and c.summary_timeout_ms != summary_timeout_default
+        ):
+            warning = (
+                "LCM summary timeout override differs from YAML authority: "
+                f"effective={c.summary_timeout_ms}ms source={source}; "
+                f"yaml={summary_timeout_default}ms source={summary_timeout_source}"
+            )
         _record("summary_timeout_ms", source, warning)
+
+        for spec in ENV_FIELD_SPECS:
+            if spec.name not in _BACKGROUND_COMPACTION_ENV_FIELDS:
+                continue
+            parser = _PARSER_WITH_SOURCE_BY_TYPE[spec.py_type]
+            value, source, warning = parser(spec.env_key, getattr(c, spec.name))
+            setattr(c, spec.name, value)
+            _record(spec.name, source, warning)
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
         for spec in ENV_FIELD_SPECS:
@@ -847,6 +1166,16 @@ class LCMConfig:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+        raw_preview_allowlist = os.environ.get(
+            "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_ALLOWLIST"
+        )
+        if raw_preview_allowlist is not None:
+            c.active_replay_preview_session_allowlist = _parse_pattern_list(
+                raw_preview_allowlist
+            )
+        c._normalize_reconcile_budget()
+        c._normalize_background_compaction()
+        c._normalize_focused_working_set()
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")

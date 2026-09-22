@@ -181,6 +181,7 @@ class StressRun:
             reserve_tokens_floor=overrides.pop("reserve_tokens_floor", 0),
             **overrides,
         )
+        _provision_externalization_storage(cfg, hermes_home)
         engine = LCMEngine(config=cfg, hermes_home=str(hermes_home))
         engine.on_session_start(
             f"stress-{case}",
@@ -460,6 +461,16 @@ def _externalized_payload_files(hermes_home: str | Path) -> list[Path]:
     if not payload_dir.exists():
         return []
     return sorted(payload_dir.glob("*.json"))
+
+
+def _provision_externalization_storage(config: Any, hermes_home: str | Path) -> Path:
+    """Model production's pre-provisioned payload store before deadline work."""
+    from hermes_lcm.externalize import resolve_large_output_storage_dir
+
+    storage_dir = resolve_large_output_storage_dir(config, hermes_home=str(hermes_home))
+    if not storage_dir.is_dir():
+        raise AssertionError(f"stress externalization storage was not provisioned: {storage_dir}")
+    return storage_dir
 
 
 _FTS_SNIPPET_MARKERS = re.compile(r">>>|<<<")
@@ -856,6 +867,7 @@ def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
     )
 
     def new_engine() -> Any:
+        _provision_externalization_storage(cfg, hermes_home)
         engine = LCMEngine(config=cfg, hermes_home=str(hermes_home))
         engine.update_model("stress-model", 4_000, provider="benchmark")
         return engine
@@ -1124,6 +1136,7 @@ def _profile_rebind_probe(run: StressRun, case: str) -> dict[str, Any]:
         large_output_externalization_threshold_chars=300,
         large_output_transcript_gc_enabled=True,
     )
+    _provision_externalization_storage(cfg, profile_a)
     engine = LCMEngine(config=cfg, hermes_home=str(profile_a))
     engine.update_model("stress-model", 4_000, provider="benchmark")
     try:
@@ -1137,6 +1150,7 @@ def _profile_rebind_probe(run: StressRun, case: str) -> dict[str, Any]:
         engine.on_session_end("profile-a-session", messages_a)
         profile_a_db = str(engine._store.db_path)
 
+        _provision_externalization_storage(cfg, profile_b)
         engine.on_session_start("profile-b-session", platform="cli", conversation_id="profile-b-conv", hermes_home=str(profile_b))
         profile_b_db = str(engine._store.db_path)
         messages_b = [
@@ -1148,6 +1162,7 @@ def _profile_rebind_probe(run: StressRun, case: str) -> dict[str, Any]:
         engine.on_session_end("profile-b-session", messages_b)
         profile_b_probe_for_a = run.call_tool(engine, "lcm_grep", {"query": "CANARY_PROFILE_A_000", "session_scope": "all", "limit": 5})
 
+        _provision_externalization_storage(cfg, profile_a)
         engine.on_session_start("profile-a-session-2", platform="cli", conversation_id="profile-a-conv-2", hermes_home=str(profile_a))
         profile_a_recall, profile_a_probe = _tool_recall_contains(
             run,

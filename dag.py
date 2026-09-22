@@ -16,9 +16,10 @@ import logging
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -31,6 +32,7 @@ from .db_bootstrap import (
 
 _DELETE_SESSION_SCOPE_TABLE = "temp_lcm_delete_session_scope"
 _DELETE_SESSION_SCOPE_INSERT_CHUNK = 512
+_NODE_EDGES_MIGRATION_STEP = "background_compaction_node_edges_v1"
 from .search_query import (
     AGE_DECAY_RATE,
     compute_search_candidate_cap,
@@ -179,6 +181,12 @@ class SummaryDAG:
         """
         return self._conn
 
+    @contextmanager
+    def connection_access(self) -> Iterator[sqlite3.Connection]:
+        """Borrow the legacy connection under its shared serialization lock."""
+        with self._bounded_read_connection() as conn:
+            yield conn
+
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
@@ -244,10 +252,76 @@ class SummaryDAG:
 
     # -- Write --------------------------------------------------------------
 
-    def add_node(self, node: SummaryNode) -> int:
+    def add_node(
+        self,
+        node: SummaryNode,
+        *,
+        lock_timeout_seconds: float | None = None,
+        write_timeout_ms: int | None = None,
+        write_deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        before_commit: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> int:
         """Insert a summary node and return its node_id."""
-        with self._db_lock:
-            cur = self._conn.execute(
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if write_deadline is None:
+                return None
+            return max(0.0, float(write_deadline) - float(clock()))
+
+        def check_deadline() -> None:
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("summary DAG write deadline exceeded")
+
+        effective_lock_timeout = lock_timeout_seconds
+        remaining = remaining_seconds()
+        if remaining is not None:
+            if remaining <= 0:
+                raise TimeoutError("summary DAG write deadline exceeded")
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+        acquired = (
+            bool(self._db_lock.acquire())
+            if effective_lock_timeout is None
+            else bool(
+                self._db_lock.acquire(
+                    timeout=max(0.0, float(effective_lock_timeout))
+                )
+            )
+        )
+        if not acquired:
+            raise TimeoutError("summary DAG lock deadline exceeded")
+
+        prior_busy_timeout: int | None = None
+        primary_error: BaseException | None = None
+        conn = self._conn
+        connection_poisoned = False
+        try:
+            if conn is None:
+                raise RuntimeError("summary DAG is closed")
+            check_deadline()
+            effective_busy_timeout_ms = write_timeout_ms
+            remaining = remaining_seconds()
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            if effective_busy_timeout_ms is not None:
+                prior_busy_timeout = int(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                )
+                conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+                )
+            cur = conn.execute(
                 """INSERT INTO summary_nodes
                    (session_id, depth, summary, token_count, source_token_count,
                     source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
@@ -266,9 +340,57 @@ class SummaryDAG:
                     node.expand_hint,
                 ),
             )
-            self._conn.commit()
+            if before_commit is not None:
+                before_commit(conn)
+            check_deadline()
+            conn.commit()
             node.node_id = cur.lastrowid
             return node.node_id
+        except BaseException as exc:
+            primary_error = exc
+            try:
+                if conn is not None and conn.in_transaction:
+                    conn.rollback()
+            except BaseException:
+                # A failed rollback makes the transaction state unknowable.
+                # Poison this shared connection while the DAG lock is still held
+                # so no later call can commit the failed node accidentally.
+                connection_poisoned = True
+                logger.warning(
+                    "LCM could not roll back a failed summary DAG write; closing "
+                    "the summary DAG connection",
+                    exc_info=True,
+                )
+                try:
+                    if conn is not None:
+                        conn.close()
+                except BaseException:
+                    logger.warning(
+                        "LCM could not close the poisoned summary DAG connection",
+                        exc_info=True,
+                    )
+                if self._conn is conn:
+                    self._conn = None
+            raise
+        finally:
+            try:
+                if (
+                    conn is not None
+                    and not connection_poisoned
+                    and prior_busy_timeout is not None
+                ):
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={prior_busy_timeout}")
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                        logger.warning(
+                            "LCM could not restore SQLite busy_timeout after a failed "
+                            "summary DAG write",
+                            exc_info=True,
+                        )
+            finally:
+                self._db_lock.release()
 
     @staticmethod
     def stage_delete_session_scope(
@@ -405,26 +527,138 @@ class SummaryDAG:
 
     # -- Read ---------------------------------------------------------------
 
-    def get_node(self, node_id: int) -> Optional[SummaryNode]:
-        row = self._conn.execute(
-            "SELECT * FROM summary_nodes WHERE node_id = ?", (node_id,)
-        ).fetchone()
+    @contextmanager
+    def _bounded_read_connection(
+        self,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Borrow the shared DAG connection without escaping a caller wall."""
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, float(deadline) - float(clock()))
+
+        remaining = remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("summary DAG read deadline exceeded")
+        effective_lock_timeout = lock_timeout_seconds
+        if remaining is not None:
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+        if effective_lock_timeout is None:
+            acquired = bool(self._db_lock.acquire())
+        else:
+            acquired = bool(
+                self._db_lock.acquire(
+                    timeout=max(0.0, float(effective_lock_timeout))
+                )
+            )
+        if not acquired:
+            raise TimeoutError("summary DAG lock deadline exceeded")
+
+        conn = self._conn
+        prior_busy_timeout: int | None = None
+        primary_error: BaseException | None = None
+        try:
+            if conn is None:
+                raise RuntimeError("summary DAG is closed")
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("summary DAG read deadline exceeded")
+            effective_busy_timeout_ms = busy_timeout_ms
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            if effective_busy_timeout_ms is not None:
+                prior_busy_timeout = int(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                )
+                conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+                )
+            yield conn
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("summary DAG read deadline exceeded")
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                if conn is not None and prior_busy_timeout is not None:
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={prior_busy_timeout}")
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                        logger.warning(
+                            "LCM could not restore SQLite busy_timeout after a failed "
+                            "summary DAG read",
+                            exc_info=True,
+                        )
+            finally:
+                self._db_lock.release()
+
+    def get_node(
+        self,
+        node_id: int,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> Optional[SummaryNode]:
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
+                "SELECT * FROM summary_nodes WHERE node_id = ?", (node_id,)
+            ).fetchone()
         return self._row_to_node(row) if row else None
 
-    def get_session_nodes(self, session_id: str,
-                          depth: int | None = None,
-                          limit: int = 1000) -> List[SummaryNode]:
+    def get_session_nodes(
+        self,
+        session_id: str,
+        depth: int | None = None,
+        limit: int = 1000,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> List[SummaryNode]:
         """Get nodes for a session, optionally filtered by depth."""
-        with self._db_lock:
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
             if depth is not None:
-                rows = self._conn.execute(
+                rows = conn.execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ? AND depth = ?
                        ORDER BY created_at LIMIT ?""",
                     (session_id, depth, limit),
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                rows = conn.execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ?
                        ORDER BY depth, created_at LIMIT ?""",
@@ -466,27 +700,42 @@ class SummaryDAG:
             ).fetchone()
         return row[0] if row else 0
 
-    def get_session_node_count(self, session_id: str) -> int:
+    def get_session_node_count(
+        self,
+        session_id: str,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> int:
         """Count summary nodes for a session without loading node rows."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
         return int(row[0] if row else 0)
 
     def get_session_depth_stats(self, session_id: str) -> Dict[int, Dict[str, int]]:
         """Aggregate per-depth node/token stats for a session."""
-        rows = self._conn.execute(
-            """SELECT depth,
-                      COUNT(*) AS count,
-                      COALESCE(SUM(token_count), 0) AS tokens,
-                      COALESCE(SUM(source_token_count), 0) AS source_tokens
-               FROM summary_nodes
-               WHERE session_id = ?
-               GROUP BY depth
-               ORDER BY depth""",
-            (session_id,),
-        ).fetchall()
+        with self._bounded_read_connection() as conn:
+            rows = conn.execute(
+                """SELECT depth,
+                          COUNT(*) AS count,
+                          COALESCE(SUM(token_count), 0) AS tokens,
+                          COALESCE(SUM(source_token_count), 0) AS source_tokens
+                   FROM summary_nodes
+                   WHERE session_id = ?
+                   GROUP BY depth
+                   ORDER BY depth""",
+                (session_id,),
+            ).fetchall()
         return {
             int(row[0]): {
                 "count": int(row[1] or 0),
@@ -506,35 +755,50 @@ class SummaryDAG:
         """Return a bounded ordered sample of nodes per depth."""
         if per_depth_limit <= 0:
             return {}
-        if depths is None:
-            depth_rows = self._conn.execute(
-                """SELECT DISTINCT depth FROM summary_nodes
-                   WHERE session_id = ?
-                   ORDER BY depth""",
-                (session_id,),
-            ).fetchall()
-            depths = [int(row[0]) for row in depth_rows]
-
         samples: Dict[int, List[SummaryNode]] = {}
-        for depth in depths:
-            rows = self._conn.execute(
-                """SELECT * FROM summary_nodes
-                   WHERE session_id = ? AND depth = ?
-                   ORDER BY created_at LIMIT ?""",
-                (session_id, depth, per_depth_limit),
-            ).fetchall()
-            samples[int(depth)] = [self._row_to_node(row) for row in rows]
+        with self._bounded_read_connection() as conn:
+            if depths is None:
+                depth_rows = conn.execute(
+                    """SELECT DISTINCT depth FROM summary_nodes
+                       WHERE session_id = ?
+                       ORDER BY depth""",
+                    (session_id,),
+                ).fetchall()
+                depths = [int(row[0]) for row in depth_rows]
+
+            for depth in depths:
+                rows = conn.execute(
+                    """SELECT * FROM summary_nodes
+                       WHERE session_id = ? AND depth = ?
+                       ORDER BY created_at LIMIT ?""",
+                    (session_id, depth, per_depth_limit),
+                ).fetchall()
+                samples[int(depth)] = [self._row_to_node(row) for row in rows]
         return samples
 
-    def get_uncondensed_at_depth(self, session_id: str, depth: int,
-                                  limit: int = 100) -> List[SummaryNode]:
+    def get_uncondensed_at_depth(
+        self,
+        session_id: str,
+        depth: int,
+        limit: int = 100,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> List[SummaryNode]:
         """Get nodes at a depth that haven't been condensed yet.
 
         A node is 'uncondensed' if it's not referenced as a source by
         any higher-depth node.
         """
-        with self._db_lock:
-            rows = self._conn.execute(
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            rows = conn.execute(
                 """SELECT n.* FROM summary_nodes n
                    WHERE n.session_id = ? AND n.depth = ?
                    AND n.node_id NOT IN (
@@ -546,6 +810,79 @@ class SummaryDAG:
                 (session_id, depth, session_id, depth, limit),
             ).fetchall()
         return [self._row_to_node(r) for r in rows]
+
+    def get_active_frontier_nodes(
+        self,
+        session_id: str,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> List[SummaryNode]:
+        """Return every active summary root for ``session_id`` exactly.
+
+        Once the normalized edge backfill is complete, reverse-edge lookup is
+        indexed.  Older databases remain correct through an uncapped JSON
+        fallback until that optional migration has finished.
+        """
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            edges_complete = conn.execute(
+                """
+                SELECT 1 FROM lcm_migration_state
+                WHERE step_name=?
+                """,
+                (_NODE_EDGES_MIGRATION_STEP,),
+            ).fetchone() is not None
+            if edges_complete:
+                rows = conn.execute(
+                    """
+                    SELECT n.*
+                    FROM summary_nodes AS n
+                    WHERE n.session_id=?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM lcm_compaction_node_edges AS edge
+                          JOIN summary_nodes AS parent
+                            ON parent.node_id=edge.parent_node_id
+                          WHERE edge.session_id=?
+                            AND edge.child_node_id=n.node_id
+                            AND parent.session_id=n.session_id
+                            AND parent.depth>n.depth
+                            AND parent.source_type='nodes'
+                      )
+                    ORDER BY n.depth DESC, n.created_at, n.node_id
+                    """,
+                    (session_id, session_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT n.*
+                    FROM summary_nodes AS n
+                    WHERE n.session_id=?
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM summary_nodes AS parent,
+                               json_each(
+                                   CASE WHEN json_valid(parent.source_ids)
+                                        THEN parent.source_ids ELSE '[]' END
+                               ) AS source
+                          WHERE parent.session_id=n.session_id
+                            AND parent.depth>n.depth
+                            AND parent.source_type='nodes'
+                            AND CAST(source.value AS INTEGER)=n.node_id
+                      )
+                    ORDER BY n.depth DESC, n.created_at, n.node_id
+                    """,
+                    (session_id,),
+                ).fetchall()
+        return [self._row_to_node(row) for row in rows]
 
     # -- Search -------------------------------------------------------------
 
@@ -710,12 +1047,13 @@ class SummaryDAG:
         if node.source_type != "nodes" or not node.source_ids:
             return []
         placeholders = ",".join("?" * len(node.source_ids))
-        rows = self._conn.execute(
-            f"""SELECT * FROM summary_nodes
-                WHERE node_id IN ({placeholders})
-                ORDER BY created_at""",
-            node.source_ids,
-        ).fetchall()
+        with self._bounded_read_connection() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM summary_nodes
+                    WHERE node_id IN ({placeholders})
+                    ORDER BY created_at""",
+                node.source_ids,
+            ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
     def source_message_ids(self, node_id: int, *, limit: int) -> List[int]:
@@ -774,46 +1112,66 @@ class SummaryDAG:
         if cache is not None and node_id in cache:
             return cache[node_id]
         legacy_blank_clause = _legacy_blank_source_clause("m.source")
-        row = self._conn.execute(
-            f"""
-            WITH RECURSIVE source_walk(source_type, source_id) AS (
-                SELECT n.source_type, CAST(j.value AS INTEGER)
-                FROM summary_nodes n, json_each(n.source_ids) j
-                WHERE n.node_id = ?
+        with self._bounded_read_connection() as conn:
+            row = conn.execute(
+                f"""
+                WITH RECURSIVE source_walk(source_type, source_id) AS (
+                    SELECT n.source_type, CAST(j.value AS INTEGER)
+                    FROM summary_nodes n, json_each(n.source_ids) j
+                    WHERE n.node_id = ?
 
-                UNION ALL
+                    UNION ALL
 
-                SELECT child.source_type, CAST(j.value AS INTEGER)
-                FROM summary_nodes child
-                JOIN source_walk walk
-                  ON walk.source_type = 'nodes'
-                 AND child.node_id = walk.source_id
-                JOIN json_each(child.source_ids) j
-            )
-            SELECT 1
-            FROM source_walk walk
-            JOIN messages m
-              ON walk.source_type = 'messages'
-             AND m.store_id = walk.source_id
-            WHERE CASE
-                    WHEN ? = ? THEN (m.source = ? OR {legacy_blank_clause})
-                    ELSE m.source = ?
-                  END
-            LIMIT 1
-            """,
-            (node_id, normalized_source, _UNKNOWN_SOURCE, normalized_source, normalized_source),
-        ).fetchone()
+                    SELECT child.source_type, CAST(j.value AS INTEGER)
+                    FROM summary_nodes child
+                    JOIN source_walk walk
+                      ON walk.source_type = 'nodes'
+                     AND child.node_id = walk.source_id
+                    JOIN json_each(child.source_ids) j
+                )
+                SELECT 1
+                FROM source_walk walk
+                JOIN messages m
+                  ON walk.source_type = 'messages'
+                 AND m.store_id = walk.source_id
+                WHERE CASE
+                        WHEN ? = ? THEN (m.source = ? OR {legacy_blank_clause})
+                        ELSE m.source = ?
+                      END
+                LIMIT 1
+                """,
+                (
+                    node_id,
+                    normalized_source,
+                    _UNKNOWN_SOURCE,
+                    normalized_source,
+                    normalized_source,
+                ),
+            ).fetchone()
         matched = row is not None
         if cache is not None:
             cache[node_id] = matched
         return matched
 
-    def get_source_time_window(self, node_ids: List[int]) -> tuple[float | None, float | None]:
+    def get_source_time_window(
+        self,
+        node_ids: List[int],
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> tuple[float | None, float | None]:
         if not node_ids:
             return None, None
         placeholders = ",".join("?" * len(node_ids))
-        with self._db_lock:
-            row = self._conn.execute(
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
                 f"""SELECT
                         MIN(COALESCE(earliest_at, created_at)),
                         MAX(COALESCE(latest_at, created_at))
@@ -875,14 +1233,15 @@ class SummaryDAG:
         )
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        with self._db_lock:
+            conn = getattr(self, "_conn", None)
+            if conn:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

@@ -7,6 +7,7 @@ with a DAG-based summarization system that preserves every message.
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -25,6 +26,14 @@ from .codex_routing import (
     _is_codex_gpt55_route,
 )
 from .config import LCMConfig
+from .background_compaction import (
+    BackgroundCompactionStore,
+    ForegroundProviderPermitUnavailable,
+    PromotionResult,
+    ProviderPermit,
+    acquire_background_runtime,
+    background_policy_fingerprint,
+)
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
@@ -40,18 +49,21 @@ from .escalation import (
     summarize_with_escalation,
 )
 from .externalize import (
+    ExternalizationOwnership,
     build_transcript_gc_placeholder,
     extract_externalized_ref,
     find_externalized_payload_for_message,
     find_externalized_tool_result_content_for_call,
+    get_large_output_storage_dir,
     is_externalized_placeholder,
     load_externalized_payload,
     maybe_externalize_tool_output,
 )
 from .extraction import (
+    PreparedExtraction,
     extract_before_compaction,
+    persist_pre_compaction_extraction,
     sanitize_pre_compaction_content,
-    sanitize_pre_compaction_tool_arguments,
     strip_injected_context_blocks,
 )
 from .ingest_protection import (
@@ -85,7 +97,11 @@ from .rollup_builder import (
     run_rollup_maintenance,
 )
 from .assertion_extraction import ModelAssertionExtractor
-from .assertion_store import AssertionStore, SourceSnapshot
+from .assertion_store import (
+    AssertionSchemaReadyToken,
+    AssertionStore,
+    SourceSnapshot,
+)
 from .adaptive_retrieval import AdaptiveRetrievalRegistry
 from .query_view_store import QueryViewStore
 from .schemas import (
@@ -115,15 +131,18 @@ from .session_patterns import (
     matches_session_pattern,
 )
 from .message_analysis import (
-    _is_synthetic_assistant_noise,
-    _matched_tool_call_ids,
     _tool_call_id,
 )
 from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
-from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
+from .reconcile import (
+    ForegroundDeadlineExceeded,
+    ReconcileBudgetExceeded,
+    ReconcileMixin,
+    _PRESERVED_OBJECTIVE_CONTEXT_PREFIX,
+)
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
@@ -138,12 +157,29 @@ from .sqlite_util import (
     _temporary_sqlite_busy_timeout,
 )
 from .store import MessageStore
+from .summary_serialization import (
+    project_active_replay_messages,
+    serialize_summary_messages,
+)
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
+from .working_set import (
+    WORKING_SET_REFERENCE_PREFIX,
+    WorkingSetDecision,
+    select_phase_working_set,
+)
+from .active_replay_preview import (
+    ActiveReplayPreviewPolicy,
+    project_externalized_tool_results,
+)
 
 logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+_FOREGROUND_PROJECTION_MAX_WORKERS = 4
+_FOREGROUND_PROJECTION_PROCESS_SLOT = threading.BoundedSemaphore(
+    _FOREGROUND_PROJECTION_MAX_WORKERS
+)
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -382,7 +418,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._background_compaction: BackgroundCompactionStore | None = None
+        self._background_runtime_handle: Any = None
+        # A timed-out Python thread may remain inside a provider that ignores
+        # cancellation. Keep all foreground provider-like calls single-flight
+        # until the physical call returns instead of accumulating orphans.
+        self._foreground_hard_call_slot = threading.BoundedSemaphore(1)
+        self._foreground_projection_call_slot = threading.BoundedSemaphore(1)
+        self._extraction_persistence_slot = threading.BoundedSemaphore(1)
+        self._extraction_persistence_idle = threading.Event()
+        self._extraction_persistence_idle.set()
         self._assertion_extraction_metrics_lock = threading.RLock()
+        # Restart reconciliation temporarily installs per-call memo/deadline
+        # state on the engine. Serialize it so concurrent post-LLM hooks cannot
+        # overwrite or clear another call's guardrails.
+        self._reconcile_lock = threading.Lock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
         self._assertion_extraction_batches_scheduled = 0
@@ -535,6 +585,36 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        self._last_working_set_decision: dict[str, Any] = {
+            "reason": "never_run",
+            "source_tokens": 0,
+            "selected_tokens": 0,
+            "omitted_tokens": 0,
+            "source_sha256": "",
+            "cache_state": "unknown",
+            "payback_calls": 0,
+        }
+        self._active_replay_preview_policies: dict[
+            str, ActiveReplayPreviewPolicy
+        ] = {}
+        self._last_active_replay_preview: dict[str, Any] = {
+            "reason": "never_run",
+            "policy_version": "externalized-tool-preview-v1",
+            "eligible_results": 0,
+            "projected_results": 0,
+            "source_tokens": 0,
+            "projected_tokens": 0,
+            "tokens_saved": 0,
+            "refs": [],
+        }
+        self._last_compaction_payback: dict[str, Any] = {
+            "allowed": None,
+            "reason": "never_evaluated",
+            "same_source_denials": 0,
+        }
+        self._last_foreground_deadline: Dict[str, Any] = {
+            "status": "never_exhausted"
+        }
         # Ingest-failure tracking. The core promise is that nothing is ever
         # lost, but a swallowed persistence error (disk full, DB locked,
         # corruption) silently breaks it: the turn continues while messages
@@ -567,6 +647,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
+        self._last_active_replay_store_ids: list[Optional[int]] = []
+        self._last_active_replay_explicit_store_id_indices: set[int] = set()
+        self._active_replay_store_refs_by_message_id: dict[
+            int,
+            tuple[Dict[str, Any], Optional[int]],
+        ] = {}
+        self._active_replay_store_ref_session_id = ""
+        self._active_replay_store_ref_conversation_id = ""
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
@@ -682,18 +770,49 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._query_views = None
         self._adaptive_retrieval = None
         self._assertion_extractor = None
+        self._assertion_schema_ready_token = None
         try:
             self._store = MessageStore(
                 db_path,
                 ingest_protection_config=self._config,
                 hermes_home=hermes_home,
             )
+            # Resolve the configured target without creating it. Automatic
+            # foreground projections are abandonable and therefore may use an
+            # already-provisioned directory, but must never mkdir one. Manual
+            # and background writes retain their normal lazy-create path.
+            self._foreground_externalization_storage_dir = None
+            try:
+                self._foreground_externalization_storage_dir = (
+                    get_large_output_storage_dir(
+                        self._config,
+                        hermes_home=hermes_home,
+                        create=False,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "LCM externalization storage unavailable at engine bind: %s",
+                    exc,
+                )
             self._dag = SummaryDAG(db_path)
             if self._config.temporal_rollups_enabled:
                 # Install the transaction-coupled summary mutation triggers before
                 # this engine can publish or delete a DAG node.
                 initialize_rollup_invalidation_outbox(self._dag)
             self._lifecycle = LifecycleStateStore(db_path)
+            if (
+                self._config.background_compaction_enabled
+                and not self._background_compaction_compatibility_blocker()
+            ):
+                self._background_compaction = BackgroundCompactionStore(
+                    db_path,
+                    config=self._config,
+                )
+                self._background_runtime_handle = acquire_background_runtime(
+                    db_path,
+                    config=self._config,
+                )
             self._assertions = (
                 AssertionStore(db_path)
                 if bool(getattr(self._config, "assertions_enabled", False))
@@ -716,6 +835,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._assertions is not None
                 and bool(getattr(self._config, "assertion_extraction_enabled", False))
             ):
+                # All profile stores have finished startup DDL. Issue one exact
+                # inode/schema-cookie proof so deadline-owned workers can skip
+                # migrations without weakening schema validation.
+                self._assertion_schema_ready_token = (
+                    self._assertions.issue_schema_ready_token()
+                )
                 self._assertion_extractor = ModelAssertionExtractor(
                     self._assertions,
                     model=self._assertion_extraction_model(),
@@ -727,7 +852,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
+        self._assertion_schema_ready_token = None
+        self._foreground_externalization_storage_dir = None
+        runtime_handle = getattr(self, "_background_runtime_handle", None)
+        self._background_runtime_handle = None
+        release = getattr(runtime_handle, "release", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                logger.debug(
+                    "LCM failed releasing background compaction runtime",
+                    exc_info=True,
+                )
         for attr in (
+            "_background_compaction",
             "_adaptive_retrieval",
             "_store",
             "_dag",
@@ -742,6 +881,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     close()
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+            if attr == "_background_compaction":
+                self._background_compaction = None
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -898,6 +1039,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         context-threshold value, so expose the stricter cap here; otherwise a
         tool/schema-heavy request can skip host preflight entirely.
         """
+        publication_cap = getattr(self, "_admission_publication_tokens", 0)
+        if publication_cap:
+            context_threshold_tokens = min(context_threshold_tokens, publication_cap) if context_threshold_tokens > 0 else publication_cap
         assembly_cap = self._effective_assembly_token_cap()
         if assembly_cap is not None and assembly_cap > 0:
             if context_threshold_tokens > 0:
@@ -949,9 +1093,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._runtime_context_threshold(model=model, provider=provider)
         )
         self.threshold_percent = self.context_threshold
-        context_threshold_tokens = int(
-            effective_context_length * self.context_threshold
-        )
+        reserve_tokens = max(0, int(self._config.context_reserve_tokens or 0))
+        if reserve_tokens > 0:
+            context_threshold_tokens = max(
+                1,
+                effective_context_length - reserve_tokens,
+            )
+        else:
+            context_threshold_tokens = int(
+                effective_context_length * self.context_threshold
+            )
         self.threshold_tokens = self._effective_threshold_tokens(
             context_threshold_tokens
         )
@@ -979,6 +1130,261 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def name(self) -> str:
         return "lcm"
 
+    @staticmethod
+    def _working_set_message_identity(message: Dict[str, Any]) -> str:
+        return json.dumps(
+            message,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def _working_set_required_request_indices(
+        self,
+        request_messages: List[Dict[str, Any]],
+        conversation_messages: Optional[List[Dict[str, Any]]],
+    ) -> set[int]:
+        """Preserve request-only authority/profile/prefill scaffolding.
+
+        The persisted transcript is reference data. Messages present only in
+        the assembled request include the system prompt, policy/profile
+        projections, prefill and other host-owned scaffolding, so they are
+        mandatory even when their text is not recognized by a heuristic.
+        """
+        remaining: dict[str, int] = {}
+        for message in conversation_messages or []:
+            identity = self._working_set_message_identity(message)
+            remaining[identity] = remaining.get(identity, 0) + 1
+        required: set[int] = set()
+        for index, message in enumerate(request_messages):
+            if message.get("role") == "system":
+                required.add(index)
+                continue
+            identity = self._working_set_message_identity(message)
+            available = remaining.get(identity, 0)
+            if available > 0:
+                remaining[identity] = available - 1
+            else:
+                required.add(index)
+        return required
+
+    def _working_set_cache_state(self) -> str:
+        if self.last_cache_read_tokens > 0 or self.last_cache_write_tokens > 0:
+            return "hot"
+        if self.cache_metrics_available:
+            return "cold"
+        return "unknown"
+
+    def _active_replay_preview_policy(self) -> ActiveReplayPreviewPolicy:
+        """Return the immutable policy snapshot for the bound session."""
+        session_id = str(self._session_id or "")
+        existing = self._active_replay_preview_policies.get(session_id)
+        if existing is not None:
+            return existing
+        allowlist = set(self._config.active_replay_preview_session_allowlist)
+        policy = ActiveReplayPreviewPolicy(
+            enabled=bool(self._config.active_replay_preview_enabled)
+            and (not allowlist or session_id in allowlist),
+            version=str(
+                self._config.active_replay_preview_policy_version
+                or "externalized-tool-preview-v1"
+            ),
+            min_tokens=int(self._config.active_replay_preview_min_tokens),
+            head_tokens=int(self._config.active_replay_preview_head_tokens),
+            tail_tokens=int(self._config.active_replay_preview_tail_tokens),
+            max_tokens=int(self._config.active_replay_preview_max_tokens),
+            fresh_tail_count=int(self._config.fresh_tail_count),
+        )
+        self._active_replay_preview_policies[session_id] = policy
+        while len(self._active_replay_preview_policies) > 1_024:
+            self._active_replay_preview_policies.pop(
+                next(iter(self._active_replay_preview_policies))
+            )
+        return policy
+
+    def _record_active_replay_preview(self, decision: Any) -> None:
+        self._last_active_replay_preview = {
+            "reason": str(decision.reason),
+            "policy_version": str(decision.policy_version),
+            "eligible_results": int(decision.eligible_results),
+            "projected_results": int(decision.projected_results),
+            "source_tokens": int(decision.source_tokens),
+            "projected_tokens": int(decision.projected_tokens),
+            "tokens_saved": int(decision.tokens_saved),
+            "refs": list(decision.refs),
+        }
+
+    def _record_working_set_decision(self, decision: WorkingSetDecision) -> None:
+        self._last_working_set_decision = {
+            "reason": decision.reason,
+            "source_tokens": decision.source_tokens,
+            "selected_tokens": decision.selected_tokens,
+            "omitted_tokens": decision.omitted_tokens,
+            "source_sha256": decision.source_sha256,
+            "omitted_ranges": [list(value) for value in decision.omitted_ranges],
+            "cache_state": decision.cache_state,
+            "payback_calls": decision.payback_calls,
+        }
+
+    def _active_replay_preview_excluded_indices(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> set[int]:
+        """Exclude content altered by existing privacy/ignore policy."""
+        excluded: set[int] = set()
+        for index, message in enumerate(messages):
+            if self._matches_ignore_message_patterns(message):
+                excluded.add(index)
+                continue
+            original = normalize_content_value(message.get("content")) or ""
+            redacted = normalize_content_value(
+                redact_sensitive_value(
+                    message.get("content"),
+                    self._config,
+                    parse_json_strings=False,
+                )
+            ) or ""
+            if redacted != original:
+                excluded.add(index)
+        return excluded
+
+    def _ingest_for_working_set(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> bool:
+        if not messages or self._bypasses_lcm_context_management():
+            return False
+        timeout = max(
+            0.1,
+            float(self._config.focused_working_set_ingest_timeout_seconds),
+        )
+        deadline = self._foreground_now() + timeout
+        try:
+            self._ingest_messages(messages, deadline=deadline)
+            return True
+        except Exception as exc:
+            self._record_ingest_failure("focused working set", exc)
+            logger.warning(
+                "LCM focused working-set ingest failed; retaining full request",
+                exc_info=True,
+            )
+            return False
+
+    def select_context(
+        self,
+        request_messages: List[Dict[str, Any]],
+        *,
+        conversation_messages: Optional[List[Dict[str, Any]]] = None,
+        incoming_message: Optional[Dict[str, Any]] = None,
+        budget_tokens: int = 0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Select a bounded phase view while keeping raw history lossless."""
+        preview_policy = self._active_replay_preview_policy()
+        working_set_enabled = bool(self._config.focused_working_set_enabled)
+        if not working_set_enabled and not preview_policy.enabled:
+            return None
+        if self._bypasses_lcm_context_management():
+            return None
+        if (
+            preview_policy.enabled
+            and self._config.ignore_message_patterns
+            and not self._compiled_ignore_message_patterns
+        ):
+            # A configured ignore policy that could not be compiled must not
+            # become a privacy bypass merely because the optional bounded
+            # regex engine is unavailable. Disable only this request-local
+            # preview; established working-set behavior remains unchanged.
+            preview_policy = ActiveReplayPreviewPolicy(
+                enabled=False,
+                version=preview_policy.version,
+                min_tokens=preview_policy.min_tokens,
+                head_tokens=preview_policy.head_tokens,
+                tail_tokens=preview_policy.tail_tokens,
+                max_tokens=preview_policy.max_tokens,
+                fresh_tail_count=preview_policy.fresh_tail_count,
+            )
+        durable_source = list(conversation_messages or [])
+        if isinstance(incoming_message, dict) and incoming_message not in durable_source:
+            durable_source.append(incoming_message)
+        if durable_source and not self._ingest_for_working_set(durable_source):
+            return None
+
+        preview_decision = project_externalized_tool_results(
+            request_messages,
+            session_id=str(self._session_id or ""),
+            config=self._config,
+            hermes_home=self._hermes_home,
+            policy=preview_policy,
+            excluded_result_indices=self._active_replay_preview_excluded_indices(
+                request_messages
+            ),
+        )
+        self._record_active_replay_preview(preview_decision)
+        projected_messages = preview_decision.messages or request_messages
+        if not working_set_enabled:
+            return preview_decision.messages
+
+        target = int(self._config.focused_working_set_target_tokens)
+        if budget_tokens > 0:
+            # Never spend more than half of a model window on replay when the
+            # configured target is larger, while retaining a useful floor.
+            target = min(target, max(8_000, int(budget_tokens * 0.50)))
+        required_indices = self._working_set_required_request_indices(
+            projected_messages,
+            conversation_messages,
+        )
+        decision = select_phase_working_set(
+            projected_messages,
+            target_tokens=target,
+            trigger_tokens=max(
+                target,
+                int(self._config.focused_working_set_trigger_tokens),
+            ),
+            min_reclaim_tokens=int(
+                self._config.focused_working_set_min_reclaim_tokens
+            ),
+            min_reclaim_ratio=float(
+                self._config.focused_working_set_min_reclaim_ratio
+            ),
+            cache_state=self._working_set_cache_state(),
+            expected_remaining_calls=int(
+                self._config.focused_working_set_payback_calls
+            ),
+            required_indices=required_indices,
+        )
+        self._record_working_set_decision(decision)
+        if decision.messages is None:
+            return preview_decision.messages
+        selected = self._sanitize_active_context_messages(decision.messages)
+        if not selected or count_messages_tokens(selected) >= decision.source_tokens:
+            self._record_working_set_decision(
+                WorkingSetDecision(
+                    None,
+                    "post_validation_failed",
+                    decision.source_tokens,
+                    count_messages_tokens(selected),
+                    0,
+                    decision.source_sha256,
+                    decision.omitted_ranges,
+                    decision.cache_state,
+                    decision.payback_calls,
+                )
+            )
+            return preview_decision.messages
+        return selected
+
+    def on_turn_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        usage: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Durably ingest each finalized turn without triggering a model call."""
+        if not self._config.focused_working_set_enabled:
+            return
+        self._ingest_for_working_set(messages)
+
     @property
     def last_compression_status(self) -> str:
         """Public status for the most recent compression/preflight attempt.
@@ -998,6 +1404,1171 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def last_compression_was_noop(self) -> bool:
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status == "noop"
+
+    def _background_publication_trigger_tokens(self) -> int:
+        """Publish before the host admission budget, retaining earlier policy."""
+        window = max(0, int(self.context_length or 0))
+        reserve = max(0, int(self._config.context_reserve_tokens or 0))
+        trigger = max(1, window - reserve) if window > 0 and reserve > 0 else max(0, int(self.threshold_tokens or 0))
+        bound = getattr(self, "_admission_publication_tokens", 0)
+        if bound:
+            trigger = min(trigger or bound, bound, self._effective_assembly_token_cap() or bound)
+        return trigger
+
+    def _background_emergency_trigger_tokens(self) -> int:
+        """Recover with headroom before assembly and final host admission."""
+        window = max(0, int(self.context_length or 0))
+        if window <= 0:
+            return 0
+        trigger = max(1, window - max(32_000, int(window * 0.05)))
+        bound = getattr(self, "_admission_emergency_tokens", 0)
+        if bound:
+            trigger = min(trigger, bound, self._effective_assembly_token_cap() or bound)
+        return trigger
+
+    def _background_compaction_enabled(self) -> bool:
+        return bool(
+            self._config.background_compaction_enabled
+            and self._background_compaction is not None
+            and not self._background_compaction_compatibility_blocker()
+        )
+
+    def _background_compaction_compatibility_blocker(self) -> str:
+        """Return why this configuration must retain foreground derivation.
+
+        File/assertion extraction are separate model-data egress paths.  Until
+        an operator explicitly adopts an asynchronous policy for those paths,
+        keep their existing foreground semantics rather than silently skipping
+        them or sending captured content from a new background worker.
+        """
+        if bool(getattr(self._config, "extraction_enabled", False)):
+            return "file_extraction_requires_foreground_compaction"
+        if bool(getattr(self._config, "assertions_enabled", False)) and bool(
+            getattr(self._config, "assertion_extraction_enabled", False)
+        ):
+            return "assertion_extraction_requires_foreground_compaction"
+        return ""
+
+    def _background_policy_fingerprint(self) -> str:
+        return background_policy_fingerprint(self._config)
+
+    def _reconcile_background_publication_fence(
+        self,
+        lifecycle_state: Any | None = None,
+        *,
+        log_contention: bool = False,
+        deadline: float | None = None,
+    ) -> int | None:
+        """Activate the currently bound lifecycle epoch with a bounded CAS.
+
+        This is intentionally safe to call again on a later foreground turn.
+        The store will not reopen an intentional reset fence for the same
+        lifecycle binding, but it can recover from a transient activation lock
+        after a newer durable bind.
+        """
+        if (
+            not self._background_compaction_enabled()
+            or not self._conversation_id
+            or not self._session_id
+        ):
+            return None
+        remaining = self._foreground_deadline_remaining(deadline)
+        if deadline is not None and (remaining is None or remaining <= 0):
+            raise ForegroundDeadlineExceeded(
+                "publication fence",
+                "before lifecycle lookup",
+            )
+        try:
+            state = lifecycle_state or self._lifecycle.get_by_conversation(
+                self._conversation_id,
+                lock_timeout_seconds=remaining,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                "publication fence",
+                "lifecycle lookup exceeded the shared deadline",
+            ) from exc
+        if (
+            state is None
+            or state.current_session_id != self._session_id
+            or state.current_bound_at is None
+        ):
+            return None
+        try:
+            write_timeout_ms = 100
+            remaining = self._foreground_deadline_remaining(deadline)
+            if remaining is not None:
+                write_timeout_ms = min(
+                    write_timeout_ms,
+                    max(0, int(remaining * 1000)),
+                )
+            return self._background_compaction.activate_session(
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                expected_lifecycle_bound_at=float(state.current_bound_at),
+                expected_lifecycle_reset_at=state.last_reset_at,
+                write_timeout_ms=write_timeout_ms,
+                lock_timeout_seconds=remaining,
+                write_deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                "publication fence",
+                "activation lock wait exceeded the shared deadline",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            if log_contention:
+                logger.warning(
+                    "LCM background publication fence activation deferred: %s",
+                    exc,
+                )
+            return None
+
+    def _maybe_enqueue_background_compaction(
+        self,
+        messages: List[Dict[str, Any]],
+        observed_tokens: int | None = None,
+        *,
+        allow_canonical_prefix_adoption: bool = True,
+        deadline: float | None = None,
+    ):
+        """Capture/coalesce eligible durable raw work without model I/O."""
+        if (
+            not self._background_compaction_enabled()
+            or not self._session_id
+            or not self._conversation_id
+            or self._call_with_foreground_deadline(
+                self._bypasses_lcm_context_management,
+                deadline=deadline,
+            )
+        ):
+            return None
+        remaining = self._foreground_deadline_remaining(deadline)
+        try:
+            lifecycle = self._lifecycle.get_by_conversation(
+                self._conversation_id,
+                lock_timeout_seconds=remaining,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except TimeoutError:
+            return None
+        if lifecycle is None or lifecycle.current_session_id != self._session_id:
+            return None
+        try:
+            fence_generation = self._reconcile_background_publication_fence(
+                lifecycle,
+                deadline=deadline,
+            )
+        except ForegroundDeadlineExceeded:
+            return None
+        if fence_generation is None:
+            return None
+        if allow_canonical_prefix_adoption:
+            adopted_frontier = self._maybe_adopt_existing_canonical_prefix(
+                lifecycle,
+                expected_session_fence_generation=fence_generation,
+                deadline=deadline,
+            )
+            if adopted_frontier > int(lifecycle.current_frontier_store_id or 0):
+                # The durable frontier changed atomically.  Do not capture a
+                # stale job in this boundary; preflight/compress will rebuild
+                # the active view from the canonical DAG before considering
+                # the still-uncovered suffix on a later bounded boundary.
+                return None
+            remaining = self._foreground_deadline_remaining(deadline)
+            try:
+                latest_lifecycle = self._lifecycle.get_by_conversation(
+                    self._conversation_id,
+                    lock_timeout_seconds=remaining,
+                    deadline=deadline,
+                    deadline_clock=self._foreground_now,
+                )
+            except TimeoutError:
+                return None
+            if (
+                latest_lifecycle is None
+                or latest_lifecycle.current_session_id != self._session_id
+                or int(latest_lifecycle.current_frontier_store_id or 0)
+                != int(lifecycle.current_frontier_store_id or 0)
+            ):
+                return None
+        active_tokens = (
+            int(observed_tokens)
+            if observed_tokens is not None and int(observed_tokens) >= 0
+            else count_messages_tokens(messages)
+        )
+        try:
+            remaining = self._foreground_deadline_remaining(deadline)
+            job = self._background_compaction.capture_and_enqueue(
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                expected_frontier_store_id=lifecycle.current_frontier_store_id,
+                active_tokens=active_tokens,
+                effective_context_window=max(0, int(getattr(self, "_admission_safe_input_tokens", 0) or self.context_length or 0)),
+                policy_fingerprint=self._background_policy_fingerprint(),
+                lock_timeout_seconds=remaining,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except TimeoutError:
+            return None
+        except sqlite3.OperationalError as exc:
+            if _is_sqlite_locked_error(exc):
+                logger.warning(
+                    "LCM background compaction enqueue deferred by SQLite lock contention"
+                )
+                return None
+            raise
+        runtime = self._background_runtime_handle
+        notify = getattr(runtime, "notify", None)
+        if job is not None and callable(notify):
+            notify()
+        return job
+
+    def _maybe_adopt_existing_canonical_prefix(
+        self,
+        lifecycle_state: Any | None = None,
+        *,
+        expected_session_fence_generation: int | None = None,
+        deadline: float | None = None,
+    ) -> int:
+        """Boundedly reconcile legacy canonical coverage above the frontier.
+
+        Older foreground publication used separate DAG/frontier transactions,
+        so a crash could leave an already-canonical raw prefix above the
+        lifecycle marker.  Advance only across the normalized, contiguous
+        prefix before any provider work; the following foreground compression
+        boundary adopts that durable frontier into the active context.
+        """
+        if (
+            not self._background_compaction_enabled()
+            or not self._conversation_id
+            or not self._session_id
+        ):
+            return 0
+        remaining = self._foreground_deadline_remaining(deadline)
+        try:
+            lifecycle = lifecycle_state or self._lifecycle.get_by_conversation(
+                self._conversation_id,
+                lock_timeout_seconds=remaining,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except TimeoutError:
+            return 0
+        if lifecycle is None or lifecycle.current_session_id != self._session_id:
+            return 0
+        frontier = int(lifecycle.current_frontier_store_id or 0)
+        fence_generation = expected_session_fence_generation
+        if fence_generation is None:
+            fence_generation = self._reconcile_background_publication_fence(
+                lifecycle,
+                deadline=deadline,
+            )
+        if fence_generation is None:
+            return frontier
+        try:
+            remaining = self._foreground_deadline_remaining(deadline)
+            write_timeout_ms = 100
+            if remaining is not None:
+                write_timeout_ms = min(
+                    write_timeout_ms,
+                    max(0, int(remaining * 1000)),
+                )
+            return int(
+                self._background_compaction.adopt_contiguous_canonical_prefix(
+                    conversation_id=self._conversation_id,
+                    session_id=self._session_id,
+                    expected_frontier_store_id=frontier,
+                    expected_session_fence_generation=int(fence_generation),
+                    write_timeout_ms=write_timeout_ms,
+                    lock_timeout_seconds=remaining,
+                    write_deadline=deadline,
+                    deadline_clock=self._foreground_now,
+                )
+                or frontier
+            )
+        except TimeoutError:
+            return frontier
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            logger.warning(
+                "LCM canonical-prefix adoption deferred by SQLite lock contention"
+            )
+            return frontier
+
+    def _has_publishable_background_job(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        if not self._background_compaction_enabled() or not self._conversation_id:
+            return False
+        remaining = self._foreground_deadline_remaining(deadline)
+        lifecycle = self._lifecycle.get_by_conversation(
+            self._conversation_id,
+            lock_timeout_seconds=remaining,
+            deadline=deadline,
+            deadline_clock=self._foreground_now,
+        )
+        expected_frontier = (
+            lifecycle.current_frontier_store_id if lifecycle is not None else None
+        )
+        return self._background_compaction.find_prepared_job(
+            conversation_id=self._conversation_id,
+            session_id=self._session_id,
+            expected_frontier_store_id=expected_frontier,
+            policy_fingerprint=self._background_policy_fingerprint(),
+            lock_timeout_seconds=remaining,
+            deadline=deadline,
+            deadline_clock=self._foreground_now,
+        ) is not None
+
+    def _has_newer_committed_background_frontier(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        """Return whether this process still needs to adopt a sibling commit."""
+        if not self._background_compaction_enabled() or not self._conversation_id:
+            return False
+        remaining = self._foreground_deadline_remaining(deadline)
+        lifecycle = self._lifecycle.get_by_conversation(
+            self._conversation_id,
+            lock_timeout_seconds=remaining,
+            deadline=deadline,
+            deadline_clock=self._foreground_now,
+            busy_timeout_ms=(
+                max(0, int(remaining * 1000))
+                if remaining is not None
+                else None
+            ),
+        )
+        return bool(
+            lifecycle is not None
+            and lifecycle.current_session_id == self._session_id
+            and int(lifecycle.current_frontier_store_id or 0)
+            > int(self._last_compacted_store_id or 0)
+        )
+
+    def _all_durable_messages_after(
+        self,
+        store_id: int,
+        *,
+        deadline: float | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Page the complete durable suffix; MessageStore defaults to 10k rows."""
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "durable tail scan",
+        )
+        rows: List[Dict[str, Any]] = []
+        cursor = max(0, int(store_id or 0))
+        while True:
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "context reconstruction",
+                "durable tail page",
+            )
+            try:
+                page = self._store.get_session_messages_after(
+                    self._session_id,
+                    cursor,
+                    limit=1_000,
+                    conversation_id=self._conversation_id,
+                    lock_timeout_seconds=(
+                        self._foreground_deadline_remaining(deadline)
+                    ),
+                    deadline=deadline,
+                    deadline_clock=self._foreground_now,
+                )
+            except TimeoutError as exc:
+                raise ForegroundDeadlineExceeded(
+                    "context reconstruction",
+                    "durable tail read exceeded the shared deadline",
+                ) from exc
+            except sqlite3.OperationalError as exc:
+                if not _is_sqlite_locked_error(exc):
+                    raise
+                raise ForegroundDeadlineExceeded(
+                    "context reconstruction",
+                    "SQLite contention prevented a bounded durable tail read",
+                ) from exc
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "context reconstruction",
+                "durable tail page",
+            )
+            if not page:
+                break
+            rows.extend(page)
+            next_cursor = max(int(row.get("store_id") or 0) for row in page)
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            if len(page) < 1_000:
+                break
+        return rows
+
+    def _project_durable_active_tail(
+        self,
+        store_id: int,
+        *,
+        preserve_messages: List[Dict[str, Any]] | None = None,
+        deadline: float | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the complete replay-safe suffix above ``store_id``.
+
+        Durable rows define ordering and make sibling-process writes visible.
+        When the caller also has an in-memory active view, overlay matching raw
+        rows with those exact objects so provider-only fields, structured media,
+        and already-established replay representations are not degraded by a
+        storage round-trip.
+        """
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "durable replay projection",
+        )
+        durable_rows = self._call_with_foreground_deadline(
+            self._all_durable_messages_after,
+            store_id,
+            deadline=deadline,
+        )
+        durable_suffix_store_ids = {
+            int(row.get("store_id") or 0) for row in durable_rows
+        }
+        replay: List[Dict[str, Any]] = []
+        for row_index, row in enumerate(durable_rows):
+            if row_index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "context reconstruction",
+                    "durable replay conversion",
+                )
+            message = self._store.to_openai_msg(row)
+            message["_lcm_replay_store_id"] = int(row.get("store_id") or 0)
+            replay.append(message)
+        projected = self._call_foreground_projection(
+            project_active_replay_messages,
+            replay,
+            deadline=deadline,
+            stage="durable replay projection",
+            config=self._config,
+            session_id=self._session_id,
+            hermes_home=self._hermes_home,
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "durable replay projection",
+        )
+        if not preserve_messages:
+            for message_index, message in enumerate(projected):
+                if message_index % 32 == 0:
+                    self._foreground_deadline_checkpoint(
+                        deadline,
+                        "context reconstruction",
+                        "durable replay cleanup",
+                    )
+                message.pop("_lcm_replay_store_id", None)
+            return projected
+
+        leading_count = (
+            1
+            if preserve_messages and preserve_messages[0].get("role") == "system"
+            else 0
+        )
+        active_tail = preserve_messages[leading_count:]
+        ids_by_message_id = self._get_store_id_map_for_messages(
+            active_tail,
+            deadline=deadline,
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "active replay source mapping",
+        )
+        exact_by_store_id: dict[int, Dict[str, Any]] = {}
+        last_mapped_active_index = -1
+        for active_index, message in enumerate(active_tail):
+            if active_index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "context reconstruction",
+                    "active replay source overlay",
+                )
+            message_store_id = ids_by_message_id.get(id(message))
+            if message_store_id is None:
+                continue
+            last_mapped_active_index = active_index
+            if int(message_store_id) > int(store_id or 0):
+                exact_by_store_id[int(message_store_id)] = dict(message)
+        merged: List[Dict[str, Any]] = []
+        represented_store_ids: set[int] = set()
+        for projected_index, durable_message in enumerate(projected):
+            if projected_index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "context reconstruction",
+                    "durable replay merge",
+                )
+            durable_store_id = int(
+                durable_message.pop("_lcm_replay_store_id", 0) or 0
+            )
+            represented_store_ids.add(durable_store_id)
+            exact_message = exact_by_store_id.get(durable_store_id)
+            merged.append(
+                dict(exact_message) if exact_message is not None else durable_message
+            )
+
+        # A normal publication/adoption follows ingestion, so every live raw
+        # message should map durably.  Preserve any genuinely new unmapped
+        # caller suffix defensively, while excluding synthetic context scaffolds
+        # that the freshly assembled DAG prefix will replace.
+        for index, message in enumerate(active_tail):
+            if index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "context reconstruction",
+                    "active replay suffix merge",
+                )
+            mapped_store_id = ids_by_message_id.get(id(message))
+            if mapped_store_id is not None:
+                mapped_store_id = int(mapped_store_id)
+                if mapped_store_id in represented_store_ids:
+                    continue
+                if mapped_store_id <= int(store_id or 0):
+                    continue
+                if mapped_store_id in durable_suffix_store_ids:
+                    # The durable projector considered this row.  If it is not
+                    # represented above, replay policy deliberately filtered it
+                    # (for example, an ignored turn or its dependent reply).
+                    # Never resurrect or move that row behind later kept rows.
+                    continue
+            elif index <= last_mapped_active_index:
+                # Unmapped ignore/quarantine placeholders can sit inside the
+                # consumed range.  Their position does not prove they are a
+                # new suffix, so fail closed instead of moving them beyond the
+                # published frontier.  Only caller objects after every mapped
+                # durable row are demonstrably newer.
+                continue
+            if (
+                message.get("display_kind") == "context_projection"
+                or self._is_replayed_context_scaffold_message(message)
+            ):
+                continue
+            merged.append(dict(message))
+        return merged
+
+    def _adopt_committed_background_frontier(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> List[Dict[str, Any]] | None:
+        """Adopt a sibling process's committed frontier at a foreground boundary."""
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "frontier adoption",
+        )
+        if not self._background_compaction_enabled() or not self._conversation_id:
+            return None
+        lifecycle = self._lifecycle.get_by_conversation(
+            self._conversation_id,
+            lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+            deadline=deadline,
+            deadline_clock=self._foreground_now,
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "frontier lookup",
+        )
+        if (
+            lifecycle is None
+            or lifecycle.current_session_id != self._session_id
+            or int(lifecycle.current_frontier_store_id or 0)
+            <= int(self._last_compacted_store_id or 0)
+        ):
+            return None
+        committed_frontier = int(lifecycle.current_frontier_store_id or 0)
+        tail_messages = self._call_with_foreground_deadline(
+            self._project_durable_active_tail,
+            committed_frontier,
+            preserve_messages=messages,
+            deadline=deadline,
+        )
+        leading = (
+            dict(messages[0])
+            if messages and messages[0].get("role") == "system"
+            else None
+        )
+        assembled = self._call_with_foreground_deadline(
+            self._assemble_context,
+            leading,
+            tail_messages,
+            deadline=deadline,
+        )
+        assembled = self._call_foreground_projection(
+            self._sanitize_active_context_messages,
+            assembled,
+            deadline=deadline,
+            stage="frontier adoption cleanup",
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "frontier adoption finalization",
+        )
+        self._last_compacted_store_id = committed_frontier
+        self._align_ingest_cursor_to_active_context(
+            assembled,
+            deadline=deadline,
+        )
+        return assembled
+
+    def run_background_compaction_once(self, summarizer=None):
+        """Claim and prepare one durable job (deterministic tests/operators)."""
+        if not self._background_compaction_enabled():
+            return None
+        if self._session_id and self._conversation_id:
+            self._maybe_enqueue_background_compaction(
+                self._store.get_session_messages(self._session_id),
+                observed_tokens=self.last_prompt_tokens,
+            )
+        owner = f"manual-{os.getpid()}-{threading.get_ident()}"
+        job = self._background_compaction.run_next_job(
+            owner=owner,
+            summarizer=summarizer,
+            circuit_breaker=self._summary_circuit_breaker,
+            spend_guard=self._summary_spend_guard,
+        )
+        return job
+
+    def promote_prepared_compaction(
+        self,
+        job_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        current_tokens: int | None = None,
+        deadline: float | None = None,
+    ) -> PromotionResult:
+        """Atomically publish one prepared range, then assemble a new list."""
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "prepared publication entry",
+        )
+        if not self._background_compaction_enabled():
+            return PromotionResult(
+                promoted=False,
+                reason="background_compaction_disabled",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        remaining = self._foreground_deadline_remaining(deadline)
+        try:
+            scoped_job = self._background_compaction.get_job(
+                str(job_id or ""),
+                lock_timeout_seconds=remaining,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except (TimeoutError, sqlite3.OperationalError) as exc:
+            if isinstance(exc, sqlite3.OperationalError) and not _is_sqlite_locked_error(
+                exc
+            ):
+                raise
+            return PromotionResult(
+                promoted=False,
+                reason="publication_inspection_deferred",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        if scoped_job is None:
+            return PromotionResult(
+                promoted=False,
+                reason="job_not_found",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        if (
+            scoped_job.conversation_id != self._conversation_id
+            or scoped_job.session_id != self._session_id
+        ):
+            return PromotionResult(
+                promoted=False,
+                reason="job_scope_mismatch",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        observed_tokens = (
+            max(0, int(current_tokens))
+            if current_tokens is not None
+            else max(0, int(count_messages_tokens(messages)))
+        )
+        publication_trigger = self._background_publication_trigger_tokens()
+        if publication_trigger <= 0 or observed_tokens < publication_trigger:
+            return PromotionResult(
+                promoted=False,
+                reason="publication_trigger_not_reached",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        owner = f"publish-{os.getpid()}-{threading.get_ident()}"
+        remaining = self._foreground_deadline_remaining(deadline)
+        write_timeout_ms = 100
+        if remaining is not None:
+            write_timeout_ms = min(
+                write_timeout_ms,
+                max(0, int(remaining * 1000)),
+            )
+        try:
+            lease = self._background_compaction.acquire_publication_lease(
+                job_id,
+                owner=owner,
+                write_timeout_ms=write_timeout_ms,
+                lock_timeout_seconds=remaining,
+                write_deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except (TimeoutError, sqlite3.OperationalError) as exc:
+            if isinstance(exc, sqlite3.OperationalError) and not _is_sqlite_locked_error(
+                exc
+            ):
+                raise
+            return PromotionResult(
+                promoted=False,
+                reason="publication_lease_deferred",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        if lease is None:
+            return PromotionResult(
+                promoted=False,
+                reason="publication_lease_unavailable",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        remaining = self._foreground_deadline_remaining(deadline)
+        write_timeout_ms = 100
+        if remaining is not None:
+            write_timeout_ms = min(
+                write_timeout_ms,
+                max(0, int(remaining * 1000)),
+            )
+        try:
+            result = self._background_compaction.publish_prepared(
+                job_id,
+                owner=owner,
+                generation=lease.lease_generation,
+                policy_fingerprint=self._background_policy_fingerprint(),
+                write_timeout_ms=write_timeout_ms,
+                observed_active_tokens=observed_tokens,
+                effective_context_window=max(0, int(getattr(self, "_admission_safe_input_tokens", 0) or self.context_length or 0)),
+                publication_trigger_tokens=publication_trigger,
+                emergency_trigger_tokens=self._background_emergency_trigger_tokens(),
+                trigger_policy=(
+                    "fixed_reserve"
+                    if int(self.context_length or 0) > 0
+                    and int(self._config.context_reserve_tokens or 0) > 0
+                    else "threshold"
+                ),
+                lock_timeout_seconds=remaining,
+                write_deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except (TimeoutError, sqlite3.OperationalError) as exc:
+            if isinstance(exc, sqlite3.OperationalError) and not _is_sqlite_locked_error(
+                exc
+            ):
+                raise
+            return PromotionResult(
+                promoted=False,
+                reason="prepared_publication_deferred",
+                job_id=str(job_id or ""),
+                messages=list(messages),
+            )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "prepared publication commit",
+        )
+        if not result.promoted:
+            result.messages = list(messages)
+            return result
+
+        committed_frontier = int(
+            result.captured_watermark_store_id or lease.captured_watermark_store_id
+        )
+        try:
+            tail_messages = self._call_with_foreground_deadline(
+                self._project_durable_active_tail,
+                committed_frontier,
+                preserve_messages=messages,
+                deadline=deadline,
+            )
+            leading = (
+                dict(messages[0])
+                if messages and messages[0].get("role") == "system"
+                else None
+            )
+            assembled = self._call_with_foreground_deadline(
+                self._assemble_context,
+                leading,
+                tail_messages,
+                deadline=deadline,
+            )
+            assembled = self._call_foreground_projection(
+                self._sanitize_active_context_messages,
+                assembled,
+                deadline=deadline,
+                stage="prepared publication cleanup",
+            )
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "context reconstruction",
+                "prepared publication assembly",
+            )
+        except ForegroundDeadlineExceeded:
+            raise
+        except Exception:
+            # The SQLite publication/frontier CAS is already committed and is
+            # authoritative.  Do not turn a local replay/assembly fault into an
+            # apparent failed publication, and do not advance the process-local
+            # marker: the next foreground boundary can adopt the durable
+            # frontier again.  Returning the caller view preserves the current
+            # turn without deleting or duplicating raw storage.
+            logger.exception(
+                "LCM published background compaction but deferred local context rebuild"
+            )
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = "published context rebuild deferred"
+            result.reason = "published_context_rebuild_deferred"
+            result.messages = list(messages)
+            return result
+        self._last_compacted_store_id = committed_frontier
+        self._align_ingest_cursor_to_active_context(
+            assembled,
+            deadline=deadline,
+        )
+        self.compression_count += 1
+        self._last_compression_status = "compacted"
+        self._last_compression_noop_reason = ""
+        result.messages = assembled
+        return result
+
+    def _publish_prepared_background_compaction(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        current_tokens: int,
+        deadline: float | None = None,
+    ) -> PromotionResult | None:
+        if not self._background_compaction_enabled():
+            return None
+        job = self._background_compaction.find_prepared_job(
+            conversation_id=self._conversation_id,
+            session_id=self._session_id,
+            expected_frontier_store_id=self._last_compacted_store_id,
+            policy_fingerprint=self._background_policy_fingerprint(),
+            lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+            deadline=deadline,
+            deadline_clock=self._foreground_now,
+        )
+        if job is None:
+            return None
+        return self.promote_prepared_compaction(
+            job.job_id,
+            messages,
+            current_tokens=current_tokens,
+            deadline=deadline,
+        )
+
+    def _supersede_background_jobs_after_foreground(self) -> int:
+        if not self._background_compaction_enabled() or not self._conversation_id:
+            return 0
+        return self._background_compaction.supersede_overlapping(
+            conversation_id=self._conversation_id,
+            new_frontier_store_id=self._last_compacted_store_id,
+            reason="foreground_emergency_compaction",
+        )
+
+    def _publish_foreground_background_node(
+        self,
+        node: SummaryNode,
+        *,
+        expected_session_fence_generation: int,
+        expected_frontier_store_id: int,
+        consumed_store_ids: List[int],
+        expected_source_identity_hash: str,
+        deadline: float | None = None,
+    ) -> PromotionResult:
+        """Atomically fence a foreground node against prepared publishers."""
+        if not self._background_compaction_enabled() or not consumed_store_ids:
+            return PromotionResult(False, "background_compaction_disabled")
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "foreground publication",
+            "before durable publication",
+        )
+        remaining = self._foreground_deadline_remaining(deadline)
+        write_timeout_ms = 100
+        sqlite_wait_uses_deadline = False
+        if remaining is not None:
+            if remaining <= 0:
+                raise ForegroundDeadlineExceeded(
+                    "foreground publication",
+                    "before durable publication",
+                )
+            sqlite_wait_uses_deadline = remaining <= (write_timeout_ms / 1000.0)
+            write_timeout_ms = min(write_timeout_ms, max(0, int(remaining * 1000)))
+        watermark = max(int(store_id) for store_id in consumed_store_ids)
+        sqlite_wait_started = self._foreground_now()
+        try:
+            result = self._background_compaction.publish_foreground_node(
+                node,
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                expected_session_fence_generation=expected_session_fence_generation,
+                expected_frontier_store_id=expected_frontier_store_id,
+                captured_watermark_store_id=watermark,
+                expected_source_identity_hash=expected_source_identity_hash,
+                debt_tokens=int(node.source_token_count or 0),
+                reason="foreground_emergency_compaction",
+                write_timeout_ms=write_timeout_ms,
+                lock_timeout_seconds=remaining,
+                write_deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                "foreground publication",
+                "durable publication lock wait exceeded the shared deadline",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            sqlite_wait_finished = self._foreground_now()
+            deadline_wait_exhausted = bool(
+                deadline is not None and sqlite_wait_finished >= float(deadline)
+            )
+            if sqlite_wait_uses_deadline and remaining is not None:
+                # SQLite accepts only whole-millisecond busy timeouts. Treat a
+                # real wait that reaches that rounded boundary as exhausting
+                # the shared wall, while preserving the existing immediate
+                # contention result for callers that still have time to react.
+                deadline_wait_exhausted = deadline_wait_exhausted or (
+                    sqlite_wait_finished - sqlite_wait_started
+                    >= max(0.0, remaining - 0.002)
+                )
+            if deadline_wait_exhausted:
+                raise ForegroundDeadlineExceeded(
+                    "foreground publication",
+                    "SQLite wait consumed the shared deadline",
+                ) from exc
+            logger.warning(
+                "LCM foreground emergency publication deferred by SQLite lock contention"
+            )
+            try:
+                self._background_compaction.record_diagnostic_event(
+                    "sqlite_lock_contention",
+                    conversation_id=self._conversation_id,
+                    session_id=self._session_id,
+                    detail=exc,
+                    deduplicate_seconds=60.0,
+                    # Diagnostics are optional. Never spend the caller's
+                    # remaining wall waiting on the same contended writer or
+                    # this helper's process-local serialization lock.
+                    write_timeout_ms=0,
+                    lock_timeout_seconds=0.0,
+                    write_deadline=deadline,
+                    deadline_clock=self._foreground_now,
+                )
+            except (sqlite3.OperationalError, TimeoutError):
+                # Contention diagnostics must never extend the bounded
+                # foreground path merely because the same writer is busy.
+                pass
+            return PromotionResult(False, "sqlite_lock_contention")
+        if result.promoted:
+            node.node_id = result.node_ids[0]
+            self._last_compacted_store_id = watermark
+        return result
+
+    def _publish_foreground_dag_node(
+        self,
+        node: SummaryNode,
+        *,
+        deadline: float | None,
+        stage: str,
+        frontier_store_id: int | None = None,
+    ) -> int:
+        """Publish one legacy DAG node without outwaiting the foreground wall.
+
+        A disabled-background leaf also advances its lifecycle frontier in the
+        same SQLite transaction.  Holding the lifecycle store's process-local
+        lock across that transaction preserves its serialization contract while
+        eliminating the old node-then-marker partial-publication window.
+        """
+
+        lifecycle_lock = None
+        lifecycle_lock_acquired = False
+        before_commit = None
+        if frontier_store_id is not None:
+            lifecycle_lock = self._lifecycle._lock
+            if deadline is None:
+                lifecycle_lock_acquired = bool(lifecycle_lock.acquire())
+            else:
+                remaining = self._foreground_deadline_remaining(deadline)
+                if remaining is None or remaining <= 0:
+                    raise ForegroundDeadlineExceeded(
+                        stage,
+                        "before lifecycle frontier serialization",
+                    )
+                lifecycle_lock_acquired = bool(
+                    lifecycle_lock.acquire(timeout=max(0.0, remaining))
+                )
+            if not lifecycle_lock_acquired:
+                raise ForegroundDeadlineExceeded(
+                    stage,
+                    "lifecycle frontier lock wait exceeded the shared deadline",
+                )
+
+            def advance_frontier_in_publication(
+                conn: sqlite3.Connection,
+            ) -> None:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    stage,
+                    "before lifecycle frontier publication",
+                )
+                conn.execute(
+                    """
+                    UPDATE lcm_lifecycle_state
+                    SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                        updated_at = ?
+                    WHERE conversation_id = ? AND current_session_id = ?
+                    """,
+                    (
+                        max(0, int(frontier_store_id)),
+                        time.time(),
+                        self._conversation_id,
+                        self._session_id,
+                    ),
+                )
+
+            before_commit = advance_frontier_in_publication
+
+        try:
+            if deadline is None:
+                return self._dag.add_node(
+                    node,
+                    before_commit=before_commit,
+                )
+
+            self._foreground_deadline_checkpoint(
+                deadline,
+                stage,
+                "before DAG publication",
+            )
+            remaining = self._foreground_deadline_remaining(deadline)
+            if remaining is None or remaining <= 0:
+                raise ForegroundDeadlineExceeded(stage, "before DAG publication")
+            node_id = self._dag.add_node(
+                node,
+                lock_timeout_seconds=remaining,
+                write_timeout_ms=max(0, int(remaining * 1000)),
+                write_deadline=deadline,
+                deadline_clock=self._foreground_now,
+                before_commit=before_commit,
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                stage,
+                "DAG publication lock wait exceeded the shared deadline",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            raise ForegroundDeadlineExceeded(
+                stage,
+                "SQLite wait prevented DAG publication inside the shared deadline",
+            ) from exc
+        finally:
+            if lifecycle_lock_acquired and lifecycle_lock is not None:
+                lifecycle_lock.release()
+        return node_id
+
+    def get_background_compaction_status(self) -> Dict[str, Any]:
+        """Return durable worker/job status, or an inert disabled view."""
+        compatibility_blocker = self._background_compaction_compatibility_blocker()
+        configured_enabled = bool(
+            getattr(self._config, "background_compaction_enabled", False)
+        )
+        helper = getattr(self, "_background_compaction", None)
+        if helper is not None:
+            status = helper.status(
+                conversation_id=str(self.current_conversation_id or ""),
+                publication_trigger_tokens=self._background_publication_trigger_tokens(),
+                emergency_trigger_tokens=self._background_emergency_trigger_tokens(),
+            )
+        else:
+            status = {
+                "enabled": configured_enabled and not compatibility_blocker,
+                "worker_count": int(
+                    getattr(self._config, "background_compaction_workers", 1)
+                ),
+                "global_limit": int(
+                    getattr(self._config, "background_compaction_global_limit", 2)
+                ),
+                "queued_jobs": 0,
+                "running_jobs": 0,
+                "prepared_jobs": 0,
+                "retry_jobs": 0,
+                "published_jobs": 0,
+                "superseded_jobs": 0,
+                "failed_jobs": 0,
+                "oldest_queued_job_age_seconds": None,
+                "current_job": None,
+                "current_debt_tokens": 0,
+                "last_preparation_result": None,
+                "last_publication_result": None,
+                "durable_frontier_store_id": 0,
+                "active_coverage": "raw",
+            }
+        status["publication_trigger_tokens"] = (
+            self._background_publication_trigger_tokens()
+        )
+        status["emergency_trigger_tokens"] = (
+            self._background_emergency_trigger_tokens()
+        )
+        status["configured_enabled"] = configured_enabled
+        if compatibility_blocker:
+            status["enabled"] = False
+            status["worker_count"] = 0
+            status["worker_available"] = False
+            status["compatibility_blocked_reason"] = compatibility_blocker
+        durable_frontier = max(
+            0,
+            int(status.get("durable_frontier_store_id") or 0),
+        )
+        status["active_coverage"] = (
+            "published_summary"
+            if durable_frontier > 0
+            and int(self._last_compacted_store_id or 0) >= durable_frontier
+            else "raw"
+        )
+        return status
 
     def _mark_preflight_compression_requested(self) -> bool:
         """Record that preflight found work and clear any stale no-op reason."""
@@ -1459,7 +3030,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._foreground_conversation_id = ""
         self._clear_foreground_rebind_candidate()
 
-    def _maybe_reclassify_current_session_as_auxiliary_before_message_ingest(self) -> bool:
+    def _maybe_reclassify_current_session_as_auxiliary_before_message_ingest(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
         """Defense-in-depth for host markers that arrive after session binding.
 
         Older Hermes Agent background-review forks seed ``_memory_write_origin``
@@ -1472,21 +3047,48 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_id = str(self._session_id or "")
         if not session_id:
             return False
-        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
+        if (
+            self._session_ignored
+            or self._session_stateless
+            or self._thread_context_stateless(
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        ):
             return False
         if self._ingest_cursor > 0:
             return False
         try:
-            stored_count = self._store.get_session_count(session_id)
+            stored_count = self._store.get_session_count(
+                session_id,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+                busy_timeout_ms=0 if deadline is not None else None,
+            )
+        except TimeoutError:
+            raise
         except Exception:
             logger.debug("LCM first-ingest auxiliary recheck count probe failed", exc_info=True)
             return False
         if stored_count != 0:
             return False
-        if not self._in_process_auxiliary_caller_generation(session_id):
+        if not self._in_process_auxiliary_caller_generation(
+            session_id,
+            deadline=deadline,
+            deadline_clock=self._foreground_now,
+        ):
             return False
 
-        self._mark_thread_context_stateless(session_id)
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "session classification",
+            "before auxiliary state mutation",
+        )
+        self._mark_thread_context_stateless(
+            session_id,
+            deadline=deadline,
+            deadline_clock=self._foreground_now,
+        )
         self._restore_foreground_after_late_auxiliary_reclassification(session_id)
         logger.info(
             "LCM reclassified session %s as auxiliary at first ingest after bind-time detection missed",
@@ -1523,12 +3125,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._ingest_messages(messages)
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                logger.debug(
-                    "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
-                    self._session_id, len(messages), self._ingest_cursor,
-                )
             except Exception as e:
                 self._record_ingest_failure("per-turn ingest()", e)
+                return
+            try:
+                self._maybe_enqueue_background_compaction(
+                    messages,
+                    observed_tokens=max(
+                        int(self.last_prompt_tokens or 0),
+                        count_messages_tokens(messages),
+                    ),
+                )
+            except Exception as e:
+                # Immutable raw ingest already committed successfully.  Queue
+                # maintenance is opportunistic and must not corrupt ingest
+                # health accounting or cause the host to retry this raw batch.
+                logger.warning(
+                    "LCM background compaction enqueue failed after raw ingest: %s",
+                    e,
+                )
+            logger.debug(
+                "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
+                self._session_id, len(messages), self._ingest_cursor,
+            )
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -1571,50 +3190,472 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         return current_chunk[:-1]
 
+    def _acquire_foreground_emergency_provider_permit(
+        self,
+        *,
+        deadline: float,
+        expected_session_fence_generation: int,
+    ) -> ProviderPermit:
+        """Reserve durable provider capacity immediately before thread start."""
+        state = getattr(
+            self._thread_context,
+            "foreground_emergency_provider_permit",
+            None,
+        )
+        if state is not None:
+            if state.get("guardian_owned"):
+                completed = state.get("completed")
+                if not isinstance(completed, threading.Event) or not completed.is_set():
+                    raise ForegroundProviderPermitUnavailable(
+                        "foreground emergency provider call is still physically running"
+                    )
+                try:
+                    del self._thread_context.foreground_emergency_provider_permit
+                except AttributeError:
+                    pass
+            else:
+                return state["permit"]
+        helper = self._background_compaction
+        if helper is None or not self._conversation_id:
+            raise ForegroundProviderPermitUnavailable(
+                "foreground emergency provider permit is unavailable"
+            )
+        # The first lease covers the complete foreground wall plus a short
+        # publication cushion.  If the physical call outlives that wall, the
+        # guardian begins heartbeating before this reservation can expire.
+        remaining = max(0.0, float(deadline) - self._foreground_now())
+        if remaining <= 0:
+            raise ForegroundProviderPermitUnavailable(
+                "foreground emergency provider deadline is exhausted"
+            )
+        lease_seconds = max(
+            float(
+                getattr(
+                    self._config,
+                    "background_compaction_lease_seconds",
+                    300,
+                )
+                or 300
+            ),
+            (remaining * 2.0) + 5.0,
+        )
+        owner = f"foreground-{os.getpid()}-{threading.get_ident()}"
+        acquire_kwargs: dict[str, Any] = {
+            "conversation_id": self._conversation_id,
+            "owner": owner,
+            "session_id": self._session_id,
+            "expected_session_fence_generation": expected_session_fence_generation,
+            "lease_seconds": lease_seconds,
+            "global_limit": int(
+                getattr(
+                    self._config,
+                    "background_compaction_global_limit",
+                    2,
+                )
+                or 0
+            ),
+        }
+        if self._summary_callable_accepts_keyword(
+            helper.acquire_emergency_provider_permit,
+            "lock_timeout_seconds",
+        ):
+            acquire_kwargs["lock_timeout_seconds"] = remaining
+        if self._summary_callable_accepts_keyword(
+            helper.acquire_emergency_provider_permit,
+            "write_deadline",
+        ):
+            acquire_kwargs["write_deadline"] = deadline
+        if self._summary_callable_accepts_keyword(
+            helper.acquire_emergency_provider_permit,
+            "deadline_clock",
+        ):
+            acquire_kwargs["deadline_clock"] = self._foreground_now
+        try:
+            permit = helper.acquire_emergency_provider_permit(**acquire_kwargs)
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            permit = None
+        except TimeoutError:
+            permit = None
+        if permit is not None and self._foreground_now() >= float(deadline):
+            completed = threading.Event()
+            completed.set()
+            helper._start_provider_permit_guardian(
+                completed,
+                job_id=permit.job_id,
+                owner=permit.lease_owner,
+                generation=permit.lease_generation,
+            )
+            permit = None
+        if permit is None:
+            raise ForegroundProviderPermitUnavailable(
+                "foreground emergency provider capacity is unavailable"
+            )
+        self._thread_context.foreground_emergency_provider_permit = {
+            "permit": permit,
+            "permit_store": helper,
+            "guardian_owned": False,
+            "completion_lock": threading.Lock(),
+            "provider_finished": False,
+            "start_failure_finalizer": None,
+            "start_failure_claimed": False,
+            "completed": None,
+        }
+        return permit
+
+    @staticmethod
+    def _prepare_foreground_provider_attempt(
+        state: dict[str, Any],
+        completed: threading.Event,
+    ) -> dict[str, Any]:
+        """Create race state owned by exactly one physical provider attempt."""
+        attempt = {
+            "completion_lock": threading.Lock(),
+            "provider_finished": False,
+            "start_failure_finalizer": None,
+            "start_failure_claimed": False,
+            "completed": completed,
+        }
+        with state["completion_lock"]:
+            state["active_attempt"] = attempt
+            state["completed"] = completed
+        return attempt
+
+    @staticmethod
+    def _mark_foreground_provider_finished(state: dict[str, Any]) -> None:
+        """Run a guardian-start fallback only after the provider returns."""
+        finalizer = None
+        with state["completion_lock"]:
+            state["provider_finished"] = True
+            if (
+                state.get("start_failure_finalizer") is not None
+                and not state.get("start_failure_claimed")
+            ):
+                state["start_failure_claimed"] = True
+                finalizer = state["start_failure_finalizer"]
+        if finalizer is not None:
+            finalizer()
+
+    @staticmethod
+    def _arm_foreground_guardian_start_failure(
+        state: dict[str, Any],
+        finalizer: Callable[[], None],
+    ) -> None:
+        """Transfer durable release when the guardian thread cannot start."""
+        run_now = False
+        with state["completion_lock"]:
+            state["start_failure_finalizer"] = finalizer
+            if state.get("provider_finished") and not state.get(
+                "start_failure_claimed"
+            ):
+                state["start_failure_claimed"] = True
+                run_now = True
+        if run_now:
+            finalizer()
+
+    def _handoff_foreground_emergency_provider_permit(
+        self,
+        completed: threading.Event,
+    ) -> None:
+        """Keep a timed-out physical call fenced until it actually returns."""
+        state = getattr(
+            self._thread_context,
+            "foreground_emergency_provider_permit",
+            None,
+        )
+        if state is None or state.get("guardian_owned"):
+            return
+        permit: ProviderPermit = state["permit"]
+        state["guardian_owned"] = True
+        attempt_state = state.get("active_attempt") or state
+        helper = state.get("permit_store") or self._background_compaction
+        if helper is None:
+            return
+        helper._start_provider_permit_guardian(
+            completed,
+            job_id=permit.job_id,
+            owner=permit.lease_owner,
+            generation=permit.lease_generation,
+            on_start_failure=lambda finalizer: (
+                self._arm_foreground_guardian_start_failure(
+                    attempt_state,
+                    finalizer,
+                )
+            ),
+        )
+
+    def _release_foreground_emergency_provider_permit(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        """Release this foreground thread's permit after publication or failure."""
+        state = getattr(
+            self._thread_context,
+            "foreground_emergency_provider_permit",
+            None,
+        )
+        if state is None:
+            return
+        try:
+            del self._thread_context.foreground_emergency_provider_permit
+        except AttributeError:
+            pass
+        if state.get("guardian_owned"):
+            return
+        permit: ProviderPermit = state["permit"]
+        helper = state.get("permit_store") or self._background_compaction
+        if helper is None:
+            return
+        completed = threading.Event()
+        completed.set()
+        if deadline is not None and self._foreground_now() >= float(deadline):
+            helper._start_provider_permit_guardian(
+                completed,
+                job_id=permit.job_id,
+                owner=permit.lease_owner,
+                generation=permit.lease_generation,
+            )
+            return
+        try:
+            release_kwargs: dict[str, Any] = {
+                "owner": permit.lease_owner,
+                "generation": permit.lease_generation,
+                "busy_timeout_ms": 0,
+            }
+            if self._summary_callable_accepts_keyword(
+                helper.release_provider_permit,
+                "lock_timeout_seconds",
+            ):
+                release_kwargs["lock_timeout_seconds"] = 0.0
+            if self._summary_callable_accepts_keyword(
+                helper.release_provider_permit,
+                "write_deadline",
+            ):
+                release_kwargs["write_deadline"] = deadline
+            if self._summary_callable_accepts_keyword(
+                helper.release_provider_permit,
+                "deadline_clock",
+            ):
+                release_kwargs["deadline_clock"] = self._foreground_now
+            helper.release_provider_permit(permit.job_id, **release_kwargs)
+        except BaseException:
+            logger.warning(
+                "LCM deferred release of a foreground emergency provider permit",
+                exc_info=True,
+            )
+            helper._start_provider_permit_guardian(
+                completed,
+                job_id=permit.job_id,
+                owner=permit.lease_owner,
+                generation=permit.lease_generation,
+            )
+
     def _summarize_leaf_chunk_with_rescue(
         self,
         initial_chunk: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         deadline: Optional[float] = None,
+        require_durable_provider_permit: bool = False,
+        expected_session_fence_generation: int | None = None,
     ) -> tuple[List[Dict[str, Any]], int, str, int, int]:
         attempt_chunk = list(initial_chunk)
         max_attempts = 3
         attempt_number = 0
 
         while attempt_chunk and attempt_number < max_attempts:
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "leaf token counting",
+                "before token count",
+            )
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
-            serialized = self._serialize_messages(attempt_chunk)
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "leaf token counting",
+                "after token count",
+            )
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "leaf serialization",
+                "before serialization",
+            )
+            serialized = self._call_with_foreground_deadline(
+                self._serialize_messages,
+                attempt_chunk,
+                deadline=deadline,
+            )
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "leaf serialization",
+                "after serialization",
+            )
             token_budget = max(2000, int(source_tokens * 0.20))
             token_budget = min(token_budget, 12000)
 
             try:
                 timeout_seconds = self._config.summary_timeout_ms / 1000
                 if deadline is not None:
-                    remaining_seconds = deadline - time.monotonic()
+                    remaining_seconds = deadline - self._foreground_now()
                     if remaining_seconds <= 0:
                         raise TimeoutError("threshold full sweep time budget exhausted")
                     timeout_seconds = min(timeout_seconds, remaining_seconds)
-                summary_text, level = summarize_with_escalation(
-                    text=serialized,
-                    source_tokens=source_tokens,
-                    token_budget=token_budget,
-                    depth=0,
-                    model=self._config.summary_model,
-                    fallback_models=self._config.summary_fallback_models,
-                    circuit_breaker=self._summary_circuit_breaker,
-                    spend_guard=self._summary_spend_guard,
-                    timeout=timeout_seconds,
-                    l2_budget_ratio=self._config.l2_budget_ratio,
-                    l3_truncate_tokens=self._config.l3_truncate_tokens,
-                    focus_topic=focus_topic or "",
-                    custom_instructions=self._config.custom_instructions,
-                )
+                call_kwargs = {
+                    "text": serialized,
+                    "source_tokens": source_tokens,
+                    "token_budget": token_budget,
+                    "depth": 0,
+                    "model": self._config.summary_model,
+                    "fallback_models": self._config.summary_fallback_models,
+                    "circuit_breaker": self._summary_circuit_breaker,
+                    "spend_guard": self._summary_spend_guard,
+                    "timeout": timeout_seconds,
+                    "l2_budget_ratio": self._config.l2_budget_ratio,
+                    "l3_truncate_tokens": self._config.l3_truncate_tokens,
+                    "focus_topic": focus_topic or "",
+                    "custom_instructions": self._config.custom_instructions,
+                }
+                provider_cancel_event = threading.Event()
+                if deadline is not None and self._summary_callable_accepts_keyword(
+                    summarize_with_escalation,
+                    "deadline",
+                ):
+                    call_kwargs["deadline"] = deadline
+                if deadline is not None and self._summary_callable_accepts_keyword(
+                    summarize_with_escalation,
+                    "cancel_event",
+                ):
+                    call_kwargs["cancel_event"] = provider_cancel_event
+                hard_call_slot = self._foreground_hard_call_slot
+                if not hard_call_slot.acquire(blocking=False):
+                    provider_cancel_event.set()
+                    raise ForegroundProviderPermitUnavailable(
+                        "another foreground provider call is still physically running"
+                    )
+                if deadline is None:
+                    try:
+                        summary_text, level = summarize_with_escalation(**call_kwargs)
+                    finally:
+                        hard_call_slot.release()
+                else:
+                    completed = threading.Event()
+                    result_box: dict[str, Any] = {}
+                    foreground_permit_state: dict[str, Any] | None = None
+                    foreground_attempt_state: dict[str, Any] | None = None
+
+                    if require_durable_provider_permit:
+                        if expected_session_fence_generation is None:
+                            hard_call_slot.release()
+                            raise ForegroundProviderPermitUnavailable(
+                                "foreground emergency session fence is unavailable"
+                            )
+                        try:
+                            self._acquire_foreground_emergency_provider_permit(
+                                deadline=deadline,
+                                expected_session_fence_generation=(
+                                    expected_session_fence_generation
+                                ),
+                            )
+                            foreground_permit_state = getattr(
+                                self._thread_context,
+                                "foreground_emergency_provider_permit",
+                                None,
+                            )
+                            if foreground_permit_state is None:
+                                raise ForegroundProviderPermitUnavailable(
+                                    "foreground emergency provider state is unavailable"
+                                )
+                            foreground_attempt_state = (
+                                self._prepare_foreground_provider_attempt(
+                                    foreground_permit_state,
+                                    completed,
+                                )
+                            )
+                        except BaseException:
+                            hard_call_slot.release()
+                            self._release_foreground_emergency_provider_permit()
+                            raise
+
+                    def call_provider() -> None:
+                        try:
+                            if (
+                                provider_cancel_event.is_set()
+                                or self._foreground_now() >= float(deadline)
+                            ):
+                                result_box["cancelled"] = True
+                                return
+                            result_box["value"] = summarize_with_escalation(
+                                **call_kwargs
+                            )
+                        except BaseException as provider_error:
+                            result_box["error"] = provider_error
+                        finally:
+                            hard_call_slot.release()
+                            completed.set()
+                            if foreground_attempt_state is not None:
+                                self._mark_foreground_provider_finished(
+                                    foreground_attempt_state
+                                )
+
+                    provider_thread = threading.Thread(
+                        target=call_provider,
+                        name="lcm-foreground-summary-deadline",
+                        daemon=True,
+                    )
+                    try:
+                        provider_thread.start()
+                    except BaseException:
+                        hard_call_slot.release()
+                        if require_durable_provider_permit:
+                            self._release_foreground_emergency_provider_permit()
+                        raise
+                    try:
+                        finished = completed.wait(
+                            timeout=max(
+                                0.0,
+                                float(deadline) - self._foreground_now(),
+                            )
+                        )
+                    except BaseException:
+                        provider_cancel_event.set()
+                        if require_durable_provider_permit and not completed.is_set():
+                            self._handoff_foreground_emergency_provider_permit(
+                                completed
+                            )
+                        raise
+                    if not finished or self._foreground_now() >= float(deadline):
+                        provider_cancel_event.set()
+                        if require_durable_provider_permit:
+                            self._handoff_foreground_emergency_provider_permit(
+                                completed
+                            )
+                        raise TimeoutError(
+                            "foreground compaction provider deadline exceeded"
+                        )
+                    if result_box.get("cancelled"):
+                        raise TimeoutError(
+                            "foreground compaction provider cancelled before start"
+                        )
+                    if "error" in result_box:
+                        raise result_box["error"]
+                    summary_text, level = result_box["value"]
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
+                if (
+                    deadline is not None
+                    and self._foreground_now() >= float(deadline)
+                ):
+                    raise
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
                     raise
                 smaller_chunk = self._next_leaf_rescue_chunk(attempt_chunk, source_tokens)
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "leaf rescue",
+                    "after retry selection",
+                )
                 if not smaller_chunk or len(smaller_chunk) >= len(attempt_chunk):
                     raise
                 logger.warning(
@@ -1719,6 +3760,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
 
+        if self._background_compaction_enabled():
+            self._reconcile_background_publication_fence(
+                state,
+                log_contention=True,
+            )
+
         # Garbage-collect empty lifecycle rows when the table exceeds threshold.
         # Gateway restarts, ephemeral cron ticks, and crash-loops all create
         # lifecycle rows that never ingest data — prune them here so they
@@ -1754,7 +3801,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ):
             self._schedule_rollup_maintenance(session_id)
 
-    def _invalidate_rollups_for_published_node(self, node: "SummaryNode") -> None:
+    def _invalidate_rollups_for_published_node(
+        self,
+        node: "SummaryNode",
+        *,
+        deadline: float | None = None,
+    ) -> None:
         """Stale the rollups covering EVERY UTC day a just-published node spans.
 
         Rollups consume published summary nodes, so publication — not raw ingest
@@ -1766,6 +3818,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         blocker 2 / B2).
         """
         if not self._config.temporal_rollups_enabled:
+            return
+        if deadline is not None:
+            # SummaryDAG's mutation trigger wrote the invalidation event in the
+            # node-publication transaction.  Recent-rollup reads already refuse
+            # ready rows while this outbox has debt, so synchronous draining is
+            # optional maintenance and must not outwait a foreground caller.
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "rollup invalidation",
+                "after durable invalidation enqueue",
+            )
             return
         mark_stale_for_published_summary(
             self._dag,
@@ -1991,10 +4054,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._working_leaf_chunk_tokens(raw_tokens)
         return max(1, self._config.leaf_chunk_tokens)
 
-    def _has_raw_backlog_debt(self) -> bool:
+    def _has_raw_backlog_debt(self, *, deadline: float | None = None) -> bool:
         if not self._config.deferred_maintenance_enabled or not self._conversation_id:
             return False
-        state = self._lifecycle.get_by_conversation(self._conversation_id)
+        remaining = self._foreground_deadline_remaining(deadline)
+        try:
+            state = self._lifecycle.get_by_conversation(
+                self._conversation_id,
+                lock_timeout_seconds=remaining,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+                busy_timeout_ms=(
+                    max(0, int(remaining * 1000))
+                    if remaining is not None
+                    else None
+                ),
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                "deferred maintenance inspection",
+                "lifecycle lock wait exceeded the shared deadline",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            raise ForegroundDeadlineExceeded(
+                "deferred maintenance inspection",
+                "SQLite contention prevented a bounded lifecycle read",
+            ) from exc
         return bool(state and state.debt_kind == "raw_backlog" and state.debt_size_estimate > 0)
 
     def _budget_pressure_ratio(
@@ -2036,10 +4123,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages: List[Dict[str, Any]],
         *,
         observed_tokens: int | None = None,
+        deadline: float | None = None,
     ) -> bool:
-        if not self._has_raw_backlog_debt():
+        if not self._has_raw_backlog_debt(deadline=deadline):
             return False
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "deferred maintenance inspection",
+            "before raw backlog sizing",
+        )
         raw_tokens = self._raw_backlog_tokens(messages)
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "deferred maintenance inspection",
+            "after raw backlog sizing",
+        )
         if raw_tokens <= 0:
             return False
         if raw_tokens >= self._raw_backlog_threshold(raw_tokens):
@@ -2054,33 +4152,120 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages: List[Dict[str, Any]],
         *,
         observed_tokens: int | None = None,
+        deadline: float | None = None,
     ) -> None:
         if not self._config.deferred_maintenance_enabled or not self._conversation_id:
             return
-        raw_tokens = self._raw_backlog_tokens(messages)
-        threshold = self._raw_backlog_threshold(raw_tokens) if raw_tokens > 0 else 0
-        keep_under_critical_pressure = (
-            raw_tokens > 0
-            and self._has_raw_backlog_debt()
-            and self._critical_budget_pressure_reached(
-                observed_tokens=observed_tokens,
-                messages=messages,
+
+        def refresh() -> None:
+            raw_tokens = self._raw_backlog_tokens(messages)
+            threshold = (
+                self._raw_backlog_threshold(raw_tokens) if raw_tokens > 0 else 0
             )
-        )
-        if raw_tokens > 0 and (raw_tokens >= threshold or keep_under_critical_pressure):
-            self._lifecycle.record_debt(
-                self._conversation_id,
-                kind="raw_backlog",
-                size_estimate=raw_tokens,
+            keep_under_critical_pressure = (
+                raw_tokens > 0
+                and self._has_raw_backlog_debt(deadline=deadline)
+                and self._critical_budget_pressure_reached(
+                    observed_tokens=observed_tokens,
+                    messages=messages,
+                )
             )
+            if raw_tokens > 0 and (
+                raw_tokens >= threshold or keep_under_critical_pressure
+            ):
+                self._lifecycle.record_debt(
+                    self._conversation_id,
+                    kind="raw_backlog",
+                    size_estimate=raw_tokens,
+                    lock_timeout_seconds=(
+                        self._foreground_deadline_remaining(deadline)
+                    ),
+                    deadline=deadline,
+                    deadline_clock=self._foreground_now,
+                    busy_timeout_ms=(0 if deadline is not None else None),
+                )
+                return
+            if self._has_raw_backlog_debt(deadline=deadline):
+                self._lifecycle.clear_debt(
+                    self._conversation_id,
+                    lock_timeout_seconds=(
+                        self._foreground_deadline_remaining(deadline)
+                    ),
+                    deadline=deadline,
+                    deadline_clock=self._foreground_now,
+                    busy_timeout_ms=(0 if deadline is not None else None),
+                )
+
+        if deadline is None:
+            refresh()
             return
-        if self._has_raw_backlog_debt():
-            self._lifecycle.clear_debt(self._conversation_id)
+
+        # Maintenance debt is derived from immutable raw rows and can be
+        # reconstructed on the next turn.  Never let this bookkeeping wait
+        # behind another same-process lifecycle writer after the summary node
+        # and frontier have already committed.
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "raw backlog debt persistence",
+            "before lifecycle lock probe",
+        )
+        lifecycle_lock = getattr(self._lifecycle, "_lock", None)
+        connection = getattr(self._lifecycle, "connection", None)
+        if lifecycle_lock is None or connection is None:
+            return
+        if not lifecycle_lock.acquire(blocking=False):
+            return
+
+        prior_busy_timeout: int | None = None
+        try:
+            prior_busy_timeout = int(
+                connection.execute("PRAGMA busy_timeout").fetchone()[0]
+            )
+            connection.execute("PRAGMA busy_timeout=0")
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "raw backlog debt persistence",
+                "before derived debt write",
+            )
+            refresh()
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "raw backlog debt persistence",
+                "after derived debt write",
+            )
+        except (TimeoutError, ForegroundDeadlineExceeded):
+            if connection.in_transaction:
+                connection.rollback()
+            # Derived maintenance debt is safely reconstructed next turn.
+            return
+        except sqlite3.OperationalError as exc:
+            if connection.in_transaction:
+                connection.rollback()
+            if not _is_sqlite_locked_error(exc):
+                raise
+            # A later turn can derive the same marker from durable raw rows.
+            return
+        finally:
+            try:
+                if prior_busy_timeout is not None:
+                    connection.execute(
+                        f"PRAGMA busy_timeout={prior_busy_timeout}"
+                    )
+            except sqlite3.Error:
+                logger.debug(
+                    "LCM could not restore SQLite busy_timeout after bounded "
+                    "raw backlog debt persistence",
+                    exc_info=True,
+                )
+            finally:
+                lifecycle_lock.release()
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
+        if hasattr(self, "_active_replay_preview_policies"):
+            self._active_replay_preview_policy()
         # Hold the foreground view stable when the new binding is a side
         # channel (cron tick inside the gateway process, debug probe, etc.).
         # Tools that report "current session" to operators must keep pointing
@@ -2413,6 +4598,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
             )
 
+        if can_reassign and self._background_compaction_enabled():
+            try:
+                can_reassign = (
+                    self._background_compaction.begin_session_reset(
+                        conversation_id=conversation_id,
+                        session_id=source_session_id,
+                        reason="compression_rollover",
+                    )
+                    is not None
+                )
+            except sqlite3.OperationalError as exc:
+                can_reassign = False
+                logger.warning(
+                    "LCM compression carry-over skipped because the old-session publication fence could not be acquired: %s",
+                    exc,
+                )
+
         if can_reassign:
             self._lifecycle.finalize_session(
                 conversation_id,
@@ -2741,6 +4943,74 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             suppress_as_foreground_reuse=not side_channel_rebind,
         )
         self._clear_thread_context_stateless()
+
+        # The stock host reports two non-invalidating lifecycle edges with the
+        # already-bound session id: an ordinary same-conversation rebind and an
+        # in-place compression commit (old_session_id == session_id).  The
+        # process-local ingest cursor already describes the host's active list
+        # in both cases.  Rewinding it here makes the next turn scan/reappend the
+        # entire transcript when replay cleanup prevents an exact prefix match.
+        #
+        # Preserve runtime progress only when the durable lifecycle row proves
+        # the same logical conversation.  Explicit resets, platform changes,
+        # side-channel/bypass binds, conversation reassignment, and all session
+        # rotations continue through the invalidating path below.
+        requested_conversation_id = str(kwargs.get("conversation_id") or "")
+        same_session_lifecycle = (
+            self._lifecycle.get_by_conversation(self._conversation_id)
+            if previous_session_id == session_id and self._conversation_id
+            else None
+        )
+        stable_same_session_rebind = bool(
+            previous_session_id == session_id
+            and not self._pending_reset_session_id
+            and not self._session_ignored
+            and not self._session_stateless
+            and not side_channel_rebind
+            and requested_platform == self._session_platform
+            and (
+                (not boundary_reason and not old_session_id)
+                or (
+                    boundary_reason == "compression"
+                    and old_session_id == session_id
+                )
+            )
+            and (
+                not requested_conversation_id
+                or requested_conversation_id == self._conversation_id
+            )
+            and same_session_lifecycle is not None
+            and same_session_lifecycle.conversation_id == self._conversation_id
+            and (
+                same_session_lifecycle.current_session_id == session_id
+                or (
+                    same_session_lifecycle.current_session_id is None
+                    and same_session_lifecycle.last_finalized_session_id == session_id
+                )
+            )
+        )
+        if stable_same_session_rebind:
+            stable_kwargs = dict(kwargs)
+            stable_kwargs.setdefault("platform", self._session_platform)
+            stable_kwargs.setdefault("conversation_id", self._conversation_id)
+            self._apply_session_start_metadata(session_id, stable_kwargs)
+            self._bind_lifecycle_state(
+                session_id,
+                conversation_id=self._conversation_id,
+            )
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            self._log_session_filter_diagnostics()
+            logger.debug(
+                "LCM preserved runtime progress across same-session %s rebind: "
+                "session=%s conversation=%s cursor=%d frontier=%d",
+                boundary_reason or "ordinary",
+                session_id,
+                self._conversation_id,
+                self._ingest_cursor,
+                self._last_compacted_store_id,
+            )
+            return
+
         if previous_session_id and previous_session_id != session_id:
             self._finalize_pending_reset_boundary(previous_session_id)
             self._reset_session_scoped_runtime_state()
@@ -3446,8 +5716,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._pending_reset_session_id = self._session_id
         self._pending_reset_conversation_id = self._conversation_id
         self._pending_reset_frontier_store_id = self._last_compacted_store_id
+        background_reset_fenced = True
+        if (
+            self._background_compaction_enabled()
+            and self._session_id
+            and self._conversation_id
+        ):
+            try:
+                background_reset_fenced = (
+                    self._background_compaction.begin_session_reset(
+                        conversation_id=self._conversation_id,
+                        session_id=self._session_id,
+                    )
+                    is not None
+                )
+            except sqlite3.OperationalError as exc:
+                # Never free canonical coverage while publication could still
+                # race the batched reset. Preserving the derived nodes is the
+                # fail-closed outcome; immutable raw messages are unaffected.
+                background_reset_fenced = False
+                logger.warning(
+                    "LCM reset preserved DAG nodes because the background publication fence could not be acquired: %s",
+                    exc,
+                )
         super().on_session_reset()
-        self._lifecycle.record_reset(self._conversation_id)
         self._reset_session_scoped_runtime_state()
 
         # Retain DAG nodes across sessions based on config.
@@ -3455,7 +5747,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         #    0  → delete everything
         #    N  → keep nodes at depth >= N (e.g. 2 keeps d2+)
         retain = self._config.new_session_retain_depth
-        if self._session_id and retain != -1:
+        if self._session_id and retain != -1 and background_reset_fenced:
             if retain == 0:
                 self._dag.delete_session_nodes(
                     self._session_id,
@@ -3467,6 +5759,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     retain,
                     on_deleted_batch=self._purge_embeddings_for_nodes,
                 )
+        elif self._session_id and retain != -1 and not background_reset_fenced:
+            logger.warning(
+                "LCM reset skipped DAG pruning because publication was not durably fenced"
+            )
+        # Publish the new reset epoch only after all batched DAG mutation is
+        # complete. A sibling process cannot reopen the closed fence while
+        # deletion is in progress; the next foreground bind/reconciliation may
+        # safely activate this completed epoch.
+        self._lifecycle.record_reset(self._conversation_id)
 
     def _purge_embeddings_for_nodes(
         self,
@@ -3507,27 +5808,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         connection: "sqlite3.Connection | None" = None,
     ) -> None:
-        """Soft-archive raw-history chunks for purged/GC'd messages (best effort).
+        """Soft-archive raw-history chunks for purged/GC'd messages.
 
         Mirrors ``_purge_embeddings_for_nodes`` but for the chunk corpus: when a
         message is deleted or its content is GC-rewritten, its chunks no longer
         map to live content, so they are archived (dropped from ranking, rows
-        retained). No-op unless embeddings are enabled; any failure is swallowed
-        so a chunk-archive problem never breaks purge/GC.
+        retained). No-op unless embeddings are enabled. Standalone maintenance
+        remains best-effort, but failures on a caller-supplied transaction must
+        propagate so the paired raw rewrite is rolled back atomically.
         """
         if not store_ids:
             return
         if not bool(getattr(self._config, "embeddings_enabled", False)):
             return
-        try:
-            from .vector_store import VectorStore
+        from .vector_store import VectorStore
 
-            if connection is not None:
-                for offset in range(0, len(store_ids), 256):
-                    VectorStore.archive_chunks_for_messages_on_connection(
-                        connection, store_ids[offset:offset + 256]
-                    )
-                return
+        if connection is not None:
+            for offset in range(0, len(store_ids), 256):
+                VectorStore.archive_chunks_for_messages_on_connection(
+                    connection, store_ids[offset:offset + 256]
+                )
+            return
+        try:
             store = VectorStore(self._store.db_path, config=self._config)
             try:
                 store.archive_chunks_for_messages(store_ids)
@@ -3767,8 +6069,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "effective_context_length_cap": self.effective_context_length_cap,
             "effective_context_length_reason": self.effective_context_length_reason,
             "threshold_tokens": self.threshold_tokens,
+            "compression_policy": {
+                "engine": "lcm",
+                "ignored_stock_settings": [
+                    "compression.threshold_tokens", "compression.target_ratio",
+                ],
+                "host_preflight_trigger_tokens": self.threshold_tokens,
+                "publication_trigger_tokens": self._background_publication_trigger_tokens(),
+                "emergency_trigger_tokens": self._background_emergency_trigger_tokens(),
+                "assembly_cap_tokens": self._effective_assembly_token_cap(),
+                "safe_input_tokens": getattr(self, "_admission_safe_input_tokens", 0),
+                "target_policy": "LCM summary budgets and protected recent messages; not a fixed stock target ratio",
+            },
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "last_foreground_deadline": dict(self._last_foreground_deadline),
             "threshold_full_sweep": dict(self._last_threshold_full_sweep),
             "ingest_failure_count": self._ingest_failure_count,
             "consecutive_ingest_failures": self._consecutive_ingest_failures,
@@ -3779,12 +6094,42 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context_length_source": self._context_length_source,
             "configured_context_threshold": self._config.context_threshold,
             "context_threshold": self.context_threshold,
+            "context_reserve_tokens": self._config.context_reserve_tokens,
+            "threshold_policy": (
+                "fixed_reserve"
+                if self._config.context_reserve_tokens > 0
+                else "ratio"
+            ),
             "context_threshold_source": self._context_threshold_source,
             "context_threshold_autoraised": self._context_threshold_autoraised,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
+            "focused_working_set": {
+                "enabled": bool(self._config.focused_working_set_enabled),
+                "target_tokens": int(self._config.focused_working_set_target_tokens),
+                "trigger_tokens": int(self._config.focused_working_set_trigger_tokens),
+                "min_reclaim_tokens": int(self._config.focused_working_set_min_reclaim_tokens),
+                "min_reclaim_ratio": float(self._config.focused_working_set_min_reclaim_ratio),
+                "expected_payback_calls": int(self._config.focused_working_set_payback_calls),
+                "last_decision": dict(self._last_working_set_decision),
+            },
+            "active_replay_preview": {
+                "enabled_for_current_session": bool(
+                    self._active_replay_preview_policy().enabled
+                ),
+                "policy_version": self._active_replay_preview_policy().version,
+                "last_decision": dict(self._last_active_replay_preview),
+            },
+            "compaction_payback": {
+                "enabled": bool(self._config.compaction_payback_enabled),
+                "expected_phase_calls": int(self._config.compaction_payback_expected_calls),
+                "min_reclaim_tokens": int(self._config.compaction_payback_min_reclaim_tokens),
+                "summary_ratio": float(self._config.compaction_payback_summary_ratio),
+                "last_decision": dict(self._last_compaction_payback),
+            },
         })
+        status["background_compaction"] = self.get_background_compaction_status()
         with self._assertion_extraction_metrics_lock:
             status["assertion_extraction"] = {
                 "store_enabled": self._assertions is not None,
@@ -3914,6 +6259,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 }
         return status
 
+    def bind_context_budget(self, budget: Any) -> None:
+        super().bind_context_budget(budget)
+        self._set_context_length(
+            budget.context_window,
+            source="host_context_budget",
+            model=self.model,
+            provider=self.provider,
+        )
+
     def update_model(self, model: str, context_length: int,
                      base_url: str = "", api_key: str = "",
                      provider: str = "",
@@ -3925,6 +6279,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 parent_session_id,
             )
             return
+        for field in ("_admission_safe_input_tokens", "_admission_publication_tokens", "_admission_emergency_tokens", "_admission_assembly_tokens"):
+            setattr(self, field, 0)
         self.model = str(model or "")
         self.base_url = str(base_url or "")
         self.api_key = str(api_key or "")
@@ -4079,7 +6435,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _content_has_externalized_placeholder_ref(self, content: str) -> bool:
         return bool(extract_externalized_ref(content) or extract_ingest_externalized_refs(content))
 
-    def _has_prior_raw_externalized_placeholder_row(self, store_id: int, msg: Dict[str, Any]) -> bool:
+    def _has_prior_raw_externalized_placeholder_row(
+        self,
+        store_id: int,
+        msg: Dict[str, Any],
+        *,
+        deadline: float | None = None,
+    ) -> bool:
         if not self._session_id:
             return False
         raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
@@ -4089,10 +6451,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._session_id,
                 after_store_id=after_store_id,
                 limit=1000,
+                conversation_id=self._conversation_id,
+                lock_timeout_seconds=(
+                    self._foreground_deadline_remaining(deadline)
+                ),
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
             )
             if not rows:
                 return False
-            for row in rows:
+            for row_index, row in enumerate(rows):
+                if row_index % 32 == 0:
+                    self._foreground_deadline_checkpoint(
+                        deadline,
+                        "ingest filtering",
+                        "prior externalized-row scan",
+                    )
                 row_store_id = int(row.get("store_id") or 0)
                 if row_store_id >= store_id:
                     return False
@@ -4100,7 +6474,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     return True
                 after_store_id = max(after_store_id, row_store_id)
 
-    def _mapped_stored_row_matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
+    def _mapped_stored_row_matches_ignore_message_patterns(
+        self,
+        msg: Dict[str, Any],
+        *,
+        deadline: float | None = None,
+    ) -> bool:
         store_id = msg.get("store_id")
         content = normalize_content_value(msg.get("content")) or ""
         has_externalized_placeholder = self._content_has_externalized_placeholder_ref(content)
@@ -4110,12 +6489,50 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             mapped_from_active_placeholder = has_externalized_placeholder and store_id is not None
         if store_id is None:
             return False
-        if mapped_from_active_placeholder and self._has_prior_raw_externalized_placeholder_row(int(store_id), msg):
-            raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-            if self._current_compress_placeholder_identity_counts.get(raw_identity, 0) <= 1:
-                return False
         try:
-            stored = self._store.get(int(store_id))
+            if (
+                mapped_from_active_placeholder
+                and self._has_prior_raw_externalized_placeholder_row(
+                    int(store_id),
+                    msg,
+                    deadline=deadline,
+                )
+            ):
+                raw_identity = self._raw_externalized_placeholder_replay_identity(
+                    msg
+                )
+                if (
+                    self._current_compress_placeholder_identity_counts.get(
+                        raw_identity,
+                        0,
+                    )
+                    <= 1
+                ):
+                    return False
+            stored = self._store.get(
+                int(store_id),
+                lock_timeout_seconds=(
+                    self._foreground_deadline_remaining(deadline)
+                ),
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except TimeoutError as exc:
+            if deadline is not None:
+                raise ForegroundDeadlineExceeded(
+                    "ingest filtering",
+                    "message-store lookup exceeded the shared deadline",
+                ) from exc
+            logger.debug("LCM stored ignore-pattern lookup failed", exc_info=True)
+            return False
+        except sqlite3.OperationalError as exc:
+            if deadline is not None and _is_sqlite_locked_error(exc):
+                raise ForegroundDeadlineExceeded(
+                    "ingest filtering",
+                    "SQLite contention prevented a bounded message lookup",
+                ) from exc
+            logger.debug("LCM stored ignore-pattern lookup failed", exc_info=True)
+            return False
         except Exception:
             logger.debug("LCM stored ignore-pattern lookup failed", exc_info=True)
             return False
@@ -4142,20 +6559,262 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         original_messages: List[Dict[str, Any]],
         active_replay_messages: List[Dict[str, Any]],
+        *,
+        store_ids_by_index: Optional[List[Optional[int]]] = None,
+        explicit_store_id_indices: Optional[set[int]] = None,
+        deadline: float | None = None,
     ) -> List[Dict[str, Any]]:
+        if (
+            store_ids_by_index is None
+            or len(store_ids_by_index) != len(active_replay_messages)
+        ):
+            store_ids_by_message_id = ReconcileMixin._get_store_id_map_for_messages(
+                self,
+                original_messages,
+                deadline=deadline,
+            )
+            store_ids_by_index = [
+                store_ids_by_message_id.get(id(message))
+                for message in original_messages
+            ]
+            if len(store_ids_by_index) < len(active_replay_messages):
+                store_ids_by_index.extend(
+                    [None] * (len(active_replay_messages) - len(store_ids_by_index))
+                )
+            elif len(store_ids_by_index) > len(active_replay_messages):
+                store_ids_by_index = store_ids_by_index[: len(active_replay_messages)]
+
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
         ]
-        self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+        cached_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
             active_replay_messages
         )
-        self._write_generated_ignored_placeholder_hash_counts(
-            self._generated_placeholder_digest_budget_for_active_replay(active_replay_messages)
+        self._last_active_replay_messages = cached_replay_messages
+        self._last_active_replay_store_ids = list(store_ids_by_index)
+        self._last_active_replay_explicit_store_id_indices = set(
+            explicit_store_id_indices or ()
         )
-        self._write_generated_ignored_placeholder_hash_ordinals(
-            self._generated_placeholder_digest_ordinals_for_active_replay(active_replay_messages)
+        self._remember_active_replay_store_refs(
+            original_messages,
+            active_replay_messages,
+            cached_replay_messages,
+            store_ids_by_index=store_ids_by_index,
+            explicit_store_id_indices=(
+                self._last_active_replay_explicit_store_id_indices
+            ),
         )
+        # Placeholder counts/ordinals are regenerable replay metadata, not raw
+        # source truth. A deadline-bound ingest has already committed its raw
+        # rows by the time this cache is remembered; synchronously persisting
+        # derived metadata here could extend the caller wall and mutate SQLite
+        # after timeout. Manual/background callers keep the historical durable
+        # update, while automatic foreground turns safely defer it to a later
+        # no-deadline maintenance path.
+        if deadline is None:
+            self._write_generated_ignored_placeholder_hash_counts(
+                self._generated_placeholder_digest_budget_for_active_replay(
+                    active_replay_messages,
+                    deadline=None,
+                )
+            )
+            self._write_generated_ignored_placeholder_hash_ordinals(
+                self._generated_placeholder_digest_ordinals_for_active_replay(
+                    active_replay_messages,
+                    deadline=None,
+                )
+            )
         return active_replay_messages
+
+    def _remember_active_replay_store_refs(
+        self,
+        original_messages: List[Dict[str, Any]],
+        active_replay_messages: List[Dict[str, Any]],
+        cached_replay_messages: List[Dict[str, Any]],
+        *,
+        store_ids_by_index: List[Optional[int]],
+        explicit_store_id_indices: set[int],
+    ) -> None:
+        """Keep exact-object lineage for an active view with reordered rows."""
+        refs: dict[int, tuple[Dict[str, Any], Optional[int]]] = {}
+        for index, store_id in enumerate(store_ids_by_index):
+            if index not in explicit_store_id_indices:
+                continue
+            for collection in (
+                original_messages,
+                active_replay_messages,
+                cached_replay_messages,
+            ):
+                if index >= len(collection):
+                    continue
+                message = collection[index]
+                refs[id(message)] = (message, store_id)
+        self._active_replay_store_refs_by_message_id = refs
+        self._active_replay_store_ref_session_id = str(self._session_id or "")
+        self._active_replay_store_ref_conversation_id = str(
+            self._conversation_id or ""
+        )
+
+    def _align_ingest_cursor_to_active_context(
+        self,
+        active_messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        """Make a transformed context the exact basis for future appends."""
+        ids_by_message_id = ReconcileMixin._get_store_id_map_for_messages(
+            self,
+            active_messages,
+            deadline=deadline,
+        )
+        store_ids_by_index = [
+            ids_by_message_id.get(id(message)) for message in active_messages
+        ]
+        cached_replay_messages = (
+            self._copy_active_replay_messages_preserving_generated_ids(
+                active_messages
+            )
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "active context alignment",
+            "before runtime cursor update",
+        )
+        self._ingest_cursor = len(active_messages)
+        self._ingest_cursor_needs_reconcile = False
+        self._last_active_replay_source_identities = [
+            self._message_replay_identity(message) for message in active_messages
+        ]
+        self._last_active_replay_messages = cached_replay_messages
+        self._last_active_replay_store_ids = store_ids_by_index
+        self._last_active_replay_explicit_store_id_indices = set()
+        self._remember_active_replay_store_refs(
+            active_messages,
+            active_messages,
+            cached_replay_messages,
+            store_ids_by_index=store_ids_by_index,
+            explicit_store_id_indices=set(),
+        )
+
+    def supports_bounded_admission_recovery(self) -> bool:
+        """Advertise the automatic, deterministic recovery lane to the host."""
+        return self._background_compaction_enabled()
+
+    def _reused_cached_suffix_indices(
+        self,
+        previous_identities: List[tuple[Any, ...]],
+        incoming_identities: List[tuple[Any, ...]],
+        *,
+        common_prefix: int,
+        deadline: float | None,
+    ) -> dict[int, int]:
+        """Map unchanged previous blocks onto their incoming positions.
+
+        The host can replace, insert, or delete messages inside an already
+        ingested active list while preserving its later messages.  Find the
+        longest suffix of the previous list that still occurs contiguously in
+        the incoming list, using a linear KMP scan over the reversed identities.
+        Unique ordered anchors also recover unchanged islands between edits.
+        Values map incoming indices to their cached indices.
+        """
+        previous_tail = previous_identities[common_prefix:]
+        incoming_tail = incoming_identities[common_prefix:]
+        if not previous_tail or not incoming_tail:
+            return {}
+
+        pattern = list(reversed(previous_tail))
+        failure = [0] * len(pattern)
+        for index in range(1, len(pattern)):
+            if index % 64 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "ingest replay validation",
+                )
+            matched = failure[index - 1]
+            while matched and pattern[matched] != pattern[index]:
+                matched = failure[matched - 1]
+            if pattern[matched] == pattern[index]:
+                matched += 1
+            failure[index] = matched
+
+        matched = 0
+        best_length = 0
+        best_incoming_start = -1
+        incoming_tail_length = len(incoming_tail)
+        for reverse_index, identity in enumerate(reversed(incoming_tail)):
+            if reverse_index % 64 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "ingest replay validation",
+                )
+            while matched and pattern[matched] != identity:
+                matched = failure[matched - 1]
+            if pattern[matched] == identity:
+                matched += 1
+            incoming_start = (
+                common_prefix + incoming_tail_length - 1 - reverse_index
+            )
+            if matched > best_length or (
+                matched == best_length
+                and matched > 0
+                and (
+                    best_incoming_start < 0
+                    or incoming_start < best_incoming_start
+                )
+            ):
+                best_length = matched
+                best_incoming_start = incoming_start
+            if matched == len(pattern):
+                matched = failure[matched - 1]
+
+        reused = {}
+        if best_length > 0:
+            previous_start = len(previous_identities) - best_length
+            reused = {
+                best_incoming_start + offset: previous_start + offset
+                for offset in range(best_length)
+            }
+
+        # More than one host rewrite can leave unchanged islands before the
+        # final suffix. Reusing only that suffix re-ingests those islands on
+        # every bind. Unique identities provide ordered, unambiguous anchors;
+        # repeated text alone is never enough to suppress a new occurrence.
+        from collections import Counter
+        previous_counts = Counter(previous_tail)
+        incoming_counts = Counter(incoming_tail)
+        previous_positions = {
+            identity: common_prefix + index
+            for index, identity in enumerate(previous_tail)
+            if previous_counts[identity] == 1
+        }
+        last_previous = common_prefix - 1
+        incoming_limit = best_incoming_start if reused else len(incoming_identities)
+        previous_limit = min(reused.values()) if reused else len(previous_identities)
+        for incoming_index in range(common_prefix, incoming_limit):
+            if incoming_index % 64 == 0:
+                self._foreground_deadline_checkpoint(deadline, "ingest replay validation")
+            identity = incoming_identities[incoming_index]
+            previous_index = previous_positions.get(identity)
+            if (
+                incoming_counts[identity] == 1
+                and previous_index is not None
+                and last_previous < previous_index < previous_limit
+            ):
+                reused[incoming_index] = previous_index
+                last_previous = previous_index
+        # Extend exact adjacent blocks between anchors without a quadratic
+        # diff or changing the order/multiplicity of repeated messages.
+        anchors = [(common_prefix - 1, common_prefix - 1), *sorted(reused.items()),
+                   (len(incoming_identities), len(previous_identities))]
+        for (left_i, left_p), (right_i, right_p) in zip(anchors, anchors[1:]):
+            i, pidx = left_i + 1, left_p + 1
+            while i < right_i and pidx < right_p and incoming_identities[i] == previous_identities[pidx]:
+                if i % 64 == 0:
+                    self._foreground_deadline_checkpoint(deadline, "ingest replay validation")
+                reused[i] = pidx
+                i += 1
+                pidx += 1
+        return reused
 
     def _cached_active_replay_messages(
         self,
@@ -4165,7 +6824,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return self._copy_active_replay_messages_preserving_generated_ids(cached)
+                copied = self._copy_active_replay_messages_preserving_generated_ids(cached)
+                store_ids = list(
+                    getattr(self, "_last_active_replay_store_ids", [])
+                )
+                if len(store_ids) != len(copied):
+                    store_ids = [None] * len(copied)
+                explicit_store_id_indices = set(
+                    getattr(
+                        self,
+                        "_last_active_replay_explicit_store_id_indices",
+                        set(),
+                    )
+                )
+                self._remember_active_replay_store_refs(
+                    original_messages,
+                    copied,
+                    cached,
+                    store_ids_by_index=store_ids,
+                    explicit_store_id_indices=explicit_store_id_indices,
+                )
+                return copied
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -4178,6 +6857,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and "Earlier turns have been compacted into hierarchical summaries below." in content
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
+            return True
+        if content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX):
+            return True
+        if content.lstrip().startswith("<relevant-memories>"):
+            return True
+        if content.lstrip().startswith(WORKING_SET_REFERENCE_PREFIX):
             return True
         if "[Expand for details:" not in content:
             return False
@@ -4357,7 +7042,208 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
-    def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _call_foreground_projection(
+        self,
+        operation,
+        *args,
+        deadline: float | None,
+        stage: str,
+        **kwargs,
+    ):
+        """Bound a foreground-owned file projection by the caller's wall."""
+        if deadline is None:
+            return operation(*args, **kwargs)
+        cancel_event = threading.Event()
+        guarded_kwargs = dict(kwargs)
+        timeout_error = ForegroundDeadlineExceeded(
+            stage,
+            "foreground projection exceeded the shared deadline",
+        )
+        remaining = self._foreground_deadline_remaining(deadline)
+        if remaining is None or remaining <= 0:
+            cancel_event.set()
+            raise timeout_error
+        try:
+            accepts_ownership = "ownership" in inspect.signature(
+                operation
+            ).parameters
+        except (TypeError, ValueError):
+            accepts_ownership = False
+        projection_ownership = guarded_kwargs.get("ownership")
+        owns_projection = accepts_ownership and projection_ownership is None
+        if owns_projection:
+            projection_ownership = self._new_foreground_externalization_ownership(
+                deadline,
+            )
+            guarded_kwargs["ownership"] = projection_ownership
+        for name, value in (
+            ("deadline", deadline),
+            ("cancel_event", cancel_event),
+            ("now", self._foreground_now),
+        ):
+            if self._summary_callable_accepts_keyword(operation, name):
+                guarded_kwargs[name] = value
+        remaining = self._foreground_deadline_remaining(deadline)
+        if remaining is None or remaining <= 0:
+            cancel_event.set()
+            if owns_projection:
+                projection_ownership.rollback()
+            raise timeout_error
+        slot = self._foreground_projection_call_slot
+        if not slot.acquire(blocking=False):
+            cancel_event.set()
+            if owns_projection:
+                projection_ownership.rollback()
+            raise timeout_error
+        process_slot = _FOREGROUND_PROJECTION_PROCESS_SLOT
+        if not process_slot.acquire(blocking=False):
+            slot.release()
+            cancel_event.set()
+            if owns_projection:
+                projection_ownership.rollback()
+            raise timeout_error
+
+        completed = threading.Event()
+        result_box: dict[str, Any] = {}
+
+        def invoke() -> None:
+            try:
+                if cancel_event.is_set() or self._foreground_now() >= float(deadline):
+                    return
+                result_box["value"] = operation(*args, **guarded_kwargs)
+            except BaseException as exc:
+                result_box["error"] = exc
+            finally:
+                process_slot.release()
+                slot.release()
+                completed.set()
+
+        worker = threading.Thread(
+            target=invoke,
+            name="lcm-foreground-projection",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            process_slot.release()
+            slot.release()
+            if owns_projection:
+                projection_ownership.rollback()
+            raise
+        remaining = self._foreground_deadline_remaining(deadline)
+        try:
+            finished = (
+                remaining is not None
+                and completed.wait(timeout=max(0.0, remaining))
+            )
+        except BaseException:
+            cancel_event.set()
+            if owns_projection:
+                projection_ownership.rollback()
+            raise
+        if not finished or self._foreground_now() >= float(deadline):
+            cancel_event.set()
+            if owns_projection:
+                projection_ownership.rollback()
+            raise timeout_error
+        if "error" in result_box:
+            if owns_projection:
+                projection_ownership.rollback()
+            raise result_box["error"]
+        if owns_projection:
+            try:
+                projection_ownership.publish(
+                    deadline=deadline,
+                    now=self._foreground_now,
+                )
+            except TimeoutError:
+                cancel_event.set()
+                projection_ownership.rollback()
+                raise timeout_error
+            except BaseException:
+                projection_ownership.rollback()
+                raise
+            if self._foreground_now() >= float(deadline):
+                cancel_event.set()
+                projection_ownership.rollback()
+                raise timeout_error
+            projection_ownership.commit()
+        return result_box.get("value")
+
+    def _new_foreground_externalization_ownership(
+        self,
+        deadline: float,
+    ) -> ExternalizationOwnership:
+        """Prepare storage before an abandonable worker can queue file intents."""
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "externalization storage preparation",
+        )
+        storage_dir = getattr(
+            self,
+            "_foreground_externalization_storage_dir",
+            None,
+        )
+        if storage_dir is None:
+            try:
+                # Resolve the configured name without creating or chmodding
+                # anything. A worker may perform bounded read-only existence
+                # checks, but only the joined foreground caller may write.
+                storage_dir = get_large_output_storage_dir(
+                    self._config,
+                    hermes_home=self._hermes_home,
+                    create=False,
+                )
+            except (OSError, ValueError):
+                storage_dir = None
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "externalization storage preparation",
+        )
+        return ExternalizationOwnership(
+            defer_publication=True,
+            storage_dir=storage_dir,
+        )
+
+    def _ingest_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> List[Dict[str, Any]]:
+        if deadline is None:
+            return self._ingest_messages_with_externalization_scope(
+                messages,
+                deadline=None,
+                ownership=None,
+            )
+
+        ownership = self._new_foreground_externalization_ownership(deadline)
+        try:
+            replay = self._ingest_messages_with_externalization_scope(
+                messages,
+                deadline=deadline,
+                ownership=ownership,
+            )
+            ownership.publish(
+                deadline=deadline,
+                now=self._foreground_now,
+            )
+            self._foreground_deadline_checkpoint(deadline, "ingest publication")
+        except BaseException:
+            ownership.rollback()
+            raise
+        ownership.commit()
+        return replay
+
+    def _ingest_messages_with_externalization_scope(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None,
+        ownership: ExternalizationOwnership | None,
+    ) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list
@@ -4370,6 +7256,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         assistant loops replaced by quarantine placeholders. Existing callers may
         ignore the return value when they only need durable persistence.
         """
+        self._foreground_deadline_checkpoint(deadline, "ingest")
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
             return self._redact_active_replay_messages(messages)
@@ -4383,15 +7270,128 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._redact_active_replay_messages(messages)
 
         n = len(messages)
-        cursor = min(max(self._ingest_cursor, 0), n)
+        previous_cursor = max(self._ingest_cursor, 0)
+        cursor = min(previous_cursor, n)
+        reused_cached_replay_indices: dict[int, int] = {}
+        active_store_ids_by_index: List[Optional[int]] = [None] * n
+        explicit_store_id_indices: set[int] = set()
+        cached_active_store_ids = list(
+            getattr(self, "_last_active_replay_store_ids", [])
+        )
+        cached_explicit_store_id_indices = set(
+            getattr(
+                self,
+                "_last_active_replay_explicit_store_id_indices",
+                set(),
+            )
+        )
+        if cursor > 0 and not self._ingest_cursor_needs_reconcile:
+            cached_source_identities = getattr(
+                self,
+                "_last_active_replay_source_identities",
+                None,
+            )
+            cached_active_replay_messages = getattr(
+                self,
+                "_last_active_replay_messages",
+                None,
+            )
+            if (
+                cached_source_identities is None
+                or cached_active_replay_messages is None
+                or len(cached_source_identities) < previous_cursor
+                or len(cached_active_replay_messages) < previous_cursor
+            ):
+                self._ingest_cursor_needs_reconcile = True
+            else:
+                matching_cursor = 0
+                for index, message in enumerate(messages[:cursor]):
+                    if index % 32 == 0:
+                        self._foreground_deadline_checkpoint(
+                            deadline,
+                            "ingest replay validation",
+                        )
+                    if (
+                        self._message_replay_identity(message)
+                        != cached_source_identities[index]
+                    ):
+                        break
+                    matching_cursor += 1
+                if matching_cursor < cursor:
+                    logger.info(
+                        "LCM rewound the in-memory ingest cursor after an active "
+                        "prefix rewrite: session=%s cursor=%d->%d",
+                        self._session_id,
+                        cursor,
+                        matching_cursor,
+                    )
+                    self._ingest_cursor = matching_cursor
+                    cursor = matching_cursor
+                    incoming_identities: List[tuple[Any, ...]] = []
+                    for index, message in enumerate(messages):
+                        if index % 32 == 0:
+                            self._foreground_deadline_checkpoint(
+                                deadline,
+                                "ingest replay validation",
+                            )
+                        incoming_identities.append(
+                            self._message_replay_identity(message)
+                        )
+                    reused_cached_replay_indices = (
+                        self._reused_cached_suffix_indices(
+                            cached_source_identities[:previous_cursor],
+                            incoming_identities,
+                            common_prefix=matching_cursor,
+                            deadline=deadline,
+                        )
+                    )
+                    if reused_cached_replay_indices:
+                        explicit_store_id_indices.update(
+                            reused_cached_replay_indices
+                        )
+                        for incoming_index, cached_index in (
+                            reused_cached_replay_indices.items()
+                        ):
+                            if cached_index < len(cached_active_store_ids):
+                                active_store_ids_by_index[incoming_index] = (
+                                    cached_active_store_ids[cached_index]
+                                )
+                        logger.info(
+                            "LCM reused %d unchanged active suffix messages "
+                            "after an in-memory prefix rewrite: session=%s",
+                            len(reused_cached_replay_indices),
+                            self._session_id,
+                        )
+                for index in range(matching_cursor):
+                    if index < len(cached_active_store_ids):
+                        active_store_ids_by_index[index] = (
+                            cached_active_store_ids[index]
+                        )
+                    if index in cached_explicit_store_id_indices:
+                        explicit_store_id_indices.add(index)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
             previous_store_id_map = self._current_compress_store_ids_by_message_id
-            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(messages)
+            self._current_compress_store_ids_by_message_id = (
+                self._get_store_id_map_for_messages(
+                    messages,
+                    deadline=deadline,
+                )
+            )
             try:
                 for idx in range(scan_start, n):
-                    mapped_ignore = self._mapped_stored_row_matches_ignore_message_patterns(messages[idx])
+                    if idx % 32 == 0:
+                        self._foreground_deadline_checkpoint(
+                            deadline,
+                            "ingest filtering",
+                        )
+                    mapped_ignore = (
+                        self._mapped_stored_row_matches_ignore_message_patterns(
+                            messages[idx],
+                            deadline=deadline,
+                        )
+                    )
                     ignored_original_messages[idx] = (
                         self._matches_ignore_message_patterns(messages[idx])
                         or mapped_ignore
@@ -4401,16 +7401,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         externalize_messages = [False] * n
         prefer_existing_externalized = [False] * n
         for idx in range(scan_start, n):
+            if idx % 64 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "ingest preparation",
+                )
             externalize_messages[idx] = not ignored_original_messages[idx]
         for idx in range(0, scan_start):
             prefer_existing_externalized[idx] = not ignored_original_messages[idx]
-        replay_messages = quarantine_suspicious_assistant_messages(
+        replay_messages = self._call_foreground_projection(
+            quarantine_suspicious_assistant_messages,
             messages,
+            deadline=deadline,
+            stage="ingest quarantine",
             session_id=self._session_id,
             config=self._config,
             hermes_home=self._hermes_home,
             externalize=externalize_messages,
             prefer_existing_externalized=prefer_existing_externalized,
+            ownership=ownership,
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "ingest quarantine",
         )
         replay_messages = self._redact_active_replay_messages(replay_messages)
         replay_messages = self._apply_ignored_active_replay_placeholders(
@@ -4418,7 +7431,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             replay_messages,
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
+            persist_metadata=deadline is None,
         )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "ingest replay cleanup",
+        )
+        if reused_cached_replay_indices:
+            cached_replay = self._copy_active_replay_messages_preserving_generated_ids(
+                self._last_active_replay_messages
+            )
+            replay_messages = list(replay_messages)
+            for incoming_index, cached_index in reused_cached_replay_indices.items():
+                replay_messages[incoming_index] = cached_replay[cached_index]
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = [
                 original_msg
@@ -4438,9 +7463,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 else replay_msg
                 for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
             ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
-            self._ingest_cursor_needs_reconcile = False
+            try:
+                if deadline is None:
+                    self._ingest_cursor = self._reconcile_ingest_cursor_from_store(
+                        reconcile_messages
+                    )
+                else:
+                    self._ingest_cursor = self._reconcile_ingest_cursor_from_store(
+                        reconcile_messages,
+                        deadline=deadline,
+                    )
+                self._ingest_cursor_needs_reconcile = False
+            except ReconcileBudgetExceeded:
+                # Reconciliation outlived its budget: abort this ingest batch
+                # entirely (never ingest duplicates past an unreconciled
+                # cursor), keep the needs-reconcile flag so the next turn
+                # retries with a warm payload index, and unblock turn
+                # finalization — the post-LLM hook must never wedge a turn.
+                logger.warning(
+                    "LCM ingest reconcile budget exceeded: session=%s incoming=%d — "
+                    "deferring ingest to next turn",
+                    self._session_id,
+                    len(reconcile_messages),
+                )
+                raise
         cursor = min(max(self._ingest_cursor, 0), n)
+        self._foreground_deadline_checkpoint(deadline, "ingest")
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4450,9 +7498,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and len(cached_source_identities) >= cursor
                 and len(cached_active_replay_messages) >= cursor
             ):
-                current_prefix_identities = [
-                    self._message_replay_identity(message) for message in messages[:cursor]
-                ]
+                current_prefix_identities = []
+                for index, message in enumerate(messages[:cursor]):
+                    if index % 32 == 0:
+                        self._foreground_deadline_checkpoint(
+                            deadline,
+                            "ingest replay validation",
+                        )
+                    current_prefix_identities.append(
+                        self._message_replay_identity(message)
+                    )
                 if current_prefix_identities == cached_source_identities[:cursor]:
                     replay_messages = (
                         self._copy_active_replay_messages_preserving_generated_ids(
@@ -4460,6 +7515,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         )
                         + replay_messages[cursor:]
                     )
+            if any(
+                active_store_ids_by_index[index] is None
+                for index in range(cursor)
+            ):
+                prefix_store_ids = ReconcileMixin._get_store_id_map_for_messages(
+                    self,
+                    messages[:cursor],
+                    deadline=deadline,
+                )
+                for index, message in enumerate(messages[:cursor]):
+                    if active_store_ids_by_index[index] is None:
+                        active_store_ids_by_index[index] = prefix_store_ids.get(
+                            id(message)
+                        )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
@@ -4477,20 +7546,41 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
                 return cached_replay
-            return self._remember_active_replay_messages(messages, replay_messages)
+            return self._remember_active_replay_messages(
+                messages,
+                replay_messages,
+                store_ids_by_index=active_store_ids_by_index,
+                explicit_store_id_indices=explicit_store_id_indices,
+                deadline=deadline,
+            )
 
         active_replay_messages = replay_messages
         compression_boundary_ingest_pending = self._compression_boundary_ingest_pending
         empty_session_placeholder_budget: dict[str, int] = {}
         empty_session_placeholder_ordinals: dict[str, set[int]] = {}
         if not compression_boundary_ingest_pending and self._session_id:
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "ingest durable count",
+            )
             try:
-                if self._store.get_session_count(self._session_id) == 0:
+                if self._store.get_session_count(
+                    self._session_id,
+                    lock_timeout_seconds=(
+                        self._foreground_deadline_remaining(deadline)
+                    ),
+                    deadline=deadline,
+                    deadline_clock=self._foreground_now,
+                ) == 0:
                     empty_session_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
                     empty_session_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
             except Exception:
                 empty_session_placeholder_budget = {}
                 empty_session_placeholder_ordinals = {}
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "ingest durable count",
+            )
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
             (cursor + offset, replay_msg)
             for offset, replay_msg in enumerate(new_messages)
@@ -4549,9 +7639,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
             )
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
+                if offset % 32 == 0:
+                    self._foreground_deadline_checkpoint(
+                        deadline,
+                        "ingest batch preparation",
+                    )
                 absolute_idx = cursor + offset
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+                generated_context_scaffold = self._is_replayed_context_scaffold_message(replay_msg)
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
                     replay_msg,
                     replay_text,
@@ -4574,6 +7670,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         or replay_text_stripped.startswith(_PRESERVED_TODO_CONTEXT_PREFIX)
                     ):
                         boundary_seen_synthetic_summary_before = True
+                # Generated projections are model-facing replay scaffold, not
+                # new source history. Record their compression-boundary ordering
+                # signal above before excluding them, otherwise carried ignored
+                # placeholders lose their ordinal/provenance protection.
+                if generated_context_scaffold:
+                    logger.debug(
+                        "LCM skipped generated context projection during ingest: session=%s index=%d",
+                        self._session_id,
+                        absolute_idx,
+                    )
+                    continue
                 compression_carried_active_placeholder = False
                 metadata_replayed_active_placeholder = False
                 if (
@@ -4654,7 +7761,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ):
                     self._ignored_message_count += 1
                     if generated_volatile_placeholder and volatile_digest is not None:
-                        self._remember_generated_ignored_placeholder_hash(volatile_digest)
+                        self._remember_generated_ignored_placeholder_hash(
+                            volatile_digest,
+                            persist=deadline is None,
+                        )
                     replay_preserves_ignore_decision = (
                         self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
                         or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
@@ -4696,7 +7806,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                 ):
                     store_msg = original_msg
-                kept.append((absolute_idx, store_msg))
+                if absolute_idx not in reused_cached_replay_indices:
+                    kept.append((absolute_idx, store_msg))
             messages_to_store_with_index = kept
 
         if not messages_to_store_with_index:
@@ -4706,21 +7817,40 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-            return self._remember_active_replay_messages(messages, active_replay_messages)
+            return self._remember_active_replay_messages(
+                messages,
+                active_replay_messages,
+                store_ids_by_index=active_store_ids_by_index,
+                explicit_store_id_indices=explicit_store_id_indices,
+                deadline=deadline,
+            )
 
-        protected_messages = protect_messages_for_ingest(
+        protected_messages = self._call_foreground_projection(
+            protect_messages_for_ingest,
             [msg for _idx, msg in messages_to_store_with_index],
+            deadline=deadline,
+            stage="ingest protection",
             session_id=self._session_id,
             config=self._config,
             hermes_home=self._hermes_home,
+            ownership=ownership,
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "ingest protection",
         )
         recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(
             active_replay_messages
         )
-        for (absolute_idx, _replay_msg), protected_msg in zip(
+        for protected_index, ((absolute_idx, _replay_msg), protected_msg) in enumerate(zip(
             messages_to_store_with_index,
             protected_messages,
-        ):
+        )):
+            if protected_index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "ingest active replay protection",
+                )
             if self._protected_message_uses_raw_payload_active_stub(protected_msg):
                 if active_replay_messages is replay_messages:
                     active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
@@ -4732,9 +7862,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
 
             active_message = active_replay_messages[absolute_idx]
-            stubbed_message = self._maybe_stub_active_tool_result(
+            stubbed_message = self._call_foreground_projection(
+                self._maybe_stub_active_tool_result,
                 active_message,
+                deadline=deadline,
+                stage="ingest active replay stubbing",
                 recovery_tool_call_ids=recovery_tool_call_ids,
+                ownership=ownership,
             )
             if stubbed_message is not None:
                 if active_replay_messages is replay_messages:
@@ -4743,14 +7877,91 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                 active_replay_messages[absolute_idx] = stubbed_message
 
-        estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
-            self._session_id,
+        estimates: list[int] = []
+        for estimate_index, (protected_message, (absolute_idx, _replay_message)) in enumerate(
+            zip(protected_messages, messages_to_store_with_index)
+        ):
+            if estimate_index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "ingest token counting",
+                )
+            # When previewing is enabled, the stored row may contain a small
+            # lossless externalization marker. Keep backlog/compaction accounting
+            # tied to the original source message so request-only projections
+            # cannot make raw work disappear. Flag-off sessions retain the prior
+            # marker-estimate behavior exactly.
+            # The integer estimate contains no payload and does not weaken the
+            # protected/externalized storage boundary.
+            source_message = protected_message
+            if self._active_replay_preview_policy().enabled:
+                source_message = (
+                    messages[absolute_idx]
+                    if 0 <= absolute_idx < len(messages)
+                    else protected_message
+                )
+            estimates.append(count_message_tokens(source_message))
+        self._foreground_deadline_checkpoint(deadline, "ingest commit")
+        metadata_json_updates = None
+        metadata_json_list_additions = None
+        if deadline is not None:
+            durable_active_indices = {
+                index
+                for index, store_id in enumerate(active_store_ids_by_index)
+                if store_id is not None
+            }
+            durable_active_indices.update(
+                absolute_idx
+                for absolute_idx, _message in messages_to_store_with_index
+            )
+            (
+                metadata_json_updates,
+                metadata_json_list_additions,
+            ) = self._active_placeholder_metadata_transaction_updates(
+                active_replay_messages,
+                durable_indices=durable_active_indices,
+                deadline=deadline,
+            )
+        # Persist replay ordering atomically with its raw rows. Otherwise a
+        # restart after multiple edits loses the only proof that unchanged
+        # islands were already ingested and appends the entire view again.
+        # Intentionally filtered rows are accepted too; bind the proof to
+        # the complete policy so changing filters forces reconciliation.
+        metadata_json_updates = list(metadata_json_updates or [])
+        metadata_json_updates.append((
+            [self._active_ingest_manifest_key()],
+            json.dumps(self._active_ingest_manifest(messages, deadline=deadline)),
+            True,
+        ))
+        if ownership is not None:
+            try:
+                ownership.publish(
+                    deadline=deadline,
+                    now=self._foreground_now,
+                )
+            except TimeoutError as exc:
+                raise ForegroundDeadlineExceeded(
+                    "ingest",
+                    "payload publication exceeded the shared deadline",
+                ) from exc
+            self._foreground_deadline_checkpoint(deadline, "ingest publication")
+        appended_store_ids = self._append_ingest_batch_with_deadline(
             protected_messages,
             estimates,
-            source=self._session_platform,
-            conversation_id=self._conversation_id,
+            deadline=deadline,
+            metadata_json_updates=metadata_json_updates,
+            metadata_json_list_additions=metadata_json_list_additions,
         )
+        # The raw append is the ownership boundary: placeholders now have a
+        # durable consumer, so a later foreground checkpoint must not remove
+        # their payload files during compensation.
+        if ownership is not None:
+            ownership.commit()
+        for (absolute_idx, _message), store_id in zip(
+            messages_to_store_with_index,
+            appended_store_ids,
+        ):
+            active_store_ids_by_index[absolute_idx] = int(store_id)
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists
@@ -4761,13 +7972,153 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
+        self._foreground_deadline_checkpoint(deadline, "ingest commit")
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         # Most ``protected_messages`` changes are storage-only: inline media and
         # data/base64 substrings stay provider-usable in active replay. The
         # exceptions are whole-message ``raw_payload`` externalization and the
         # separately opt-in textual tool-result interceptor above.
-        return self._remember_active_replay_messages(messages, active_replay_messages)
+        return self._remember_active_replay_messages(
+            messages,
+            active_replay_messages,
+            store_ids_by_index=active_store_ids_by_index,
+            explicit_store_id_indices=explicit_store_id_indices,
+            deadline=deadline,
+        )
+
+    def _active_placeholder_metadata_transaction_updates(
+        self,
+        active_replay_messages: List[Dict[str, Any]],
+        *,
+        durable_indices: set[int],
+        deadline: float,
+    ) -> tuple[
+        list[tuple[list[str], str, bool]],
+        list[tuple[list[str], list[str], int]],
+    ]:
+        """Build derived placeholder metadata for the raw append transaction."""
+        generated_hashes = set(
+            getattr(
+                self,
+                "_generated_ignored_active_replay_placeholder_hashes",
+                set(),
+            )
+        )
+        generated_message_ids = getattr(
+            self,
+            "_generated_ignored_active_replay_placeholder_message_ids",
+            set(),
+        )
+        counts: dict[str, int] = {}
+        ordinals: dict[str, set[int]] = {}
+        occurrence_by_digest: dict[str, int] = {}
+        for index, message in enumerate(active_replay_messages):
+            if index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "ingest placeholder metadata",
+                )
+            text = text_content_for_pattern_matching(message.get("content")) or ""
+            digest = self._active_replay_placeholder_digest(text)
+            if not digest or (
+                digest not in generated_hashes
+                and id(message) not in generated_message_ids
+            ):
+                continue
+            generated_hashes.add(digest)
+            occurrence_by_digest[digest] = occurrence_by_digest.get(digest, 0) + 1
+            if index in durable_indices:
+                continue
+            counts[digest] = counts.get(digest, 0) + 1
+            ordinals.setdefault(digest, set()).add(
+                occurrence_by_digest[digest]
+            )
+
+        serialized_counts = json.dumps(counts, sort_keys=True)
+        serialized_ordinals = json.dumps(
+            {
+                digest: sorted(values)
+                for digest, values in ordinals.items()
+                if values
+            },
+            sort_keys=True,
+        )
+        updates = [
+            (
+                self._ignored_placeholder_count_metadata_keys(),
+                serialized_counts,
+                True,
+            ),
+            (
+                self._ignored_placeholder_ordinal_metadata_keys(),
+                serialized_ordinals,
+                True,
+            ),
+        ]
+        list_additions = [
+            (
+                self._ignored_placeholder_metadata_keys(),
+                sorted(generated_hashes),
+                512,
+            )
+        ]
+        return updates, list_additions
+
+    def _append_ingest_batch_with_deadline(
+        self,
+        protected_messages: List[Dict[str, Any]],
+        estimates: List[int],
+        *,
+        deadline: float | None,
+        metadata_json_updates: list[
+            tuple[list[str], str, bool]
+        ] | None = None,
+        metadata_json_list_additions: list[
+            tuple[list[str], list[str], int]
+        ] | None = None,
+    ) -> List[int]:
+        """Atomically append raw rows without waiting past a foreground wall."""
+        if deadline is None:
+            return self._store._append_protected_batch(
+                self._session_id,
+                protected_messages,
+                estimates,
+                source=self._session_platform,
+                conversation_id=self._conversation_id,
+                metadata_json_updates=metadata_json_updates,
+                metadata_json_list_additions=metadata_json_list_additions,
+            )
+
+        remaining = self._foreground_deadline_remaining(deadline)
+        if remaining is None or remaining <= 0:
+            raise ForegroundDeadlineExceeded("ingest", "before raw append")
+        try:
+            return self._store._append_protected_batch(
+                self._session_id,
+                protected_messages,
+                estimates,
+                source=self._session_platform,
+                conversation_id=self._conversation_id,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+                lock_timeout_seconds=remaining,
+                busy_timeout_ms=max(0, int(remaining * 1000)),
+                metadata_json_updates=metadata_json_updates,
+                metadata_json_list_additions=metadata_json_list_additions,
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                "ingest",
+                "message-store work exceeded the shared deadline",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            raise ForegroundDeadlineExceeded(
+                "ingest",
+                "SQLite wait consumed the shared deadline",
+            ) from exc
 
     @staticmethod
     def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
@@ -4776,39 +8127,237 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "[Externalized payload: kind=raw_payload;"
         )
 
-    def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
-        ids_by_message_id = self._get_store_id_map_for_messages(messages)
-        return [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
+    def _get_store_id_map_for_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> dict[int, int]:
+        """Map active objects, including a suffix reused across a middle edit."""
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "source mapping",
+            "before active replay reference scan",
+        )
+        explicit: dict[int, Optional[int]] = {}
+        refs = (
+            getattr(self, "_active_replay_store_refs_by_message_id", {})
+            if (
+                str(self._session_id or "")
+                == getattr(self, "_active_replay_store_ref_session_id", "")
+                and str(self._conversation_id or "")
+                == getattr(
+                    self,
+                    "_active_replay_store_ref_conversation_id",
+                    "",
+                )
+            )
+            else {}
+        )
+        all_explicit = True
+        for message_index, message in enumerate(messages):
+            if message_index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "source mapping",
+                    "active replay reference scan",
+                )
+            cached = refs.get(id(message))
+            if cached is None or cached[0] is not message:
+                all_explicit = False
+                continue
+            explicit[id(message)] = cached[1]
+
+        possible_joined_user = any(
+            m.get('role') == 'user' and isinstance(m.get('content'), str)
+            and '\n\n' in m['content'] for m in messages)
+        if all_explicit and not possible_joined_user:
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "source mapping",
+                "after active replay reference scan",
+            )
+            return {
+                message_id: int(store_id)
+                for message_id, store_id in explicit.items()
+                if store_id is not None
+            }
+
+        mapped = ReconcileMixin._get_store_id_map_for_messages(
+            self,
+            messages,
+            deadline=deadline,
+        )
+        for message_id, store_id in explicit.items():
+            if store_id is None:
+                mapped.pop(message_id, None)
+            else:
+                mapped[message_id] = int(store_id)
+                groups = getattr(mapped, 'source_groups', {})
+                if message_id in groups and groups[message_id][-1] != int(store_id):
+                    groups.pop(message_id)
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "source mapping",
+            "after durable source mapping",
+        )
+        return mapped
+
+    def _get_store_ids_for_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> List[int]:
+        ids_by_message_id = self._get_store_id_map_for_messages(
+            messages,
+            deadline=deadline,
+        )
+        from .historical_projection import source_ids
+        return [source for msg in messages for source in source_ids(ids_by_message_id, msg)]
 
     # -- Internal: summarization -------------------------------------------
+
+    def _schedule_pre_compaction_extraction_persistence(
+        self,
+        prepared: PreparedExtraction,
+        *,
+        output_path: str,
+        session_id: str,
+        cancel_event: threading.Event,
+        deadline: float,
+    ) -> None:
+        """Persist extraction off-path with one bounded, deadline-aware worker."""
+        if not prepared.content or self._foreground_now() >= float(deadline):
+            return
+        if not self._extraction_persistence_slot.acquire(blocking=False):
+            logger.debug(
+                "Pre-compaction extraction persistence skipped while a prior write is active"
+            )
+            return
+        self._extraction_persistence_idle.clear()
+
+        def persist() -> None:
+            try:
+                persist_pre_compaction_extraction(
+                    prepared,
+                    output_path=output_path,
+                    session_id=session_id,
+                    cancel_event=cancel_event,
+                    deadline=deadline,
+                    now=self._foreground_now,
+                )
+            finally:
+                self._extraction_persistence_slot.release()
+                self._extraction_persistence_idle.set()
+
+        worker = threading.Thread(
+            target=persist,
+            name="lcm-extraction-persistence",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException as exc:
+            self._extraction_persistence_slot.release()
+            self._extraction_persistence_idle.set()
+            logger.warning(
+                "Pre-compaction extraction persistence worker could not start "
+                "(error_type=%s)",
+                type(exc).__name__,
+            )
 
     def _run_pre_compaction_extraction(
         self,
         messages: List[Dict[str, Any]],
         *,
         timeout_seconds: Optional[float] = None,
+        deadline: float | None = None,
     ) -> None:
         """Best-effort extraction of decisions before compaction."""
+        cancel_event = threading.Event()
         try:
-            serialized = self._serialize_messages(messages)
+            started_at = self._foreground_now()
+            configured_timeout = (
+                float(timeout_seconds)
+                if timeout_seconds is not None
+                else self._config.summary_timeout_ms / 1000
+            )
+            local_deadline = started_at + max(0.0, configured_timeout)
+            effective_deadline = (
+                local_deadline
+                if deadline is None
+                else min(float(deadline), local_deadline)
+            )
+            if self._foreground_now() >= effective_deadline:
+                raise TimeoutError(
+                    "pre-compaction extraction budget expired before serialization"
+                )
+            serialized = self._call_with_foreground_deadline(
+                self._serialize_messages,
+                messages,
+                deadline=effective_deadline,
+            )
+            remaining = max(
+                0.0,
+                effective_deadline - self._foreground_now(),
+            )
+            if remaining <= 0:
+                raise TimeoutError(
+                    "pre-compaction extraction budget expired during serialization"
+                )
             output_path = self._config.extraction_output_path
             if not output_path:
                 base = self._hermes_home or os.path.expanduser("~/.hermes")
                 output_path = os.path.join(base, "lcm-extractions")
             extraction_model = self._config.extraction_model or self._config.summary_model
-            extract_before_compaction(
-                serialized_messages=serialized,
-                output_path=output_path,
-                session_id=self._session_id or "",
-                model=extraction_model,
-                timeout=(
-                    timeout_seconds
-                    if timeout_seconds is not None
-                    else self._config.summary_timeout_ms / 1000
-                ),
+            extraction_kwargs: dict[str, Any] = {
+                "serialized_messages": serialized,
+                "output_path": output_path,
+                "session_id": self._session_id or "",
+                "model": extraction_model,
+            }
+            if self._summary_callable_accepts_keyword(
+                extract_before_compaction,
+                "timeout",
+            ):
+                extraction_kwargs["timeout"] = remaining
+            if self._summary_callable_accepts_keyword(
+                extract_before_compaction,
+                "cancel_event",
+            ):
+                extraction_kwargs["cancel_event"] = cancel_event
+            defers_persistence = self._summary_callable_accepts_keyword(
+                extract_before_compaction,
+                "defer_persistence",
             )
+            if defers_persistence:
+                extraction_kwargs["defer_persistence"] = True
+
+            result = self._call_with_hard_foreground_deadline(
+                lambda: extract_before_compaction(**extraction_kwargs),
+                deadline=effective_deadline,
+                timeout_error=TimeoutError(
+                    "pre-compaction extraction exceeded its foreground budget"
+                ),
+                cancel_event=cancel_event,
+            )
+            if isinstance(result, PreparedExtraction):
+                if self._foreground_now() >= effective_deadline:
+                    cancel_event.set()
+                    return
+                self._schedule_pre_compaction_extraction_persistence(
+                    result,
+                    output_path=output_path,
+                    session_id=self._session_id or "",
+                    cancel_event=cancel_event,
+                    deadline=effective_deadline,
+                )
         except Exception as e:
-            logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
+            logger.warning(
+                "Pre-compaction extraction failed or timed out (non-blocking): %s",
+                type(e).__name__,
+            )
 
     def _run_assertion_extraction_batch(
         self,
@@ -4816,8 +8365,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         snapshots: tuple[SourceSnapshot, ...],
         model: str,
         timeout_seconds: float,
+        schema_ready_token: AssertionSchemaReadyToken,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Derive one bounded batch on a daemon worker outside raw writes."""
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if cancel_event is not None and cancel_event.is_set():
+                return 0.0
+            if deadline is None:
+                return None
+            return max(0.0, float(deadline) - float(clock()))
+
+        def require_active() -> float | None:
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("assertion origin deadline exceeded")
+            return remaining
+
         started = time.perf_counter()
         completed = 0
         failed = 0
@@ -4825,22 +8393,76 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         extractor = None
         writer = None
         try:
-            writer = AssertionStore(db_path)
+            initial_remaining = require_active()
+            writer = AssertionStore(
+                db_path,
+                deadline=deadline,
+                deadline_clock=clock,
+                busy_timeout_ms=(
+                    None
+                    if initial_remaining is None
+                    else max(0, int(initial_remaining * 1000))
+                ),
+                initialize_schema=False,
+                schema_ready_token=schema_ready_token,
+            )
             extractor = ModelAssertionExtractor(
                 writer,
                 model=model,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=(
+                    timeout_seconds
+                    if initial_remaining is None
+                    else min(timeout_seconds, initial_remaining)
+                ),
             )
             for snapshot in snapshots:
                 try:
-                    if writer.has_current_receipt(snapshot):
+                    remaining = require_active()
+                    read_kwargs = (
+                        {
+                            "lock_timeout_seconds": remaining,
+                            "deadline": deadline,
+                            "deadline_clock": clock,
+                            "busy_timeout_ms": max(0, int(remaining * 1000)),
+                        }
+                        if remaining is not None
+                        else {}
+                    )
+                    if writer.has_current_receipt(snapshot, **read_kwargs):
                         completed += 1
                         continue
-                    extraction = extractor(snapshot)
+                    remaining = require_active()
+                    if remaining is not None:
+                        # The constructor keeps legacy standalone calls at a
+                        # 100ms floor. Origin-bounded workers must instead pass
+                        # the exact smaller remainder through to the provider.
+                        extractor.timeout_seconds = max(
+                            0.001,
+                            min(float(timeout_seconds), remaining),
+                        )
+                    extraction = extractor(
+                        snapshot,
+                        deadline=deadline,
+                        deadline_clock=clock,
+                        cancel_event=cancel_event,
+                    )
+                    remaining = require_active()
+                    publish_kwargs = (
+                        {
+                            "lock_timeout_seconds": remaining,
+                            "deadline": deadline,
+                            "deadline_clock": clock,
+                            "busy_timeout_ms": max(0, int(remaining * 1000)),
+                            "cancel_event": cancel_event,
+                        }
+                        if remaining is not None
+                        else {}
+                    )
                     writer.publish_source(
                         snapshot,
                         extraction.assertions,
                         relations=extraction.relations,
+                        **publish_kwargs,
                     )
                     completed += 1
                 except Exception as exc:
@@ -4851,6 +8473,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         snapshot.store_id,
                         last_error,
                     )
+                    if isinstance(exc, TimeoutError) or (
+                        cancel_event is not None and cancel_event.is_set()
+                    ):
+                        failed += max(0, len(snapshots) - completed - failed)
+                        break
         except Exception as exc:
             failed += max(1, len(snapshots) - completed)
             last_error = f"{type(exc).__name__}: {exc}"[:300]
@@ -4858,7 +8485,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         finally:
             if writer is not None:
                 try:
-                    writer.close()
+                    # Every durable assertion publication commits explicitly.
+                    # A deadline-owned worker must never turn an interrupted
+                    # transaction into a late commit during cleanup.
+                    writer.close(commit=False)
                 except Exception:
                     logger.warning(
                         "Structured assertion writer close failed",
@@ -4879,7 +8509,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             _ASSERTION_EXTRACTION_PROCESS_SLOT.release()
 
     def _schedule_pre_compaction_assertions(
-        self, messages: List[Dict[str, Any]]
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
     ) -> bool:
         """Queue exact persisted rows without blocking the compaction path."""
         if (
@@ -4901,21 +8534,76 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ),
             ),
         )
-        store_ids = sorted(dict.fromkeys(self._get_store_ids_for_messages(messages)))
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "assertion scheduling",
+            "before source mapping",
+        )
+        store_ids = sorted(
+            dict.fromkeys(
+                self._call_with_foreground_deadline(
+                    self._get_store_ids_for_messages,
+                    messages,
+                    deadline=deadline,
+                )
+            )
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "assertion scheduling",
+            "after source mapping",
+        )
         snapshots: list[SourceSnapshot] = []
         for store_id in store_ids:
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "assertion scheduling",
+                "before assertion source read",
+            )
+            remaining = self._foreground_deadline_remaining(deadline)
+            read_kwargs = (
+                {
+                    "lock_timeout_seconds": remaining,
+                    "deadline": deadline,
+                    "deadline_clock": self._foreground_now,
+                    "busy_timeout_ms": max(0, int(remaining * 1000)),
+                }
+                if remaining is not None
+                else {}
+            )
             try:
-                snapshot = self._assertions.snapshot_source(store_id)
+                snapshot = self._assertions.snapshot_source(
+                    store_id,
+                    **read_kwargs,
+                )
                 if snapshot.role not in {"user", "assistant"}:
                     continue
-                if not self._assertions.has_current_receipt(snapshot):
+                if not self._assertions.has_current_receipt(
+                    snapshot,
+                    **read_kwargs,
+                ):
                     snapshots.append(snapshot)
             except (KeyError, sqlite3.Error):
                 continue
+            except TimeoutError as exc:
+                raise ForegroundDeadlineExceeded(
+                    "assertion scheduling",
+                    "assertion store lock wait exceeded the shared deadline",
+                ) from exc
             if len(snapshots) >= max_sources:
                 break
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "assertion scheduling",
+            "after assertion source reads",
+        )
         if not snapshots:
             return False
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "assertion scheduling",
+            "before assertion worker admission",
+        )
         if not _ASSERTION_EXTRACTION_PROCESS_SLOT.acquire(blocking=False):
             with self._assertion_extraction_metrics_lock:
                 self._assertion_extraction_batches_skipped_busy += 1
@@ -4923,13 +8611,49 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         model = self._assertion_extraction_model()
         timeout_seconds = self._assertion_extraction_timeout()
+        schema_ready_token = self._assertion_schema_ready_token
+        if schema_ready_token is None:
+            _ASSERTION_EXTRACTION_PROCESS_SLOT.release()
+            logger.warning(
+                "Structured assertion worker skipped without a startup schema proof"
+            )
+            return False
+        remaining = self._foreground_deadline_remaining(deadline)
+        if remaining is not None:
+            if remaining <= 0:
+                _ASSERTION_EXTRACTION_PROCESS_SLOT.release()
+                raise ForegroundDeadlineExceeded(
+                    "assertion scheduling",
+                    "deadline expired after worker admission",
+                )
+            timeout_seconds = min(timeout_seconds, remaining)
+        cancel_event = threading.Event()
+        try:
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "assertion scheduling",
+                "before assertion worker start",
+            )
+        except BaseException:
+            cancel_event.set()
+            _ASSERTION_EXTRACTION_PROCESS_SLOT.release()
+            raise
         with self._assertion_extraction_metrics_lock:
             self._assertion_extraction_batches_scheduled += 1
             self._assertion_extraction_sources_scheduled += len(snapshots)
         self._assertion_extraction_idle.clear()
         worker = threading.Thread(
             target=self._run_assertion_extraction_batch,
-            args=(str(self._store.db_path), tuple(snapshots), model, timeout_seconds),
+            args=(
+                str(self._store.db_path),
+                tuple(snapshots),
+                model,
+                timeout_seconds,
+                schema_ready_token,
+                deadline,
+                self._foreground_now,
+                cancel_event,
+            ),
             name="lcm-assertion-extraction",
             daemon=True,
         )
@@ -4954,13 +8678,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         compacted_chunk: List[Dict[str, Any]],
         source_store_ids: List[int],
+        *,
+        deadline: float | None = None,
     ) -> None:
         if not getattr(self._config, "large_output_transcript_gc_enabled", False):
             return
         if not compacted_chunk or not source_store_ids:
             return
+        remaining = self._foreground_deadline_remaining(deadline)
+        if remaining is not None and remaining < 0.1:
+            # Optional cleanup should not start when there is no useful budget
+            # for both discovery and a precommit-checked rewrite.
+            return
 
-        stored_by_id = self._store.get_batch(source_store_ids)
+        def checkpoint(detail: str) -> None:
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "transcript GC",
+                detail,
+            )
 
         def _archive_in_rewrite_txn(conn: "sqlite3.Connection", sid: int) -> None:
             # Runs inside gc_externalized_tool_result's write transaction, right
@@ -4968,139 +8704,235 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # now-stale chunks ATOMICALLY with the rewrite so a recall can never
             # slice the new (short) content at the old chunk offsets (F2).
             self._archive_chunks_for_messages([sid], connection=conn)
+            checkpoint("before transcript GC commit")
 
-        for store_id in source_store_ids:
-            stored = stored_by_id.get(store_id)
-            if not stored or stored.get("session_id") != self._session_id:
-                continue
-            if stored.get("role") != "tool":
-                continue
-            content = stored.get("content", "") or ""
-            tool_call_id = stored.get("tool_call_id", "") or ""
-            if not content:
-                continue
+        def plan_gc(
+            *,
+            deadline: float | None = None,
+            cancel_event: threading.Event | None = None,
+            now: Callable[[], float] | None = None,
+        ) -> list[tuple[int, str]]:
+            clock = now or self._foreground_now
 
-            # Only take the fast ref-branch when the ENTIRE row is the
-            # externalized placeholder. A ref merely embedded in surrounding
-            # text (e.g. a recall-tool result that quotes a placeholder) must
-            # fall through to the content-equality lookup below, which tombstones
-            # only when the full row content matches the stored payload -
-            # otherwise the surrounding, never-externalized text is lost.
-            ref = extract_externalized_ref(content) if is_externalized_placeholder(content) else None
-            if ref:
-                externalized = load_externalized_payload(
-                    ref,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
-                    placeholder = build_transcript_gc_placeholder(externalized)
-                    self._store.gc_externalized_tool_result(
-                        store_id, placeholder, before_commit=_archive_in_rewrite_txn
+            def plan_checkpoint(detail: str) -> None:
+                if (
+                    (cancel_event is not None and cancel_event.is_set())
+                    or (
+                        deadline is not None
+                        and float(clock()) >= float(deadline)
                     )
+                ):
+                    raise TimeoutError(
+                        f"transcript GC planning deadline exceeded {detail}"
+                    )
+
+            plan_checkpoint("before source lookup")
+            if deadline is None:
+                stored_by_id = self._store.get_batch(source_store_ids)
+            else:
+                remaining_for_read = max(
+                    0.0,
+                    float(deadline) - float(clock()),
+                )
+                stored_by_id = self._store.get_batch(
+                    source_store_ids,
+                    deadline=deadline,
+                    deadline_clock=clock,
+                    lock_timeout_seconds=remaining_for_read,
+                    busy_timeout_ms=max(0, int(remaining_for_read * 1000)),
+                )
+            plan_checkpoint("after source lookup")
+            planned: list[tuple[int, str]] = []
+
+            for store_id in source_store_ids:
+                plan_checkpoint("before source lookup")
+                stored = stored_by_id.get(store_id)
+                if not stored or stored.get("session_id") != self._session_id:
                     continue
 
-            lookup_candidates = []
-            sanitized_content = sanitize_pre_compaction_content(content)
-            if sanitized_content and sanitized_content != content:
-                lookup_candidates.append(sanitized_content)
-            lookup_candidates.append(content)
+                if stored.get("role") != "tool":
+                    continue
+                content = stored.get("content", "") or ""
+                tool_call_id = stored.get("tool_call_id", "") or ""
+                if not content:
+                    continue
 
-            externalized = None
-            for candidate in lookup_candidates:
-                externalized = find_externalized_payload_for_message(
-                    candidate,
-                    tool_call_id=tool_call_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
+                # Only take the fast ref-branch when the ENTIRE row is the
+                # externalized placeholder. A ref merely embedded in surrounding
+                # text (e.g. a recall-tool result that quotes a placeholder) must
+                # fall through to the content-equality lookup below, which tombstones
+                # only when the full row content matches the stored payload -
+                # otherwise the surrounding, never-externalized text is lost.
+                ref = (
+                    extract_externalized_ref(content)
+                    if is_externalized_placeholder(content)
+                    else None
                 )
-                if externalized is not None:
-                    break
-            if externalized is None:
-                continue
-
-            placeholder = build_transcript_gc_placeholder(externalized)
-            self._store.gc_externalized_tool_result(
-                store_id, placeholder, before_commit=_archive_in_rewrite_txn
-            )
-
-    def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
-        """Serialize messages into labeled text for the summarizer."""
-        parts = []
-        matched_tool_ids = _matched_tool_call_ids(messages)
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = redact_sensitive_value(
-                msg.get("content") or "",
-                self._config,
-                parse_json_strings=False,
-            )
-            if role == "tool":
-                tool_id = str(msg.get("tool_call_id") or "").strip()
-                externalized = maybe_externalize_tool_output(
-                    content,
-                    tool_call_id=tool_id,
-                    session_id=self._session_id,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if externalized:
-                    content = externalized["placeholder"]
-                else:
-                    content = sanitize_pre_compaction_content(content)
-                    if len(content) > 3000:
-                        content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
-                continue
-
-            content = sanitize_pre_compaction_content(content)
-
-            if role == "assistant":
-                tool_calls = msg.get("tool_calls", [])
-                matched_tool_calls = [
-                    tc for tc in tool_calls
-                    if not _tool_call_id(tc) or _tool_call_id(tc) in matched_tool_ids
-                ]
-                if _is_synthetic_assistant_noise(content):
-                    if not matched_tool_calls:
+                if ref:
+                    externalized = load_externalized_payload(
+                        ref,
+                        config=self._config,
+                        hermes_home=self._hermes_home,
+                    )
+                    plan_checkpoint("after externalized payload lookup")
+                    if (
+                        externalized is not None
+                        and externalized.get("kind", "tool_result")
+                        == "tool_result"
+                    ):
+                        placeholder = build_transcript_gc_placeholder(externalized)
+                        planned.append((store_id, placeholder))
                         continue
-                    content = ""
-                if len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                if matched_tool_calls:
-                    tc_parts = []
-                    for tc in matched_tool_calls:
-                        if isinstance(tc, dict):
-                            fn = tc.get("function", {})
-                            name = fn.get("name", "?")
-                            args = fn.get("arguments", "")
-                            args = redact_sensitive_value(
-                                args,
-                                self._config,
-                                parse_json_strings=True,
-                            )
-                            args = sanitize_pre_compaction_tool_arguments(args)
-                            if len(args) > 500:
-                                args = args[:400] + "..."
-                            tc_parts.append(f"  {name}({args})")
-                    content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
-                parts.append(f"[ASSISTANT]: {content}")
-                continue
 
-            if len(content) > 3000:
-                content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-            parts.append(f"[{role.upper()}]: {content}")
+                lookup_candidates = []
+                sanitized_content = sanitize_pre_compaction_content(content)
+                if sanitized_content and sanitized_content != content:
+                    lookup_candidates.append(sanitized_content)
+                lookup_candidates.append(content)
 
-        return "\n\n".join(parts)
+                externalized = None
+                for candidate in lookup_candidates:
+                    externalized = find_externalized_payload_for_message(
+                        candidate,
+                        tool_call_id=tool_call_id,
+                        session_id=self._session_id,
+                        config=self._config,
+                        hermes_home=self._hermes_home,
+                    )
+                    plan_checkpoint("after externalized payload search")
+                    if externalized is not None:
+                        break
+                if externalized is not None:
+                    placeholder = build_transcript_gc_placeholder(externalized)
+                    planned.append((store_id, placeholder))
+            plan_checkpoint("after source planning")
+            return planned
+
+        if deadline is None:
+            planned_rewrites = plan_gc()
+        else:
+            try:
+                planned_rewrites = self._call_foreground_projection(
+                    plan_gc,
+                    deadline=deadline,
+                    stage="transcript GC planning",
+                )
+            except (ForegroundDeadlineExceeded, TimeoutError):
+                return
+            except sqlite3.OperationalError as exc:
+                if _is_sqlite_locked_error(exc):
+                    return
+                raise
+
+        for store_id, placeholder in planned_rewrites:
+            try:
+                checkpoint("before source rewrite")
+                remaining_for_write = self._foreground_deadline_remaining(deadline)
+                write_kwargs: dict[str, Any] = {}
+                if deadline is not None:
+                    write_kwargs = {
+                        "deadline": deadline,
+                        "deadline_clock": self._foreground_now,
+                        "lock_timeout_seconds": remaining_for_write,
+                        "busy_timeout_ms": max(
+                            0,
+                            int(float(remaining_for_write or 0.0) * 1000),
+                        ),
+                    }
+                self._store.gc_externalized_tool_result(
+                    store_id,
+                    placeholder,
+                    before_commit=_archive_in_rewrite_txn,
+                    **write_kwargs,
+                )
+            except (ForegroundDeadlineExceeded, TimeoutError):
+                # Each rewrite is its own transaction. A deadline raised by the
+                # store or archive callback rolls the current one back; earlier
+                # completed cleanup remains valid and raw content never vanishes.
+                return
+            except sqlite3.OperationalError as exc:
+                if _is_sqlite_locked_error(exc):
+                    return
+                raise
+
+    def reserve_model_switch(self, **kwargs):
+        from .model_switch_binding import reserve_model_switch
+        return reserve_model_switch(self, **kwargs)
+
+    def finish_model_switch(self, receipt):
+        from .model_switch_binding import finish_model_switch
+        return finish_model_switch(self, receipt)
+
+    def model_switch_summary_policy(self, *, custom_providers, deadline, cancel_event,
+                                    registry_version=None):
+        from .model_switch_preparation import model_switch_summary_policy
+        return model_switch_summary_policy(
+            self, custom_providers=custom_providers, deadline=deadline,
+            cancel_event=cancel_event, registry_version=registry_version)
+
+    def prepare_model_switch_summary(
+        self, messages, token_budget, deadline, cancel_event, *, admit_request,
+        custom_providers, registry_version=None
+    ):
+        """Prepare a detached summary without changing LCM or host history."""
+        from .model_switch_preparation import prepare_model_switch_summary
+
+        return prepare_model_switch_summary(
+            self, messages, token_budget, deadline, cancel_event,
+            admit_request=admit_request, custom_providers=custom_providers,
+            registry_version=registry_version,
+        )
+
+    def _serialize_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> str:
+        """Serialize messages into labeled text for the summarizer."""
+        return self._call_foreground_projection(
+            serialize_summary_messages,
+            messages,
+            deadline=deadline,
+            stage="summary serialization",
+            config=self._config,
+            session_id=self._session_id,
+            hermes_home=self._hermes_home,
+        )
 
     # -- Internal: tool-pair sanitization ------------------------------------
+
+    def _context_projection_checkpoint(
+        self,
+        *,
+        deadline: float | None,
+        cancel_event: threading.Event | None,
+        now: Callable[[], float] | None,
+        operation: str,
+    ) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ForegroundDeadlineExceeded(
+                "context reconstruction",
+                f"{operation} was cancelled at the shared deadline",
+            )
+        if deadline is None:
+            return
+        clock = now or self._foreground_now
+        if clock() >= float(deadline):
+            raise ForegroundDeadlineExceeded(
+                "context reconstruction",
+                f"{operation} exceeded the shared deadline",
+            )
 
     def _sanitize_active_context_messages(
         self,
         messages: List[Dict[str, Any]],
         *,
         insert_missing_tool_stubs: bool = True,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        now: Callable[[], float] | None = None,
+        ownership: ExternalizationOwnership | None = None,
     ) -> List[Dict[str, Any]]:
         """Drop unsafe assistant-only noise, then repair tool sequencing.
 
@@ -5111,8 +8943,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         cleaned: list[Dict[str, Any]] = []
         dropped_assistant_messages = 0
         stripped_assistant_messages = 0
-        for msg in messages:
-            msg = self._sanitize_active_preserved_objective_message(msg)
+        for message_index, msg in enumerate(messages):
+            if message_index % 32 == 0:
+                self._context_projection_checkpoint(
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    operation="active context cleanup",
+                )
+            msg = self._sanitize_active_preserved_objective_message(
+                msg,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
+            )
             if msg.get("role") == "assistant":
                 cleaned_msg = _clean_active_assistant_message(msg)
                 if cleaned_msg is None:
@@ -5135,10 +8980,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 stripped_assistant_messages,
             )
 
-        return self._sanitize_tool_pairs(
+        sanitized = self._sanitize_tool_pairs(
             cleaned,
             insert_missing_tool_stubs=insert_missing_tool_stubs,
         )
+        self._context_projection_checkpoint(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            operation="active context cleanup",
+        )
+        return sanitized
 
     @staticmethod
     def _active_tool_stub_content(original_content: Any, placeholder: str) -> Any:
@@ -5230,7 +9082,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         message: Dict[str, Any],
         *,
         recovery_tool_call_ids: set[str],
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        now: Callable[[], float] | None = None,
+        ownership: ExternalizationOwnership | None = None,
     ) -> Dict[str, Any] | None:
+        clock = now or time.monotonic
+        if (
+            (cancel_event is not None and cancel_event.is_set())
+            or (deadline is not None and float(clock()) >= float(deadline))
+        ):
+            raise TimeoutError("active replay projection deadline exceeded")
         if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
             return None
         if not getattr(self._config, "large_output_externalization_enabled", False):
@@ -5266,7 +9128,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             config=self._config,
             hermes_home=self._hermes_home,
             force=True,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
         )
+        if (
+            (cancel_event is not None and cancel_event.is_set())
+            or (deadline is not None and float(clock()) >= float(deadline))
+        ):
+            raise TimeoutError("active replay projection deadline exceeded")
         if externalized is None:
             return None
         replacement = dict(message)
@@ -5279,6 +9150,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _stub_large_tool_results_for_active_replay(
         self,
         messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        now: Callable[[], float] | None = None,
+        ownership: ExternalizationOwnership | None = None,
     ) -> List[Dict[str, Any]]:
         """Replace eligible old tool payloads with durable refs for assembly.
 
@@ -5301,9 +9177,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         stubbed_count = 0
         tokens_saved = 0
         for idx, message in enumerate(messages[:eligible_end]):
+            clock = now or time.monotonic
+            if (
+                (cancel_event is not None and cancel_event.is_set())
+                or (deadline is not None and float(clock()) >= float(deadline))
+            ):
+                raise TimeoutError("active replay projection deadline exceeded")
             replacement = self._maybe_stub_active_tool_result(
                 message,
                 recovery_tool_call_ids=recovery_tool_call_ids,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
             )
             if replacement is None:
                 continue
@@ -5432,6 +9318,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         leaf_compacted_this_turn: bool = False,
         force_overflow: bool = False,
         critical_budget_pressure: bool = False,
+        deadline: Optional[float] = None,
     ) -> None:
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
@@ -5444,7 +9331,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # the deepest existing node + 1, so condensation can always
         # create the next depth level.
         if max_depth < 0:
-            all_nodes = self._dag.get_session_nodes(self._session_id)
+            all_nodes = self._call_bounded_foreground_dag_read(
+                self._dag.get_session_nodes,
+                self._session_id,
+                deadline=deadline,
+                stage="condensation",
+            )
             upper = (max(n.depth for n in all_nodes) + 1) if all_nodes else 1
         else:
             upper = max_depth
@@ -5454,8 +9346,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
-            uncondensed = self._dag.get_uncondensed_at_depth(
-                self._session_id, depth
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            uncondensed = self._call_bounded_foreground_dag_read(
+                self._dag.get_uncondensed_at_depth,
+                self._session_id,
+                depth,
+                deadline=deadline,
+                stage="condensation",
             )
             if len(uncondensed) < fanin:
                 continue
@@ -5475,6 +9373,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source_tokens, summary_tokens, level = self._condense_summary_nodes(
                 to_condense,
                 focus_topic=focus_topic,
+                deadline=deadline,
             )
             condensed_any = True
 
@@ -5503,69 +9402,216 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         depth = nodes[0].depth
         if any(node.depth != depth for node in nodes):
             raise ValueError("condensation requires same-depth summary nodes")
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "before input preparation",
+        )
         combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
         source_tokens = sum(node.token_count for node in nodes)
         token_budget = max(1000, int(source_tokens * 0.40))
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "after input preparation",
+        )
         timeout_seconds = self._config.summary_timeout_ms / 1000
         if deadline is not None:
-            remaining_seconds = deadline - time.monotonic()
+            remaining_seconds = float(deadline) - self._foreground_now()
             if remaining_seconds <= 0:
                 raise TimeoutError("threshold full sweep time budget exhausted")
             timeout_seconds = min(timeout_seconds, remaining_seconds)
-        summary_text, level = summarize_with_escalation(
-            text=combined_text,
-            source_tokens=source_tokens,
-            token_budget=token_budget,
-            depth=depth + 1,
-            model=self._config.summary_model,
-            fallback_models=self._config.summary_fallback_models,
-            circuit_breaker=self._summary_circuit_breaker,
-            spend_guard=self._summary_spend_guard,
-            timeout=timeout_seconds,
-            l2_budget_ratio=self._config.l2_budget_ratio,
-            l3_truncate_tokens=self._config.l3_truncate_tokens,
-            focus_topic=focus_topic or "",
-            custom_instructions=self._config.custom_instructions,
+        cancel_event = threading.Event()
+        summarize_kwargs: dict[str, Any] = {
+            "text": combined_text,
+            "source_tokens": source_tokens,
+            "token_budget": token_budget,
+            "depth": depth + 1,
+            "model": self._config.summary_model,
+            "fallback_models": self._config.summary_fallback_models,
+            "circuit_breaker": self._summary_circuit_breaker,
+            "spend_guard": self._summary_spend_guard,
+            "timeout": timeout_seconds,
+            "l2_budget_ratio": self._config.l2_budget_ratio,
+            "l3_truncate_tokens": self._config.l3_truncate_tokens,
+            "focus_topic": focus_topic or "",
+            "custom_instructions": self._config.custom_instructions,
+        }
+        if deadline is not None and self._summary_callable_accepts_keyword(
+            summarize_with_escalation,
+            "deadline",
+        ):
+            summarize_kwargs["deadline"] = deadline
+        if deadline is not None and self._summary_callable_accepts_keyword(
+            summarize_with_escalation,
+            "cancel_event",
+        ):
+            summarize_kwargs["cancel_event"] = cancel_event
+        summary_text, level = self._call_with_hard_foreground_deadline(
+            lambda: summarize_with_escalation(**summarize_kwargs),
+            deadline=deadline,
+            timeout_error=TimeoutError(
+                "condensation provider exceeded the foreground deadline"
+            ),
+            cancel_event=cancel_event,
         )
-        earliest_at, latest_at = self._dag.get_source_time_window(
-            [node.node_id for node in nodes]
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "after provider",
+        )
+        source_node_ids = [node.node_id for node in nodes]
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "after source projection",
+        )
+        earliest_at, latest_at = self._call_bounded_foreground_dag_read(
+            self._dag.get_source_time_window,
+            source_node_ids,
+            deadline=deadline,
+            stage="condensation",
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "after source time lookup",
         )
         summary_tokens = count_tokens(summary_text)
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "after output token count",
+        )
+        expand_hint = self._extract_expand_hint(summary_text)
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "after expand-hint extraction",
+        )
+        created_at = time.time()
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "after node timestamp",
+        )
         condensed_node = SummaryNode(
             session_id=self._session_id,
             depth=depth + 1,
             summary=summary_text,
             token_count=summary_tokens,
             source_token_count=source_tokens,
-            source_ids=[node.node_id for node in nodes],
+            source_ids=source_node_ids,
             source_type="nodes",
-            created_at=time.time(),
+            created_at=created_at,
             earliest_at=earliest_at,
             latest_at=latest_at,
-            expand_hint=self._extract_expand_hint(summary_text),
+            expand_hint=expand_hint,
         )
-        self._dag.add_node(condensed_node)
-        self._invalidate_rollups_for_published_node(condensed_node)
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "condensation",
+            "before DAG publication",
+        )
+        self._publish_foreground_dag_node(
+            condensed_node,
+            deadline=deadline,
+            stage="condensation",
+        )
+        self._invalidate_rollups_for_published_node(
+            condensed_node,
+            deadline=deadline,
+        )
         return source_tokens, summary_tokens, level
 
-    def _summary_frontier_nodes(self) -> List[SummaryNode]:
-        """Return all provider-visible summary frontier nodes for the active session."""
-        all_nodes = self._dag.get_session_nodes(self._session_id, limit=100_000)
-        referenced = {
-            source_id
-            for node in all_nodes
-            if node.source_type == "nodes"
-            for source_id in node.source_ids
+    def _call_bounded_foreground_dag_read(
+        self,
+        operation,
+        *args,
+        deadline: float | None,
+        stage: str,
+    ):
+        """Call a deadline-aware DAG read while preserving legacy test shims."""
+        if deadline is None:
+            return operation(*args)
+        self._foreground_deadline_checkpoint(
+            deadline,
+            stage,
+            "before DAG read",
+        )
+        remaining = self._foreground_deadline_remaining(deadline)
+        if remaining is None or remaining <= 0:
+            raise ForegroundDeadlineExceeded(stage, "before DAG read")
+        available: set[str] = set()
+        accepts_kwargs = False
+        try:
+            parameters = inspect.signature(operation).parameters.values()
+            available = {parameter.name for parameter in parameters}
+            accepts_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_kwargs = True
+        bounded_kwargs = {
+            "lock_timeout_seconds": remaining,
+            "deadline": deadline,
+            "deadline_clock": self._foreground_now,
+            "busy_timeout_ms": max(0, int(remaining * 1000)),
         }
-        return [node for node in all_nodes if node.node_id not in referenced]
+        kwargs = {
+            name: value
+            for name, value in bounded_kwargs.items()
+            if accepts_kwargs or name in available
+        }
+        try:
+            result = operation(*args, **kwargs)
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                stage,
+                "DAG read lock wait exceeded the shared deadline",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            raise ForegroundDeadlineExceeded(
+                stage,
+                "SQLite contention prevented a bounded DAG read",
+            ) from exc
+        self._foreground_deadline_checkpoint(
+            deadline,
+            stage,
+            "after DAG read",
+        )
+        return result
 
-    def _summary_frontier_tokens(self) -> int:
-        return sum(node.token_count for node in self._summary_frontier_nodes())
+    def _summary_frontier_nodes(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> List[SummaryNode]:
+        """Return all provider-visible summary frontier nodes for the active session."""
+        return self._call_bounded_foreground_dag_read(
+            self._dag.get_active_frontier_nodes,
+            self._session_id,
+            deadline=deadline,
+            stage="summary frontier read",
+        )
 
-    def _select_threshold_sweep_condensation_group(self) -> List[SummaryNode]:
+    def _summary_frontier_tokens(self, *, deadline: float | None = None) -> int:
+        return sum(
+            node.token_count
+            for node in self._summary_frontier_nodes(deadline=deadline)
+        )
+
+    def _select_threshold_sweep_condensation_group(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> List[SummaryNode]:
         """Prefer routine fanin/depth, then allow bounded pressure condensation."""
         by_depth: dict[int, list[SummaryNode]] = {}
-        for node in self._summary_frontier_nodes():
+        for node in self._summary_frontier_nodes(deadline=deadline):
             by_depth.setdefault(node.depth, []).append(node)
         if not by_depth:
             return []
@@ -5595,15 +9641,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> tuple[int, str]:
         """Condense an oversized summary frontier within the remaining sweep budget."""
         passes = 0
-        while self._summary_frontier_tokens() > target_tokens:
+        while self._summary_frontier_tokens(deadline=deadline) > target_tokens:
             if passes >= pass_budget:
                 return passes, "pass_budget_exhausted"
             if time.monotonic() >= deadline:
                 return passes, "time_budget_exhausted"
-            group = self._select_threshold_sweep_condensation_group()
+            group = self._select_threshold_sweep_condensation_group(
+                deadline=deadline,
+            )
             if not group:
                 return passes, "no_same_depth_condensation_group"
-            before = self._summary_frontier_tokens()
+            before = self._summary_frontier_tokens(deadline=deadline)
             try:
                 self._condense_summary_nodes(
                     group,
@@ -5618,7 +9666,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return passes, "condensation_error"
             passes += 1
-            after = self._summary_frontier_tokens()
+            after = self._summary_frontier_tokens(deadline=deadline)
             if after >= before:
                 return passes, "condensation_no_progress"
         return passes, "summary_prefix_target_reached"
@@ -5653,24 +9701,65 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         content = text_content_for_pattern_matching(message.get("content")) or ""
         return content if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) else ""
 
-    def _sanitized_preserved_objective_context_content(self, message: Dict[str, Any]) -> str:
+    def _sanitized_preserved_objective_context_content(
+        self,
+        message: Dict[str, Any],
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        now: Callable[[], float] | None = None,
+        ownership: ExternalizationOwnership | None = None,
+    ) -> str:
         preserved_objective = self._preserved_objective_context_content(message)
         if not preserved_objective:
             return ""
         return self._sanitize_preserved_objective_content(
             preserved_objective,
             role=str(message.get("role") or "user"),
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
         )
 
-    def _sanitize_active_preserved_objective_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        sanitized_content = self._sanitized_preserved_objective_context_content(message)
+    def _sanitize_active_preserved_objective_message(
+        self,
+        message: Dict[str, Any],
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        now: Callable[[], float] | None = None,
+        ownership: ExternalizationOwnership | None = None,
+    ) -> Dict[str, Any]:
+        sanitized_content = self._sanitized_preserved_objective_context_content(
+            message,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
+        )
         if not sanitized_content or sanitized_content == message.get("content"):
             return message
         sanitized = dict(message)
         sanitized["content"] = sanitized_content
         return sanitized
 
-    def _sanitize_preserved_objective_content(self, content: str, role: str = "user") -> str:
+    def _sanitize_preserved_objective_content(
+        self,
+        content: str,
+        role: str = "user",
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        now: Callable[[], float] | None = None,
+        ownership: ExternalizationOwnership | None = None,
+    ) -> str:
+        self._context_projection_checkpoint(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            operation="preserved objective projection",
+        )
         content = strip_injected_context_blocks(content)
         content = protect_inline_payloads_in_text(
             content,
@@ -5679,14 +9768,36 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             field_path="preserved_objective.content",
             config=self._config,
             hermes_home=self._hermes_home,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
+        )
+        self._context_projection_checkpoint(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            operation="preserved objective projection",
         )
         return content
 
-    def _build_preserved_objective_summary_part(self, message: Dict[str, Any]) -> str:
+    def _build_preserved_objective_summary_part(
+        self,
+        message: Dict[str, Any],
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        now: Callable[[], float] | None = None,
+        ownership: ExternalizationOwnership | None = None,
+    ) -> str:
         content = text_content_for_pattern_matching(message.get("content")) or ""
         content = self._sanitize_preserved_objective_content(
             content,
             role=str(message.get("role") or "user"),
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
         )
         return f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n{content}"
 
@@ -5694,6 +9805,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         messages: List[Dict[str, Any]],
         selected_tail: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        now: Callable[[], float] | None = None,
+        ownership: ExternalizationOwnership | None = None,
     ) -> Optional[str]:
         """Return a scaffolded newest real user objective omitted from the tail.
 
@@ -5709,13 +9825,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         synthetic continuity marker and must not be promoted as current intent.
         """
         selected_tail_messages = [msg for msg in selected_tail if isinstance(msg, dict)]
-        for message in reversed(messages):
+        for message_index, message in enumerate(reversed(messages)):
+            if message_index % 32 == 0:
+                self._context_projection_checkpoint(
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    operation="context anchor scan",
+                )
             if not isinstance(message, dict):
                 continue
             content_text = text_content_for_pattern_matching(message.get("content")) or ""
             if (
                 self._matches_ignore_message_patterns(message)
-                or self._mapped_stored_row_matches_ignore_message_patterns(message)
+                or self._mapped_stored_row_matches_ignore_message_patterns(
+                    message,
+                    deadline=deadline,
+                )
                 or self._is_volatile_ignored_quarantine_placeholder(
                     message,
                     content_text,
@@ -5731,7 +9857,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
             if any(message == selected for selected in selected_tail_messages):
                 return None
-            return self._build_preserved_objective_summary_part(message)
+            return self._build_preserved_objective_summary_part(
+                message,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
+            )
         return None
 
     @staticmethod
@@ -5755,6 +9887,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_messages: List[Dict[str, Any]],
         summary_role: str,
         active_node_ids: set,
+        *,
+        deadline: float | None = None,
     ) -> Optional[Dict[str, Any]]:
         """Build the single proactive "relevant memories" block, or None.
 
@@ -5789,17 +9923,43 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         provider_override = getattr(config, "proactive_recall_provider", "") or ""
 
         try:
-            raw = lcm_tools.lcm_recall(
-                {
-                    "query": query,
-                    "limit": recall_k,
-                    "scope_bias": scope_bias,
-                    "include": "all",
-                },
-                engine=self,
-                provider_override=provider_override,
-            )
+            recall_kwargs: dict[str, Any] = {
+                "engine": self,
+                "provider_override": provider_override,
+            }
+            if deadline is not None:
+                recall_kwargs["deadline"] = deadline
+
+            def recall_operation() -> str:
+                return lcm_tools.lcm_recall(
+                    {
+                        "query": query,
+                        "limit": recall_k,
+                        "scope_bias": scope_bias,
+                        "include": "all",
+                    },
+                    **recall_kwargs,
+                )
+            if deadline is None:
+                raw = recall_operation()
+            else:
+                recall_cancel_event = threading.Event()
+                raw = self._call_with_hard_foreground_deadline(
+                    recall_operation,
+                    deadline=deadline,
+                    timeout_error=TimeoutError(
+                        "proactive recall exceeded the shared foreground deadline"
+                    ),
+                    cancel_event=recall_cancel_event,
+                )
+                if self._foreground_now() >= float(deadline):
+                    raise TimeoutError(
+                        "proactive recall completed after the shared foreground deadline"
+                    )
             payload = json.loads(raw)
+        except TimeoutError:
+            self._proactive_recall_timeout_count += 1
+            return None
         except Exception:  # noqa: BLE001 - never let recall break assembly
             logger.debug("LCM proactive recall failed; injecting nothing", exc_info=True)
             self._proactive_recall_skipped_count += 1
@@ -5877,6 +10037,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
         include_lcm_note: bool = True,
+        *,
+        deadline: float | None = None,
     ) -> List[Dict[str, Any]]:
         """Build the active context from DAG summaries + fresh tail.
 
@@ -5885,6 +10047,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
           [highest-depth summary nodes first, then lower]
           [fresh tail messages]
         """
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "assembly entry",
+        )
         result = []
 
         # Leading anchor with optional LCM annotation. Only a true system prompt
@@ -5911,7 +10078,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Stub durably externalized evictable tool payloads before the assembly
         # budget pass so the selector sees their reduced provider-visible cost.
         # The helper protects the configured fresh tail and is fail-open.
-        assembly_tail_messages = self._stub_large_tool_results_for_active_replay(tail_messages)
+        assembly_tail_messages = self._call_foreground_projection(
+            self._stub_large_tool_results_for_active_replay,
+            tail_messages,
+            deadline=deadline,
+            stage="context replay projection",
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "tool replay projection",
+        )
         tail_selected = assembly_tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
         if anchor_source is None:
@@ -5922,12 +10099,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             used = count_message_tokens(leading_msg) if leading_msg is not None else 0
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
-            tail_for_selection = self._sanitize_active_context_messages(
+            tail_for_selection = self._call_foreground_projection(
+                self._sanitize_active_context_messages,
                 assembly_tail_messages,
+                deadline=deadline,
+                stage="context tail cleanup",
                 insert_missing_tool_stubs=False,
             )
             skipped_tail_gap = False
-            for msg in reversed(tail_for_selection):
+            for tail_index, msg in enumerate(reversed(tail_for_selection)):
+                if tail_index % 32 == 0:
+                    self._foreground_deadline_checkpoint(
+                        deadline,
+                        "context reconstruction",
+                        "tail budget selection",
+                    )
                 msg_tokens = count_message_tokens(msg)
                 if used + tail_token_total + msg_tokens > assembly_cap:
                     if self._is_budget_droppable_tail_message(msg):
@@ -5941,7 +10127,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             tail_selected = list(reversed(kept_tail_reversed))
             summary_budget = max(0, assembly_cap - used - tail_token_total)
         if anchor_source is not None:
-            anchor_part = self._latest_user_context_anchor(anchor_source, tail_selected)
+            anchor_part = self._call_foreground_projection(
+                self._latest_user_context_anchor,
+                anchor_source,
+                tail_selected,
+                deadline=deadline,
+                stage="context objective projection",
+            )
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "context reconstruction",
+                "context anchor selection",
+            )
 
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
@@ -5964,32 +10161,42 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Node ids placed in the summary prefix — used to dedupe proactive-recall
         # injection against summaries already visible in the active context.
         active_summary_node_ids: set = set()
-        all_nodes = self._dag.get_session_nodes(self._session_id)
-        if all_nodes:
-            # Group by depth, take the most recent uncondensed at each level
-            # For active context, we want the highest-level summaries
-            # that haven't been condensed into even higher levels
-            depths = sorted(set(n.depth for n in all_nodes), reverse=True)
-            for d in depths:
-                uncondensed = self._dag.get_uncondensed_at_depth(self._session_id, d)
-                for node in uncondensed:
-                    active_summary_node_ids.add(node.node_id)
-                    depth_label = {
-                        0: "Recent",
-                        1: "Session Arc",
-                        2: "Durable",
-                    }.get(d, f"Depth-{d}")
-                    summary_parts.append(
-                        f"[{depth_label} Summary (d{d}, node {node.node_id})]\n"
-                        f"{node.summary}\n"
-                        f"[Expand for details: {node.expand_hint}]"
-                    )
+        frontier_nodes = self._summary_frontier_nodes(deadline=deadline)
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "summary frontier load",
+        )
+        for node_index, node in enumerate(frontier_nodes):
+            if node_index % 32 == 0:
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "context reconstruction",
+                    "summary frontier assembly",
+                )
+            active_summary_node_ids.add(node.node_id)
+            depth_label = {
+                0: "Recent",
+                1: "Session Arc",
+                2: "Durable",
+            }.get(node.depth, f"Depth-{node.depth}")
+            summary_parts.append(
+                f"[{depth_label} Summary (d{node.depth}, node {node.node_id})]\n"
+                f"{node.summary}\n"
+                f"[Expand for details: {node.expand_hint}]"
+            )
 
         if summary_parts:
             selected_parts = summary_parts
             if summary_budget is not None:
                 selected_parts = []
-                for part in summary_parts:
+                for part_index, part in enumerate(summary_parts):
+                    if part_index % 32 == 0:
+                        self._foreground_deadline_checkpoint(
+                            deadline,
+                            "context reconstruction",
+                            "summary budget selection",
+                        )
                     candidate = "\n\n---\n\n".join(selected_parts + [part])
                     candidate_msg = {"role": summary_role, "content": candidate}
                     if count_message_tokens(candidate_msg) > summary_budget:
@@ -5999,7 +10206,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
-                result.append({"role": summary_role, "content": combined})
+                result.append(
+                    {
+                        "role": summary_role,
+                        "content": combined,
+                        # Host persistence may use this explicit provenance to
+                        # exclude/supersede intermediate model projections while
+                        # retaining raw source turns and the current active view.
+                        "display_kind": "context_projection",
+                        "display_metadata": {"engine": "lcm"},
+                    }
+                )
 
         # Proactive memory injection (SPEC F, default-off). One bounded block is
         # placed adjacent to the summary prefix — a stable position below the
@@ -6007,7 +10224,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # already-volatile tail region absorbs its per-turn variability and the
         # cached summary prefix is left intact. Never inside the fresh tail.
         proactive_msg = self._build_proactive_recall_message(
-            tail_messages, summary_role, active_summary_node_ids
+            tail_messages,
+            summary_role,
+            active_summary_node_ids,
+            deadline=deadline,
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "proactive recall assembly",
         )
         if proactive_msg is not None:
             result.append(proactive_msg)
@@ -6018,7 +10243,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # ── Active-context cleanup / tool-pair guardrail ──
         # Drop assistant turns that carry only blank/internal structured content,
         # then ensure provider-valid tool-call/result sequencing.
-        result = self._sanitize_active_context_messages(result)
+        result = self._call_foreground_projection(
+            self._sanitize_active_context_messages,
+            result,
+            deadline=deadline,
+            stage="active context cleanup",
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "active context cleanup",
+        )
         if leading_msg is None:
             while result and result[0].get("role") in {"assistant", "tool"}:
                 result = result[1:]
@@ -6028,7 +10263,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and count_messages_tokens(result) > assembly_cap
         ):
             trimmed_result: list[Dict[str, Any]] = []
-            for msg in result:
+            for result_index, msg in enumerate(result):
+                if result_index % 32 == 0:
+                    self._foreground_deadline_checkpoint(
+                        deadline,
+                        "context reconstruction",
+                        "objective anchor trimming",
+                    )
                 content = normalize_content_value(msg.get("content")) or ""
                 if _PRESERVED_OBJECTIVE_CONTEXT_PREFIX not in content:
                     trimmed_result.append(msg)
@@ -6041,8 +10282,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     trimmed = msg.copy()
                     trimmed["content"] = "\n\n---\n\n".join(parts)
                     trimmed_result.append(trimmed)
-            result = self._sanitize_active_context_messages(trimmed_result)
+            result = self._call_foreground_projection(
+                self._sanitize_active_context_messages,
+                trimmed_result,
+                deadline=deadline,
+                stage="objective anchor cleanup",
+            )
 
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "assembly completion",
+        )
         return result
 
     def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:
@@ -6069,12 +10320,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         compressed: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
         ingest_cleanup_changed_active_context: bool = False,
+        deadline: float | None = None,
     ) -> List[Dict[str, Any]]:
         if compressed != original_messages or ingest_cleanup_changed_active_context:
             self._last_compression_status = "overflow_recovery"
             self._last_compression_noop_reason = ""
-            self._ingest_cursor = len(compressed)
-            self._ingest_cursor_needs_reconcile = False
+            self._align_ingest_cursor_to_active_context(
+                compressed,
+                deadline=deadline,
+            )
             logger.info(
                 "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
                 len(original_messages),
@@ -6157,6 +10411,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         - reserve_tokens_floor: keep headroom inside context_length
         """
         caps: list[int] = []
+        admission_cap = getattr(self, "_admission_assembly_tokens", 0)
+        if admission_cap:
+            caps.append(admission_cap)
+
 
         if self._config.max_assembly_tokens > 0:
             caps.append(self._config.max_assembly_tokens)
@@ -6184,17 +10442,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         system_msg: Optional[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
+        *,
+        deadline: float | None = None,
     ) -> List[Dict[str, Any]]:
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "overflow recovery entry",
+        )
         if tail_messages:
             first = tail_messages[0]
             content = first.get("content") or ""
             role = first.get("role") or ""
             if role == "assistant" and self._looks_like_active_summary_blob(content):
-                candidate = self._assemble_context(
+                candidate = self._call_with_foreground_deadline(
+                    self._assemble_context,
                     system_msg,
                     tail_messages[1:],
                     assembly_cap_override=assembly_cap_override,
                     include_lcm_note=False,
+                    deadline=deadline,
+                )
+                self._foreground_deadline_checkpoint(
+                    deadline,
+                    "context reconstruction",
+                    "overflow summary replacement",
                 )
                 if any(
                     (msg.get("content") or "") == content
@@ -6202,16 +10474,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ):
                     return candidate
 
-        candidate = self._assemble_context(
+        candidate = self._call_with_foreground_deadline(
+            self._assemble_context,
             system_msg,
             tail_messages,
             assembly_cap_override=assembly_cap_override,
             include_lcm_note=False,
+            deadline=deadline,
+        )
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "overflow recovery assembly",
         )
         minimum_candidate_len = 1 if system_msg is not None else 0
         if len(candidate) == minimum_candidate_len and tail_messages:
             fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
-            return self._sanitize_active_context_messages(fallback)
+            fallback = self._call_foreground_projection(
+                self._sanitize_active_context_messages,
+                fallback,
+                deadline=deadline,
+                stage="overflow recovery cleanup",
+            )
+            self._foreground_deadline_checkpoint(
+                deadline,
+                "context reconstruction",
+                "overflow recovery fallback",
+            )
+            return fallback
         return candidate
 
     @staticmethod
@@ -6519,12 +10809,4 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+        self._close_storage()

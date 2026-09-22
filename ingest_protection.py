@@ -17,11 +17,14 @@ import os
 import re
 import stat
 import tempfile
+import threading
+import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from .externalize import (
+    ExternalizationOwnership,
     externalize_ingest_payload,
     extract_externalized_ref,
     extract_externalized_refs,
@@ -34,6 +37,20 @@ from .externalize import (
 from .message_content import normalize_content_value
 
 logger = logging.getLogger(__name__)
+
+
+def _projection_cancelled_or_late(
+    *,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+    now: Callable[[], float] | None,
+) -> bool:
+    clock = now or time.monotonic
+    return bool(
+        (cancel_event is not None and cancel_event.is_set())
+        or (deadline is not None and float(clock()) >= float(deadline))
+    )
+
 
 _MEDIA_TYPE_HINTS = ("image", "audio", "video")
 _MEDIA_VALUE_KEYS = (
@@ -764,13 +781,15 @@ def _sensitive_pattern_for_key(key: Any, active_names: list[str]) -> str | None:
     return None
 
 
-def redact_sensitive_text(text: str, config) -> str:
-    """Replace configured sensitive spans with deterministic placeholders."""
-    if not isinstance(text, str) or not text:
-        return text
-    active_names = _active_sensitive_pattern_names(config)
-    if not active_names:
-        return text
+from functools import lru_cache
+
+
+@lru_cache(maxsize=512)
+def _cached_redact_sensitive_text(text: str, active_names: tuple[str, ...]) -> str:
+    return _redact_sensitive_text_with_names(text, active_names)
+
+
+def _redact_sensitive_text_with_names(text: str, active_names) -> str:
     protected = text
     for name in active_names:
         protected = _apply_sensitive_pattern(
@@ -779,6 +798,20 @@ def redact_sensitive_text(text: str, config) -> str:
             protected,
         )
     return protected
+
+
+def redact_sensitive_text(text: str, config) -> str:
+    """Replace configured sensitive spans with deterministic placeholders."""
+    if not isinstance(text, str) or not text:
+        return text
+    active_names = _active_sensitive_pattern_names(config)
+    if not active_names:
+        return text
+    # Bound retained input to 512 strings of at most 16K characters. Policy is part
+    # of the key, so enabling/changing redaction cannot reuse weaker results.
+    if len(text) <= 16_384:
+        return _cached_redact_sensitive_text(text, tuple(active_names))
+    return _redact_sensitive_text_with_names(text, active_names)
 
 
 def _redact_entire_sensitive_string(text: str, pattern_name: str) -> str:
@@ -930,7 +963,17 @@ def _externalize_quarantined_assistant_output(
     config,
     hermes_home: str,
     reason: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> str | None:
+    if _projection_cancelled_or_late(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    ):
+        return None
     existing = find_externalized_payload_for_message(
         content,
         session_id=session_id,
@@ -939,6 +982,12 @@ def _externalize_quarantined_assistant_output(
         config=config,
         hermes_home=hermes_home,
     )
+    if _projection_cancelled_or_late(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    ):
+        return None
     if existing is not None:
         return _quarantined_assistant_placeholder(existing, reason=reason)
 
@@ -950,6 +999,10 @@ def _externalize_quarantined_assistant_output(
         config=config,
         hermes_home=hermes_home,
         kind=_QUARANTINED_ASSISTANT_KIND,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+        ownership=ownership,
     )
     if result is None:
         logger.warning(
@@ -978,7 +1031,16 @@ def _existing_quarantined_assistant_placeholder(
     config,
     hermes_home: str,
     reason: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
 ) -> str | None:
+    if _projection_cancelled_or_late(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    ):
+        return None
     existing = find_externalized_payload_for_message(
         content,
         session_id=session_id,
@@ -987,6 +1049,12 @@ def _existing_quarantined_assistant_placeholder(
         config=config,
         hermes_home=hermes_home,
     )
+    if _projection_cancelled_or_late(
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+    ):
+        return None
     if existing is None:
         return None
     return _quarantined_assistant_placeholder(existing, reason=reason)
@@ -1058,6 +1126,10 @@ def _placeholder_for_payload(
     field_path: str,
     config,
     hermes_home: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> str | None:
     result = externalize_ingest_payload(
         payload,
@@ -1066,6 +1138,10 @@ def _placeholder_for_payload(
         field_path=field_path,
         config=config,
         hermes_home=hermes_home,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+        ownership=ownership,
     )
     if result is None:
         logger.warning(
@@ -1084,6 +1160,10 @@ def _protect_payload_substrings(
     field_path: str,
     config,
     hermes_home: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> str:
     if not text or is_externalized_ingest_placeholder(text):
         return text
@@ -1097,6 +1177,10 @@ def _protect_payload_substrings(
             field_path=field_path,
             config=config,
             hermes_home=hermes_home,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
         ) or payload
 
     protected = _DATA_URI_BASE64_RE.sub(replace_data_uri, text)
@@ -1112,6 +1196,10 @@ def _protect_payload_substrings(
             field_path=field_path,
             config=config,
             hermes_home=hermes_home,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
         ) or payload
 
     protected = _BASE64_RUN_RE.sub(replace_base64_run, protected)
@@ -1124,6 +1212,10 @@ def _protect_payload_substrings(
             field_path=field_path,
             config=config,
             hermes_home=hermes_home,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
         ) or payload
 
     # Line-wrapped base64 (MIME/PEM) is not a single contiguous run; externalize
@@ -1192,6 +1284,10 @@ def _protect_value(
     config,
     hermes_home: str,
     parse_json_strings: bool = False,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> Any:
     value = redact_sensitive_value(
         value,
@@ -1209,6 +1305,10 @@ def _protect_value(
                     field_path=_payload_key_field_path(field_path),
                     config=config,
                     hermes_home=hermes_home,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    ownership=ownership,
                 )
                 if isinstance(key, str)
                 else key
@@ -1222,6 +1322,10 @@ def _protect_value(
                 config=config,
                 hermes_home=hermes_home,
                 parse_json_strings=parse_json_strings,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
             )
         return protected
     if isinstance(value, list):
@@ -1234,6 +1338,10 @@ def _protect_value(
                 config=config,
                 hermes_home=hermes_home,
                 parse_json_strings=parse_json_strings,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
             )
             for idx, item in enumerate(value)
         ]
@@ -1249,6 +1357,9 @@ def _protect_value(
                 field_path=field_path,
                 config=config,
                 hermes_home=hermes_home,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
             )
         parsed = _maybe_parse_json_string(value)
         if parsed is not None:
@@ -1261,6 +1372,10 @@ def _protect_value(
                     field_path=field_path,
                     config=config,
                     hermes_home=hermes_home,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    ownership=ownership,
                 )
                 if raw_protected != value:
                     return raw_protected
@@ -1272,6 +1387,10 @@ def _protect_value(
                 config=config,
                 hermes_home=hermes_home,
                 parse_json_strings=True,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
             )
             if protected != parsed:
                 return json.dumps(protected, ensure_ascii=False, separators=(",", ":"))
@@ -1284,6 +1403,10 @@ def _protect_value(
         field_path=field_path,
         config=config,
         hermes_home=hermes_home,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+        ownership=ownership,
     )
 
 
@@ -1295,6 +1418,10 @@ def protect_inline_payloads_in_text(
     field_path: str,
     config,
     hermes_home: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> str:
     """Externalize inline media/base64 payloads inside a text scaffold.
 
@@ -1311,10 +1438,25 @@ def protect_inline_payloads_in_text(
         field_path=field_path,
         config=config,
         hermes_home=hermes_home,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+        ownership=ownership,
     )
 
 
-def _protect_tool_calls(tool_calls: Any, *, role: str, session_id: str, config, hermes_home: str) -> Any:
+def _protect_tool_calls(
+    tool_calls: Any,
+    *,
+    role: str,
+    session_id: str,
+    config,
+    hermes_home: str,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
+) -> Any:
     return _protect_value(
         tool_calls,
         role=role,
@@ -1323,6 +1465,10 @@ def _protect_tool_calls(tool_calls: Any, *, role: str, session_id: str, config, 
         config=config,
         hermes_home=hermes_home,
         parse_json_strings=True,
+        deadline=deadline,
+        cancel_event=cancel_event,
+        now=now,
+        ownership=ownership,
     )
 
 
@@ -1331,6 +1477,11 @@ def protect_message_for_ingest(
     config,
     hermes_home: str = "",
     session_id: str = "",
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> Dict[str, Any]:
     """Return a copy of ``message`` safe to persist in SQLite.
 
@@ -1385,6 +1536,10 @@ def protect_message_for_ingest(
                 hermes_home=hermes_home,
                 force=True,
                 metadata=persisted_output_metadata,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
             )
 
     # A host-side truncation marker without durable recovered storage is not
@@ -1421,6 +1576,10 @@ def protect_message_for_ingest(
                 config=config,
                 hermes_home=hermes_home,
                 parse_json_strings=False,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+                ownership=ownership,
             )
             if (
                 role == "tool"
@@ -1452,6 +1611,10 @@ def protect_message_for_ingest(
                     config=config,
                     hermes_home=hermes_home,
                     reason=reason,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    ownership=ownership,
                 )
                 if placeholder:
                     externalized = {"placeholder": placeholder}
@@ -1465,6 +1628,10 @@ def protect_message_for_ingest(
                     role=role,
                     config=config,
                     hermes_home=hermes_home,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    ownership=ownership,
                 )
             if externalized:
                 msg["content"] = externalized["placeholder"]
@@ -1477,6 +1644,10 @@ def protect_message_for_ingest(
                     config=config,
                     hermes_home=hermes_home,
                     parse_json_strings=False,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    ownership=ownership,
                 )
     else:
         msg["content"] = original_content
@@ -1488,6 +1659,10 @@ def protect_message_for_ingest(
             session_id=session_id,
             config=config,
             hermes_home=hermes_home,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
         )
 
     return msg
@@ -1501,6 +1676,10 @@ def quarantine_suspicious_assistant_message(
     *,
     externalize: bool = True,
     prefer_existing_externalized: bool = False,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> Dict[str, Any]:
     """Return ``message`` with obviously broken assistant output quarantined.
 
@@ -1524,6 +1703,10 @@ def quarantine_suspicious_assistant_message(
             config=config,
             hermes_home=hermes_home,
             reason=reason,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+            ownership=ownership,
         )
     else:
         placeholder = None
@@ -1535,6 +1718,9 @@ def quarantine_suspicious_assistant_message(
                 config=config,
                 hermes_home=hermes_home,
                 reason=reason,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
             )
         if placeholder is None:
             placeholder = _volatile_quarantined_assistant_placeholder(
@@ -1554,20 +1740,54 @@ def quarantine_suspicious_assistant_messages(
     session_id: str = "",
     externalize: List[bool] | None = None,
     prefer_existing_externalized: List[bool] | None = None,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> List[Dict[str, Any]]:
-    return [
-        quarantine_suspicious_assistant_message(
-            message,
-            config=config,
-            hermes_home=hermes_home,
-            session_id=session_id,
-            externalize=True if externalize is None else externalize[idx],
-            prefer_existing_externalized=False
-            if prefer_existing_externalized is None
-            else prefer_existing_externalized[idx],
-        )
-        for idx, message in enumerate(messages)
-    ]
+    owns_scope = ownership is None and (
+        deadline is not None or cancel_event is not None
+    )
+    batch = ownership or (ExternalizationOwnership() if owns_scope else None)
+    try:
+        projected: list[Dict[str, Any]] = []
+        for idx, message in enumerate(messages):
+            if _projection_cancelled_or_late(
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+            ):
+                raise TimeoutError("ingest quarantine deadline exceeded")
+            projected.append(
+                quarantine_suspicious_assistant_message(
+                    message,
+                    config=config,
+                    hermes_home=hermes_home,
+                    session_id=session_id,
+                    externalize=True if externalize is None else externalize[idx],
+                    prefer_existing_externalized=False
+                    if prefer_existing_externalized is None
+                    else prefer_existing_externalized[idx],
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    ownership=batch,
+                )
+            )
+        if _projection_cancelled_or_late(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        ):
+            raise TimeoutError("ingest quarantine deadline exceeded")
+    except BaseException:
+        if owns_scope and batch is not None:
+            batch.rollback()
+        raise
+    if owns_scope and batch is not None:
+        batch.commit()
+    return projected
 
 
 def protect_messages_for_ingest(
@@ -1575,16 +1795,50 @@ def protect_messages_for_ingest(
     config,
     hermes_home: str = "",
     session_id: str = "",
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    now: Callable[[], float] | None = None,
+    ownership: ExternalizationOwnership | None = None,
 ) -> List[Dict[str, Any]]:
-    return [
-        protect_message_for_ingest(
-            message,
-            config=config,
-            hermes_home=hermes_home,
-            session_id=session_id,
-        )
-        for message in messages
-    ]
+    owns_scope = ownership is None and (
+        deadline is not None or cancel_event is not None
+    )
+    batch = ownership or (ExternalizationOwnership() if owns_scope else None)
+    try:
+        projected: list[Dict[str, Any]] = []
+        for message in messages:
+            if _projection_cancelled_or_late(
+                deadline=deadline,
+                cancel_event=cancel_event,
+                now=now,
+            ):
+                raise TimeoutError("ingest protection deadline exceeded")
+            projected.append(
+                protect_message_for_ingest(
+                    message,
+                    config=config,
+                    hermes_home=hermes_home,
+                    session_id=session_id,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    now=now,
+                    ownership=batch,
+                )
+            )
+        if _projection_cancelled_or_late(
+            deadline=deadline,
+            cancel_event=cancel_event,
+            now=now,
+        ):
+            raise TimeoutError("ingest protection deadline exceeded")
+    except BaseException:
+        if owns_scope and batch is not None:
+            batch.rollback()
+        raise
+    if owns_scope and batch is not None:
+        batch.commit()
+    return projected
 
 
 def _append_unique_refs(target: list[str], refs: list[str]) -> None:

@@ -12,11 +12,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timezone
+import inspect
 import json
 import math
 import re
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .assertion_rebuild import AssertionExtraction
 from .assertion_store import (
@@ -150,7 +152,14 @@ def _usage_value(usage: Any, *names: str) -> int:
 
 
 def _call_structured_assertion_llm(
-    prompt: str, model: str, timeout_seconds: float
+    prompt: str,
+    model: str,
+    timeout_seconds: float,
+    *,
+    deadline: float | None = None,
+    deadline_clock: Callable[[], float] | None = None,
+    cancel_event: threading.Event | None = None,
+    on_provider_start: Callable[[], None] | None = None,
 ) -> tuple[str, int, int]:
     """Use Hermes' existing auxiliary client only when explicitly enabled."""
     from agent.auxiliary_client import call_llm
@@ -166,6 +175,15 @@ def _call_structured_assertion_llm(
         "timeout": timeout_seconds,
     }
     apply_lcm_model_route(call_kwargs, model)
+    remaining = _remaining_deadline_seconds(
+        deadline=deadline,
+        deadline_clock=deadline_clock or time.monotonic,
+        cancel_event=cancel_event,
+    )
+    if remaining is not None:
+        call_kwargs["timeout"] = min(float(timeout_seconds), remaining)
+    if on_provider_start is not None:
+        on_provider_start()
     response = call_llm(**call_kwargs)
     content = response.choices[0].message.content
     if not isinstance(content, str):
@@ -181,8 +199,75 @@ def _call_structured_assertion_llm(
     )
 
 
-def _history_packet(store: AssertionStore) -> list[dict[str, Any]]:
-    rows = store.query_assertions(limit=_MAX_HISTORY_ASSERTIONS)
+def _remaining_deadline_seconds(
+    *,
+    deadline: float | None,
+    deadline_clock: Callable[[], float],
+    cancel_event: threading.Event | None = None,
+) -> float | None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise TimeoutError("assertion extraction was cancelled")
+    if deadline is None:
+        return None
+    remaining = float(deadline) - float(deadline_clock())
+    if remaining <= 0:
+        raise TimeoutError("assertion extraction deadline exceeded")
+    return remaining
+
+
+def _keyword_capabilities(
+    callback: Callable[..., Any],
+) -> tuple[frozenset[str], bool]:
+    """Return explicit keywords and whether one seam accepts arbitrary ones."""
+    try:
+        parameters = inspect.signature(callback).parameters
+    except (TypeError, ValueError):
+        return frozenset(), False
+    explicit = frozenset(
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    )
+    accepts_var_keywords = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    return explicit, accepts_var_keywords
+
+
+def _history_packet(
+    store: AssertionStore,
+    *,
+    deadline: float | None = None,
+    deadline_clock: Callable[[], float] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> list[dict[str, Any]]:
+    clock = deadline_clock or time.monotonic
+    remaining = _remaining_deadline_seconds(
+        deadline=deadline,
+        deadline_clock=clock,
+        cancel_event=cancel_event,
+    )
+    read_kwargs = (
+        {
+            "lock_timeout_seconds": remaining,
+            "deadline": deadline,
+            "deadline_clock": clock,
+            "busy_timeout_ms": max(0, int(remaining * 1000)),
+        }
+        if remaining is not None
+        else {}
+    )
+    rows = store.query_assertions(limit=_MAX_HISTORY_ASSERTIONS, **read_kwargs)
+    _remaining_deadline_seconds(
+        deadline=deadline,
+        deadline_clock=clock,
+        cancel_event=cancel_event,
+    )
     return [
         {
             "assertion_id": row["assertion_id"],
@@ -201,7 +286,12 @@ def _history_packet(store: AssertionStore) -> list[dict[str, Any]]:
 
 
 def build_structured_assertion_prompt(
-    snapshot: SourceSnapshot, store: AssertionStore
+    snapshot: SourceSnapshot,
+    store: AssertionStore,
+    *,
+    deadline: float | None = None,
+    deadline_clock: Callable[[], float] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Build a bounded prompt whose output is still validated independently."""
     if len(snapshot.content) > _MAX_MODEL_SOURCE_CHARS:
@@ -273,7 +363,16 @@ def build_structured_assertion_prompt(
         "RELATION_ITEM_FIELDS:",
         json.dumps(relation_fields, ensure_ascii=False, sort_keys=True),
         "CURRENT_ASSERTIONS:",
-        json.dumps(_history_packet(store), ensure_ascii=False, sort_keys=True),
+        json.dumps(
+            _history_packet(
+                store,
+                deadline=deadline,
+                deadline_clock=deadline_clock,
+                cancel_event=cancel_event,
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
         "EXACT_SOURCE:",
         json.dumps(source, ensure_ascii=False, sort_keys=True),
     ])
@@ -296,22 +395,83 @@ class ModelAssertionExtractor:
         self.model = str(model or "")
         self.timeout_seconds = min(120.0, max(0.1, float(timeout_seconds)))
         self._payload_call = payload_call or _call_structured_assertion_llm
+        (
+            self._payload_call_keywords,
+            self._payload_call_accepts_var_keywords,
+        ) = _keyword_capabilities(self._payload_call)
         self.call_count = 0
         self.total_duration_ms = 0.0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.last_metrics: StructuredAssertionCallMetrics | None = None
 
-    def __call__(self, snapshot: SourceSnapshot) -> AssertionExtraction:
+    def __call__(
+        self,
+        snapshot: SourceSnapshot,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> AssertionExtraction:
         if snapshot.role not in {"user", "assistant"}:
             return AssertionExtraction()
-        prompt = build_structured_assertion_prompt(snapshot, self.store)
-        started = time.perf_counter()
-        self.call_count += 1
-        payload, input_tokens, output_tokens = self._payload_call(
-            prompt, self.model, self.timeout_seconds
+        clock = deadline_clock or time.monotonic
+        _remaining_deadline_seconds(
+            deadline=deadline,
+            deadline_clock=clock,
+            cancel_event=cancel_event,
         )
-        extraction = parse_assertion_extraction(snapshot, payload, store=self.store)
+        prompt = build_structured_assertion_prompt(
+            snapshot,
+            self.store,
+            deadline=deadline,
+            deadline_clock=clock,
+            cancel_event=cancel_event,
+        )
+        payload_kwargs: dict[str, Any] = {}
+        for keyword, value in (
+            ("deadline", deadline),
+            ("deadline_clock", clock),
+            ("cancel_event", cancel_event),
+        ):
+            if (
+                keyword in self._payload_call_keywords
+                or self._payload_call_accepts_var_keywords
+            ):
+                payload_kwargs[keyword] = value
+
+        provider_start_reported = False
+
+        def record_provider_start() -> None:
+            nonlocal provider_start_reported
+            if not provider_start_reported:
+                self.call_count += 1
+                provider_start_reported = True
+
+        if "on_provider_start" in self._payload_call_keywords:
+            payload_kwargs["on_provider_start"] = record_provider_start
+
+        remaining = _remaining_deadline_seconds(
+            deadline=deadline,
+            deadline_clock=clock,
+            cancel_event=cancel_event,
+        )
+        provider_timeout = (
+            self.timeout_seconds
+            if remaining is None
+            else min(self.timeout_seconds, remaining)
+        )
+        started = time.perf_counter()
+        if "on_provider_start" not in self._payload_call_keywords:
+            # Legacy/injected seams model the provider call itself, so entry is
+            # the closest possible launch boundary.
+            record_provider_start()
+        payload, input_tokens, output_tokens = self._payload_call(
+            prompt,
+            self.model,
+            provider_timeout,
+            **payload_kwargs,
+        )
         duration_ms = (time.perf_counter() - started) * 1000
         self.total_duration_ms += duration_ms
         self.total_input_tokens += int(input_tokens)
@@ -321,6 +481,19 @@ class ModelAssertionExtractor:
             duration_ms=duration_ms,
             input_tokens=int(input_tokens),
             output_tokens=int(output_tokens),
+        )
+        _remaining_deadline_seconds(
+            deadline=deadline,
+            deadline_clock=clock,
+            cancel_event=cancel_event,
+        )
+        extraction = parse_assertion_extraction(
+            snapshot,
+            payload,
+            store=self.store,
+            deadline=deadline,
+            deadline_clock=clock,
+            cancel_event=cancel_event,
         )
         return extraction
 
@@ -567,6 +740,8 @@ def _endpoint(
     prefix: str,
     candidates: list[dict[str, Any]],
     store: AssertionStore,
+    *,
+    read_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     index_key = f"{prefix}_index"
     id_key = f"{prefix}_assertion_id"
@@ -587,7 +762,11 @@ def _endpoint(
         return candidates[index], True
 
     assertion_id = str(row[id_key] or "").strip().lower()
-    matches = store.query_assertions(assertion_id=assertion_id, limit=1)
+    matches = store.query_assertions(
+        assertion_id=assertion_id,
+        limit=1,
+        **dict(read_kwargs or {}),
+    )
     if not matches:
         raise ValueError(f"{id_key} is missing, invalidated, or from another version")
     return matches[0], False
@@ -598,9 +777,22 @@ def parse_assertion_extraction(
     payload: str | Mapping[str, Any],
     *,
     store: AssertionStore,
+    deadline: float | None = None,
+    deadline_clock: Callable[[], float] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> AssertionExtraction:
     """Validate one strict payload against an exact persisted source snapshot."""
 
+    clock = deadline_clock or time.monotonic
+
+    def require_active() -> float | None:
+        return _remaining_deadline_seconds(
+            deadline=deadline,
+            deadline_clock=clock,
+            cancel_event=cancel_event,
+        )
+
+    require_active()
     decoded = _strict_object(
         decode_assertion_payload(payload),
         allowed=_PAYLOAD_KEYS,
@@ -634,6 +826,17 @@ def parse_assertion_extraction(
         _assertion_candidate(snapshot, raw, index=index)
         for index, raw in enumerate(raw_assertions)
     ]
+    remaining = require_active()
+    read_kwargs: dict[str, Any] = (
+        {
+            "lock_timeout_seconds": remaining,
+            "deadline": deadline,
+            "deadline_clock": clock,
+            "busy_timeout_ms": max(0, int(remaining * 1000)),
+        }
+        if remaining is not None
+        else {}
+    )
     candidate_rows = [
         {
             "assertion_id": store.assertion_id_for(
@@ -651,6 +854,14 @@ def parse_assertion_extraction(
     ]
     relations: list[AssertionRelationCandidate] = []
     for index, raw in enumerate(raw_relations):
+        remaining = require_active()
+        if remaining is not None:
+            read_kwargs = {
+                "lock_timeout_seconds": remaining,
+                "deadline": deadline,
+                "deadline_clock": clock,
+                "busy_timeout_ms": max(0, int(remaining * 1000)),
+            }
         label = f"relations[{index}]"
         row = _strict_object(
             raw,
@@ -664,8 +875,20 @@ def parse_assertion_extraction(
             raise ValueError(f"{label} contains an unsupported relation type")
         if str(row["evidence"] or "").strip().lower() != "explicit":
             raise ValueError(f"{label} relation evidence must be explicit")
-        from_row, from_current = _endpoint(row, "from", candidate_rows, store)
-        to_row, _to_current = _endpoint(row, "to", candidate_rows, store)
+        from_row, from_current = _endpoint(
+            row,
+            "from",
+            candidate_rows,
+            store,
+            read_kwargs=read_kwargs,
+        )
+        to_row, _to_current = _endpoint(
+            row,
+            "to",
+            candidate_rows,
+            store,
+            read_kwargs=read_kwargs,
+        )
         if relation_type != "quotes" and not from_current:
             raise ValueError(f"{label} must originate from this exact source batch")
         if relation_type in _IDENTITY_RELATIONS and (
@@ -719,4 +942,5 @@ def parse_assertion_extraction(
             to_assertion_id=str(to_row["assertion_id"]),
             confidence=row["confidence"],
         ))
+    require_active()
     return AssertionExtraction(tuple(assertions), tuple(relations))

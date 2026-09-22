@@ -18,9 +18,11 @@ import inspect
 import logging
 import sqlite3
 import threading
+import time
 import weakref
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,34 @@ def explicit_subagent_lineage(session_id: str) -> Dict[str, str]:
 
 
 class AuxiliarySessionMixin:
+    @contextmanager
+    def _bounded_auxiliary_session_lock(
+        self,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> Iterator[None]:
+        """Borrow auxiliary state without escaping an automatic turn wall."""
+        if deadline is None:
+            acquired = bool(self._auxiliary_session_lock.acquire())
+        else:
+            clock = deadline_clock or time.monotonic
+            remaining = max(0.0, float(deadline) - float(clock()))
+            if remaining <= 0:
+                raise TimeoutError("auxiliary session lock deadline exceeded")
+            acquired = bool(
+                self._auxiliary_session_lock.acquire(timeout=remaining)
+            )
+            if acquired and float(clock()) >= float(deadline):
+                self._auxiliary_session_lock.release()
+                raise TimeoutError("auxiliary session lock deadline exceeded")
+        if not acquired:
+            raise TimeoutError("auxiliary session lock deadline exceeded")
+        try:
+            yield
+        finally:
+            self._auxiliary_session_lock.release()
+
     def _thread_context_auxiliary_stack(self) -> list[str]:
         stack = getattr(self._thread_context, "auxiliary_session_stack", None)
         if stack is None:
@@ -88,27 +118,75 @@ class AuxiliarySessionMixin:
             self._thread_context.auxiliary_session_stack = stack
         return stack
 
-    def _sync_thread_context_current_auxiliary(self) -> list[str]:
+    def _sync_thread_context_current_auxiliary(
+        self,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> list[str]:
         stack = self._thread_context_auxiliary_stack()
-        active_ids = self._active_auxiliary_session_ids()
-        stack[:] = [session_id for session_id in stack if session_id in active_ids]
-        self._thread_context.current_auxiliary_session_id = stack[-1] if stack else ""
+        if deadline is None:
+            # Preserve the historical hookable read used by lifecycle-race
+            # tests and manual/session callbacks.
+            active_ids = self._active_auxiliary_session_ids()
+            stack[:] = [
+                session_id for session_id in stack if session_id in active_ids
+            ]
+            self._thread_context.current_auxiliary_session_id = (
+                stack[-1] if stack else ""
+            )
+            return stack
+        with self._bounded_auxiliary_session_lock(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        ):
+            active_ids = set(self._auxiliary_session_ids)
+            stack[:] = [
+                session_id for session_id in stack if session_id in active_ids
+            ]
+            self._thread_context.current_auxiliary_session_id = (
+                stack[-1] if stack else ""
+            )
         return stack
 
-    def _thread_context_session_id(self) -> str:
-        stack = self._sync_thread_context_current_auxiliary()
-        stack_session_id = self._in_process_auxiliary_session_id_from_stack()
+    def _thread_context_session_id(
+        self,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> str:
+        stack = self._sync_thread_context_current_auxiliary(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        )
+        stack_session_id = self._in_process_auxiliary_session_id_from_stack(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        )
         if stack_session_id:
             return stack_session_id
         if stack:
             return stack[-1]
         return ""
 
-    def _current_auxiliary_prompt_tokens(self, session_id: str) -> int:
+    def _current_auxiliary_prompt_tokens(
+        self,
+        session_id: str,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> int:
         if not session_id:
             return 0
-        caller_generation = self._in_process_auxiliary_caller_generation(session_id)
-        with self._auxiliary_session_lock:
+        caller_generation = self._in_process_auxiliary_caller_generation(
+            session_id,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        )
+        with self._bounded_auxiliary_session_lock(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        ):
             if session_id not in self._auxiliary_session_ids:
                 return 0
             active_generation = self._auxiliary_session_generations.get(session_id)
@@ -132,12 +210,28 @@ class AuxiliarySessionMixin:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_session_ids
 
-    def _active_auxiliary_session_ids(self) -> set[str]:
-        with self._auxiliary_session_lock:
+    def _active_auxiliary_session_ids(
+        self,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> set[str]:
+        with self._bounded_auxiliary_session_lock(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        ):
             return set(self._auxiliary_session_ids)
 
-    def _known_auxiliary_lineage_session_ids(self) -> set[str]:
-        with self._auxiliary_session_lock:
+    def _known_auxiliary_lineage_session_ids(
+        self,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> set[str]:
+        with self._bounded_auxiliary_session_lock(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        ):
             return set(self._auxiliary_lineage_session_ids)
 
     def _known_auxiliary_parent_lineage_session_ids(self) -> set[str]:
@@ -154,17 +248,36 @@ class AuxiliarySessionMixin:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_foreground_reused_session_ids
 
-    def _thread_context_stateless(self) -> bool:
-        return bool(self._thread_context_session_id())
+    def _thread_context_stateless(
+        self,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> bool:
+        return bool(
+            self._thread_context_session_id(
+                deadline=deadline,
+                deadline_clock=deadline_clock,
+            )
+        )
 
     def _register_auxiliary_session(
         self,
         session_id: str,
         *,
         preserve_foreground_reuse_marker: bool = False,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> bool:
-        generation = self._in_process_auxiliary_caller_generation(session_id)
-        with self._auxiliary_session_lock:
+        generation = self._in_process_auxiliary_caller_generation(
+            session_id,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        )
+        with self._bounded_auxiliary_session_lock(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        ):
             previous_generation = self._auxiliary_session_generations.get(session_id)
             had_active_session = session_id in self._auxiliary_session_ids
             if generation and self._auxiliary_generation_is_retired(session_id, generation):
@@ -175,6 +288,8 @@ class AuxiliarySessionMixin:
                 generation = self._in_process_auxiliary_caller_generation(
                     session_id,
                     refresh_retired=True,
+                    deadline=deadline,
+                    deadline_clock=deadline_clock,
                 )
             had_cached_usage = session_id in self._auxiliary_last_prompt_tokens
             self._auxiliary_session_ids.add(session_id)
@@ -273,10 +388,14 @@ class AuxiliarySessionMixin:
         session_id: str,
         *,
         preserve_foreground_reuse_marker: bool = False,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> None:
         if not self._register_auxiliary_session(
             session_id,
             preserve_foreground_reuse_marker=preserve_foreground_reuse_marker,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
         ):
             return
         stack = self._thread_context_auxiliary_stack()
@@ -513,7 +632,14 @@ class AuxiliarySessionMixin:
             return True
         return False
 
-    def _auxiliary_generation_token_for(self, caller_self: object, *, force_new: bool = False) -> int:
+    def _auxiliary_generation_token_for(
+        self,
+        caller_self: object,
+        *,
+        force_new: bool = False,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> int:
         """Return a process-local, non-reusable token for an auxiliary frame.
 
         ``id(obj)`` can be reused after GC, which makes retired-generation
@@ -523,7 +649,10 @@ class AuxiliarySessionMixin:
         are held strongly so their id cannot be recycled while the token remains
         live in this engine runtime.
         """
-        with self._auxiliary_session_lock:
+        with self._bounded_auxiliary_session_lock(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+        ):
             object_id = id(caller_self)
             existing = self._auxiliary_generation_tokens.get(object_id)
             if existing is not None and not force_new:
@@ -556,6 +685,8 @@ class AuxiliarySessionMixin:
         session_id: str,
         *,
         refresh_retired: bool = False,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
     ) -> int:
         frame = inspect.currentframe()
         try:
@@ -569,12 +700,21 @@ class AuxiliarySessionMixin:
                     continue
                 caller_session = str(getattr(caller_self, "session_id", "") or "")
                 if not session_id or caller_session == session_id:
-                    token = self._auxiliary_generation_token_for(caller_self)
+                    token = self._auxiliary_generation_token_for(
+                        caller_self,
+                        deadline=deadline,
+                        deadline_clock=deadline_clock,
+                    )
                     if refresh_retired and self._auxiliary_generation_is_retired(
                         session_id,
                         token,
                     ):
-                        token = self._auxiliary_generation_token_for(caller_self, force_new=True)
+                        token = self._auxiliary_generation_token_for(
+                            caller_self,
+                            force_new=True,
+                            deadline=deadline,
+                            deadline_clock=deadline_clock,
+                        )
                     return token
                 frame = frame.f_back
         finally:
@@ -619,9 +759,24 @@ class AuxiliarySessionMixin:
             del frame
         return ""
 
-    def _in_process_auxiliary_session_id_from_stack(self) -> str:
-        active_ids = self._active_auxiliary_session_ids()
-        lineage_ids = self._known_auxiliary_lineage_session_ids()
+    def _in_process_auxiliary_session_id_from_stack(
+        self,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+    ) -> str:
+        if deadline is None:
+            active_ids = self._active_auxiliary_session_ids()
+            lineage_ids = self._known_auxiliary_lineage_session_ids()
+        else:
+            active_ids = self._active_auxiliary_session_ids(
+                deadline=deadline,
+                deadline_clock=deadline_clock,
+            )
+            lineage_ids = self._known_auxiliary_lineage_session_ids(
+                deadline=deadline,
+                deadline_clock=deadline_clock,
+            )
         if not active_ids and not lineage_ids and not self._session_id:
             return ""
         frame = inspect.currentframe()

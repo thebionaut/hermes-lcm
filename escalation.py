@@ -14,14 +14,27 @@ import logging
 import re
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 from . import tokens as _token_module
 from .model_routing import apply_lcm_model_route
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
+_SUMMARY_TASK = ContextVar('lcm_summary_task', default='compression')
+
+
+@contextmanager
+def summary_task(task):
+    """Scope an explicit host auxiliary task without changing ordinary LCM."""
+    token = _SUMMARY_TASK.set(task)
+    try:
+        yield
+    finally:
+        _SUMMARY_TASK.reset(token)
 
 
 # Strip inline reasoning blocks emitted by thinking models (MiniMax-M2.7,
@@ -56,6 +69,216 @@ _REASONING_START_RE = re.compile(
 )
 
 _DEFAULT_ROUTE_KEY = "<task-default>"
+
+_TRACE_REASON_CODES = frozenset(
+    {
+        "provider_timeout",
+        "provider_connection_error",
+        "provider_auth_error",
+        "provider_quota",
+        "provider_rate_limit",
+        "invalid_provider_response",
+        "provider_error",
+        "provider_circuit_open",
+        "provider_spend_guard",
+        "reasoning_only_output",
+        "non_compressing_output",
+        "insufficient_compressible_source",
+    }
+)
+_TRACE_OUTCOMES = frozenset({"success", "failure", "rejected", "skipped"})
+_TRACE_LABEL_MAX_CHARS = 160
+
+
+def _safe_trace_label(value: Any) -> str:
+    """Return bounded single-line route metadata safe for diagnostics.
+
+    Summary content, exception messages, request metadata, and credentials are
+    deliberately never accepted by this helper's callers.
+    """
+    if value is None:
+        return ""
+    normalized = " ".join(str(value).split())
+    return normalized[:_TRACE_LABEL_MAX_CHARS]
+
+
+def _safe_reason_code(value: Any, *, default: str = "provider_error") -> str:
+    reason = str(value or "").strip()
+    return reason if reason in _TRACE_REASON_CODES else default
+
+
+def _set_attempt_trace(
+    trace: MutableMapping[str, Any] | None,
+    **values: Any,
+) -> None:
+    """Update one attempt trace using only the fixed, non-content schema."""
+    if trace is None:
+        return
+    for key, value in values.items():
+        if key in {
+            "physical_attempt_id",
+            "requested_provider",
+            "requested_model",
+            "actual_provider",
+            "actual_model",
+            "served_model",
+            "send_state",
+            "usage_coverage",
+            "usage_convention",
+            "usage_normalization_version",
+            "finish_reason",
+            "timeout_source",
+            "estimate_method",
+        }:
+            trace[key] = _safe_trace_label(value)
+        elif key == "failure_reason":
+            trace[key] = _safe_reason_code(value) if value else ""
+        elif key == "outcome":
+            trace[key] = value if value in _TRACE_OUTCOMES else "failure"
+        elif key in {
+            "escalation_level",
+            "logical_route_ordinal",
+            "source_token_count",
+            "summary_token_count",
+            "latency_ms",
+            "effective_timeout_ms",
+            "provider_input_total",
+            "provider_output_total",
+            "cache_read_input",
+            "cache_write_input",
+            "reasoning_output",
+            "normalized_input",
+            "normalized_output",
+            "source_input_estimate",
+            "serialized_input_estimate",
+            "framed_input_estimate",
+        }:
+            trace[key] = None if value is None else max(0, int(value or 0))
+        elif key in {"started_at", "finished_at"}:
+            trace[key] = max(0.0, float(value or 0.0))
+        elif key == "attribution_available":
+            trace[key] = bool(value)
+        elif key == "fallback_used":
+            trace[key] = None if value is None else bool(value)
+
+
+def _trace_attempt_list(
+    trace: MutableMapping[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    if trace is None:
+        return None
+    attempts = trace.get("attempts")
+    if not isinstance(attempts, list):
+        attempts = []
+        trace["attempts"] = attempts
+    return attempts
+
+
+def _set_selected_attempt(
+    trace: MutableMapping[str, Any] | None,
+    attempt: MutableMapping[str, Any],
+) -> None:
+    """Expose the successful route without making consumers scan attempts."""
+    if trace is None:
+        return
+    for key in (
+        "actual_provider",
+        "actual_model",
+        "attribution_available",
+        "fallback_used",
+        "latency_ms",
+        "escalation_level",
+        "source_token_count",
+        "summary_token_count",
+    ):
+        if key in attempt:
+            trace[key] = attempt[key]
+
+
+def _set_terminal_reason(
+    trace: MutableMapping[str, Any] | None,
+    reason: str,
+) -> None:
+    if trace is not None:
+        trace["terminal_reason"] = _safe_reason_code(reason) if reason else ""
+
+
+def _supports_explicit_keyword(callable_obj: Callable[..., Any], name: str) -> bool:
+    """Check a keyword without probing it by making a possibly paid call."""
+    try:
+        return name in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _provider_status_code(exc: BaseException) -> int | None:
+    for candidate in (exc, getattr(exc, "response", None)):
+        if candidate is None:
+            continue
+        value = getattr(candidate, "status_code", None)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _classify_provider_exception(exc: BaseException) -> str:
+    """Classify failures without inspecting or retaining exception text."""
+    status_code = _provider_status_code(exc)
+    if status_code == 408:
+        return "provider_timeout"
+    if status_code in {401, 403}:
+        return "provider_auth_error"
+    if status_code == 402:
+        return "provider_quota"
+    if status_code == 429:
+        return "provider_rate_limit"
+
+    class_name = type(exc).__name__.lower()
+    if isinstance(exc, TimeoutError) or "timeout" in class_name:
+        return "provider_timeout"
+    if isinstance(exc, ConnectionError) or any(
+        marker in class_name
+        for marker in ("connection", "connecterror", "networkerror")
+    ):
+        return "provider_connection_error"
+    return "provider_error"
+
+
+def _message_has_reasoning_payload(message: Any, content: Any) -> bool:
+    if isinstance(content, str) and content.strip():
+        return not bool(_sanitize_reasoning_summary(content))
+    for field_name in ("reasoning", "reasoning_content", "reasoning_details"):
+        if getattr(message, field_name, None):
+            return True
+    if isinstance(content, list):
+        return any(
+            isinstance(part, dict)
+            and str(part.get("type") or "").strip().lower()
+            in {"reasoning", "thinking", "thought"}
+            for part in content
+        )
+    return False
+
+
+def _route_fallback_used(
+    *,
+    requested_provider: str,
+    requested_model: str,
+    actual_provider: str,
+    actual_model: str,
+) -> bool | None:
+    """Return fallback certainty; task-default routes remain unknowable."""
+    if not actual_provider or not actual_model:
+        return None
+    if requested_provider:
+        return not (
+            actual_provider.strip().lower() == requested_provider.strip().lower()
+            and actual_model.strip() == requested_model.strip()
+        )
+    return None
 
 
 @dataclass
@@ -226,47 +449,170 @@ def _sanitize_reasoning_summary(text: str) -> str:
     return stripped
 
 
-def _call_llm_for_summary(prompt: str, max_tokens: int,
-                           model: str = "", timeout: float | None = None) -> Optional[str]:
-    """Call the Hermes auxiliary LLM for summarization."""
+def _call_llm_for_summary(
+    prompt: str,
+    max_tokens: int,
+    model: str = "",
+    timeout: float | None = None,
+    *,
+    route_info: MutableMapping[str, Any] | None = None,
+    trace: MutableMapping[str, Any] | None = None,
+    deadline: float | None = None,
+) -> Optional[str]:
+    """Call the Hermes auxiliary LLM for summarization.
+
+    ``route_info`` is a compatibility bridge to Hermes' concrete-route sink.
+    It is forwarded only when the installed host explicitly declares that
+    keyword. ``trace`` contains allowlisted operational metadata only.
+    """
+    started_at = time.time()
+    started_monotonic = time.monotonic()
+    _set_attempt_trace(
+        trace,
+        requested_model=model,
+        started_at=started_at,
+        outcome="failure",
+        failure_reason="provider_error",
+        summary_token_count=0,
+    )
+    call_kwargs: dict[str, Any] = {
+        "task": _SUMMARY_TASK.get(),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+    }
+    apply_lcm_model_route(call_kwargs, model)
+    if timeout is not None:
+        call_kwargs["timeout"] = timeout
+    requested_provider = str(call_kwargs.get("provider") or "")
+    requested_model = str(call_kwargs.get("model") or "")
     try:
         from agent.auxiliary_client import call_llm
-        call_kwargs = {
-            "task": "compression",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": max_tokens,
-        }
-        apply_lcm_model_route(call_kwargs, model)
-        if timeout is not None:
-            call_kwargs["timeout"] = timeout
+
+        if route_info is not None and _supports_explicit_keyword(call_llm, "route_info"):
+            call_kwargs["route_info"] = route_info
+        if deadline is not None and _supports_explicit_keyword(call_llm, "deadline"):
+            call_kwargs["deadline"] = deadline
         response = call_llm(**call_kwargs)
-        content = response.choices[0].message.content
-        if not isinstance(content, str):
-            content = str(content) if content else ""
-        sanitized = _sanitize_reasoning_summary(content)
-        if content.strip() and not sanitized:
-            logger.warning(
-                "LCM summary discarded reasoning-only output (model=%s); escalating",
-                model or "<default>",
-            )
-        return sanitized
-    except Exception as e:
-        logger.warning("LLM summarization failed: %s", e)
+    except Exception as exc:
+        reason = _classify_provider_exception(exc)
+        logger.warning(
+            "LLM summarization failed (%s; model=%s)",
+            reason,
+            _safe_trace_label(model) or "<default>",
+        )
+        _set_attempt_trace(
+            trace,
+            outcome="failure",
+            failure_reason=reason,
+        )
+        return None
+    finally:
+        actual_provider = _safe_trace_label(
+            route_info.get("provider") if route_info is not None else ""
+        )
+        actual_model = _safe_trace_label(
+            route_info.get("model") if route_info is not None else ""
+        )
+        attribution_available = bool(actual_provider and actual_model)
+        _set_attempt_trace(
+            trace,
+            actual_provider=actual_provider,
+            actual_model=actual_model,
+            attribution_available=attribution_available,
+            fallback_used=_route_fallback_used(
+                requested_provider=requested_provider,
+                requested_model=requested_model,
+                actual_provider=actual_provider,
+                actual_model=actual_model,
+            ),
+            finished_at=time.time(),
+            latency_ms=max(0, int((time.monotonic() - started_monotonic) * 1000)),
+        )
+
+    try:
+        message = response.choices[0].message
+        content = message.content
+    except (AttributeError, IndexError, KeyError, TypeError):
+        _set_attempt_trace(
+            trace,
+            outcome="failure",
+            failure_reason="invalid_provider_response",
+        )
+        logger.warning(
+            "LLM summarization returned an invalid response (model=%s)",
+            _safe_trace_label(model) or "<default>",
+        )
         return None
 
+    if not isinstance(content, str):
+        reason = (
+            "reasoning_only_output"
+            if _message_has_reasoning_payload(message, content)
+            else "invalid_provider_response"
+        )
+        _set_attempt_trace(trace, outcome="rejected", failure_reason=reason)
+        logger.warning(
+            "LCM summary rejected %s (model=%s)",
+            reason,
+            _safe_trace_label(model) or "<default>",
+        )
+        return "" if reason == "reasoning_only_output" else None
 
-def _invoke_summary_llm(prompt: str, max_tokens: int, model: str = "", timeout: float | None = None) -> Optional[str]:
+    sanitized = _sanitize_reasoning_summary(content)
+    if not sanitized:
+        reason = (
+            "reasoning_only_output"
+            if _message_has_reasoning_payload(message, content)
+            else "invalid_provider_response"
+        )
+        _set_attempt_trace(trace, outcome="rejected", failure_reason=reason)
+        logger.warning(
+            "LCM summary rejected %s (model=%s)",
+            reason,
+            _safe_trace_label(model) or "<default>",
+        )
+        return "" if reason == "reasoning_only_output" else None
+
+    _set_attempt_trace(
+        trace,
+        outcome="success",
+        failure_reason="",
+        summary_token_count=count_tokens(sanitized),
+    )
+    return sanitized
+
+
+def _invoke_summary_llm(
+    prompt: str,
+    max_tokens: int,
+    model: str = "",
+    timeout: float | None = None,
+    *,
+    route_info: MutableMapping[str, Any] | None = None,
+    trace: MutableMapping[str, Any] | None = None,
+    deadline: float | None = None,
+) -> Optional[str]:
     kwargs = {"model": model} if model else {}
-    if timeout is not None:
-        try:
-            sig = inspect.signature(_call_llm_for_summary)
-            if "timeout" in sig.parameters or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            ):
-                kwargs["timeout"] = timeout
-        except Exception:
-            pass
+    try:
+        sig = inspect.signature(_call_llm_for_summary)
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in sig.parameters.values()
+        )
+    except (TypeError, ValueError):
+        sig = None
+        accepts_kwargs = False
+    if timeout is not None and (
+        accepts_kwargs or (sig is not None and "timeout" in sig.parameters)
+    ):
+        kwargs["timeout"] = timeout
+    if route_info is not None and sig is not None and "route_info" in sig.parameters:
+        kwargs["route_info"] = route_info
+    if trace is not None and sig is not None and "trace" in sig.parameters:
+        kwargs["trace"] = trace
+    if deadline is not None and sig is not None and "deadline" in sig.parameters:
+        kwargs["deadline"] = deadline
     return _call_llm_for_summary(prompt, max_tokens, **kwargs)
 
 
@@ -361,6 +707,31 @@ def _summary_model_chain(primary_model: str = "", fallback_models: list[str] | t
     return chain
 
 
+def _summary_work_stopped(
+    *,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> bool:
+    """Return whether escalation must stop before starting another request."""
+    if cancel_event is not None and cancel_event.is_set():
+        return True
+    return deadline is not None and time.monotonic() >= float(deadline)
+
+
+def _remaining_route_timeout(
+    timeout: float | None,
+    *,
+    deadline: float | None,
+) -> float | None:
+    """Cap one provider timeout by the remaining absolute wall budget."""
+    if deadline is None:
+        return timeout
+    remaining = max(0.0, float(deadline) - time.monotonic())
+    if timeout is None:
+        return remaining
+    return min(max(0.0, float(timeout)), remaining)
+
+
 def _invoke_summary_llm_chain(
     prompt: str,
     max_tokens: int,
@@ -371,20 +742,174 @@ def _invoke_summary_llm_chain(
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
+    trace: MutableMapping[str, Any] | None = None,
+    escalation_level: int = 0,
+    source_token_count: int = 0,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
-    for candidate_model in chain:
+    attempts = _trace_attempt_list(trace)
+    for logical_route_ordinal, candidate_model in enumerate(chain):
+        if _summary_work_stopped(
+            deadline=deadline,
+            cancel_event=cancel_event,
+        ):
+            _set_terminal_reason(trace, "provider_timeout")
+            break
+        started_at = time.time()
+        started_monotonic = time.monotonic()
+        attempt: dict[str, Any] = {}
+        _set_attempt_trace(
+            attempt,
+            escalation_level=escalation_level,
+            logical_route_ordinal=logical_route_ordinal,
+            requested_model=candidate_model,
+            actual_provider="",
+            actual_model="",
+            attribution_available=False,
+            fallback_used=True if logical_route_ordinal > 0 else None,
+            outcome="failure",
+            failure_reason="provider_error",
+            source_token_count=source_token_count,
+            summary_token_count=0,
+            latency_ms=0,
+            started_at=started_at,
+            finished_at=started_at,
+        )
+        route_info: dict[str, Any] = {}
+        root_receipt_sink = trace.get("receipt_sink") if trace is not None else None
+        if callable(root_receipt_sink):
+            def receipt_sink(
+                event: Mapping[str, Any],
+                *,
+                _sink: Callable[[Mapping[str, Any]], None] = root_receipt_sink,
+                _level: int = escalation_level,
+                _ordinal: int = logical_route_ordinal,
+                _requested_model: str = candidate_model,
+                _source_tokens: int = source_token_count,
+                _framed_tokens: int = count_tokens(prompt),
+            ) -> None:
+                payload = dict(event)
+                payload.update(
+                    {
+                        "escalation_level": _level,
+                        "logical_route_ordinal": _ordinal,
+                        "requested_model": _requested_model,
+                        "source_input_estimate": max(0, int(_source_tokens or 0)),
+                        "framed_input_estimate": max(0, int(_framed_tokens or 0)),
+                        "estimate_method": "lcm-tokenizer-v1",
+                    }
+                )
+                _sink(payload)
+
+            route_info["receipt_sink"] = receipt_sink
+
+        def finish_attempt(*, outcome: str, reason: str = "") -> None:
+            _set_attempt_trace(
+                attempt,
+                outcome=outcome,
+                failure_reason=reason,
+                finished_at=time.time(),
+                latency_ms=max(
+                    int(attempt.get("latency_ms") or 0),
+                    max(0, int((time.monotonic() - started_monotonic) * 1000)),
+                ),
+            )
+            if attempts is None:
+                return
+            physical_attempts = route_info.get("physical_attempts")
+            if isinstance(physical_attempts, list) and physical_attempts:
+                valid_physical = [
+                    item for item in physical_attempts if isinstance(item, Mapping)
+                ]
+                for physical_index, physical_raw in enumerate(valid_physical):
+                    physical = dict(attempt)
+                    physical_outcome = str(
+                        physical_raw.get("outcome") or "failure"
+                    )
+                    physical_reason = str(
+                        physical_raw.get("failure_reason") or ""
+                    )
+                    if physical_index == len(valid_physical) - 1 and outcome != "success":
+                        physical_outcome = outcome
+                        physical_reason = reason
+                    _set_attempt_trace(
+                        physical,
+                        physical_attempt_id=physical_raw.get("physical_attempt_id"),
+                        requested_provider=physical_raw.get("provider"),
+                        requested_model=physical_raw.get("model"),
+                        logical_route_ordinal=len(attempts),
+                        actual_provider=physical_raw.get("provider"),
+                        actual_model=physical_raw.get("model"),
+                        served_model=physical_raw.get("served_model"),
+                        send_state=physical_raw.get("send_state"),
+                        effective_timeout_ms=physical_raw.get("effective_timeout_ms"),
+                        timeout_source=physical_raw.get("timeout_source"),
+                        usage_coverage=physical_raw.get("usage_coverage"),
+                        provider_input_total=physical_raw.get("provider_input_total"),
+                        provider_output_total=physical_raw.get("provider_output_total"),
+                        cache_read_input=physical_raw.get("cache_read_input"),
+                        cache_write_input=physical_raw.get("cache_write_input"),
+                        reasoning_output=physical_raw.get("reasoning_output"),
+                        normalized_input=physical_raw.get("normalized_input"),
+                        normalized_output=physical_raw.get("normalized_output"),
+                        usage_convention=physical_raw.get("usage_convention"),
+                        usage_normalization_version=physical_raw.get(
+                            "usage_normalization_version"
+                        ),
+                        finish_reason=physical_raw.get("finish_reason"),
+                        source_input_estimate=physical_raw.get("source_input_estimate"),
+                        serialized_input_estimate=physical_raw.get(
+                            "serialized_input_estimate"
+                        ),
+                        framed_input_estimate=physical_raw.get("framed_input_estimate"),
+                        estimate_method=physical_raw.get("estimate_method"),
+                        attribution_available=bool(
+                            physical_raw.get("provider")
+                            and physical_raw.get("model")
+                        ),
+                        fallback_used=(
+                            True
+                            if logical_route_ordinal > 0 or physical_index > 0
+                            else None
+                        ),
+                        outcome=physical_outcome,
+                        failure_reason=physical_reason,
+                        summary_token_count=(
+                            attempt.get("summary_token_count", 0)
+                            if physical_index == len(valid_physical) - 1
+                            and physical_outcome == "success"
+                            else 0
+                        ),
+                        latency_ms=physical_raw.get("latency_ms", 0),
+                        started_at=physical_raw.get("started_at", started_at),
+                        finished_at=physical_raw.get("finished_at", time.time()),
+                    )
+                    attempts.append(physical)
+                return
+            attempts.append(dict(attempt))
+
         if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
             skipped += 1
+            finish_attempt(outcome="skipped", reason="provider_circuit_open")
+            _set_terminal_reason(trace, "provider_circuit_open")
             logger.warning(
                 "LCM summary route skipped by open circuit: %s",
-                candidate_model or _DEFAULT_ROUTE_KEY,
+                _safe_trace_label(candidate_model) or _DEFAULT_ROUTE_KEY,
             )
             continue
+        route_timeout = _remaining_route_timeout(timeout, deadline=deadline)
+        if deadline is not None and route_timeout is not None and route_timeout <= 0:
+            finish_attempt(outcome="skipped", reason="provider_timeout")
+            _set_terminal_reason(trace, "provider_timeout")
+            break
         # Check the spend guard per-route so a mid-chain trip stops the
         # remaining fallbacks instead of over-spending by up to len(chain)-1.
         if spend_guard is not None and not spend_guard.try_record_call():
+            finish_attempt(outcome="skipped", reason="provider_spend_guard")
+            _set_terminal_reason(trace, "provider_spend_guard")
             logger.warning(
                 "LCM summary spend guard active; skipping LLM summarization and "
                 "deferring to deterministic fallback"
@@ -395,15 +920,88 @@ def _invoke_summary_llm_chain(
                 prompt,
                 max_tokens,
                 model=candidate_model,
-                timeout=timeout,
+                timeout=route_timeout,
+                route_info=route_info,
+                trace=attempt,
+                deadline=deadline,
             )
         except Exception as exc:
-            logger.warning("LLM summarization failed: %s", exc)
+            reason = _classify_provider_exception(exc)
+            logger.warning(
+                "LLM summarization failed (%s; model=%s)",
+                reason,
+                _safe_trace_label(candidate_model) or "<default>",
+            )
+            _set_attempt_trace(
+                attempt,
+                outcome="failure",
+                failure_reason=reason,
+            )
             result = None
+
+        actual_provider = _safe_trace_label(route_info.get("provider"))
+        actual_model = _safe_trace_label(route_info.get("model"))
+        if actual_provider and actual_model:
+            _set_attempt_trace(
+                attempt,
+                actual_provider=actual_provider,
+                actual_model=actual_model,
+                attribution_available=True,
+                fallback_used=(
+                    True
+                    if logical_route_ordinal > 0
+                    else attempt.get("fallback_used")
+                ),
+            )
+        if _summary_work_stopped(
+            deadline=deadline,
+            cancel_event=cancel_event,
+        ):
+            reason = "provider_timeout"
+            _set_attempt_trace(
+                attempt,
+                outcome="failure",
+                failure_reason=reason,
+                summary_token_count=0,
+            )
+            finish_attempt(outcome="failure", reason=reason)
+            _set_terminal_reason(trace, reason)
+            return None
         if result and (accepts_result is None or accepts_result(result)):
+            _set_attempt_trace(
+                attempt,
+                outcome="success",
+                failure_reason="",
+                summary_token_count=count_tokens(result),
+            )
+            finish_attempt(outcome="success")
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
+            _set_terminal_reason(trace, "")
+            _set_selected_attempt(trace, attempt)
             return result
+
+        reason = str(attempt.get("failure_reason") or "")
+        if result:
+            reason = "non_compressing_output"
+            _set_attempt_trace(
+                attempt,
+                outcome="rejected",
+                failure_reason=reason,
+                summary_token_count=count_tokens(result),
+            )
+        elif not reason:
+            reason = "invalid_provider_response" if result == "" else "provider_error"
+            _set_attempt_trace(
+                attempt,
+                outcome="rejected" if result == "" else "failure",
+                failure_reason=reason,
+            )
+        finish_attempt(
+            outcome=str(attempt.get("outcome") or "failure"),
+            reason=reason,
+        )
+        _set_terminal_reason(trace, reason)
         if circuit_breaker is not None:
             circuit_breaker.record_failure(candidate_model)
     if skipped == len(chain):
@@ -556,12 +1154,43 @@ def summarize_with_escalation(
     fallback_models: list[str] | tuple[str, ...] | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
+    trace: MutableMapping[str, Any] | None = None,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
+    _trace_attempt_list(trace)
+    _set_terminal_reason(trace, "")
+    if not isinstance(text, str) or not text.strip() or int(source_tokens or 0) <= 0:
+        now = time.time()
+        insufficient_attempt: dict[str, Any] = {}
+        _set_attempt_trace(
+            insufficient_attempt,
+            escalation_level=0,
+            logical_route_ordinal=0,
+            requested_model=model,
+            actual_provider="",
+            actual_model="",
+            attribution_available=False,
+            fallback_used=None,
+            outcome="skipped",
+            failure_reason="insufficient_compressible_source",
+            source_token_count=source_tokens,
+            summary_token_count=0,
+            latency_ms=0,
+            started_at=now,
+            finished_at=now,
+        )
+        attempts = _trace_attempt_list(trace)
+        if attempts is not None:
+            attempts.append(insufficient_attempt)
+        _set_terminal_reason(trace, "insufficient_compressible_source")
+        return _deterministic_truncate(text if isinstance(text, str) else "", l3_truncate_tokens), 3
+
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(text, token_budget, depth,
                                  focus_topic=focus_topic,
@@ -575,11 +1204,25 @@ def summarize_with_escalation(
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
+        trace=trace,
+        escalation_level=1,
+        source_token_count=source_tokens,
+        deadline=deadline,
+        cancel_event=cancel_event,
     )
 
     if l1_result:
         logger.debug("L1 summarization succeeded (%d tokens)", count_tokens(l1_result))
         return l1_result, 1
+
+    if _summary_work_stopped(
+        deadline=deadline,
+        cancel_event=cancel_event,
+    ):
+        _set_terminal_reason(trace, "provider_timeout")
+        l3_result = _deterministic_truncate(text, l3_truncate_tokens)
+        logger.debug("L3 deterministic truncation (%d tokens)", count_tokens(l3_result))
+        return l3_result, 3
 
     # Level 2: aggressive bullets at reduced budget
     l2_budget = int(token_budget * l2_budget_ratio)
@@ -595,6 +1238,11 @@ def summarize_with_escalation(
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
+        trace=trace,
+        escalation_level=2,
+        source_token_count=source_tokens,
+        deadline=deadline,
+        cancel_event=cancel_event,
     )
 
     if l2_result:

@@ -11,14 +11,19 @@ This is the smallest viable substrate for cross-turn/session lifecycle state:
 from __future__ import annotations
 
 import functools
+import logging
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+
+
+logger = logging.getLogger(__name__)
 
 
 def _synchronized(method):
@@ -129,28 +134,247 @@ class LifecycleStateStore:
             updated_at=float(row["updated_at"] or 0.0),
         )
 
-    def get_by_conversation(self, conversation_id: str | None) -> LifecycleState | None:
+    @contextmanager
+    def _bounded_read_connection(
+        self,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Borrow the shared read connection without escaping a caller wall."""
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, float(deadline) - float(clock()))
+
+        remaining = remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("lifecycle state read deadline exceeded")
+        effective_lock_timeout = lock_timeout_seconds
+        if remaining is not None:
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+        if effective_lock_timeout is None:
+            acquired = bool(self._lock.acquire())
+        else:
+            acquired = bool(
+                self._lock.acquire(timeout=max(0.0, effective_lock_timeout))
+            )
+        if not acquired:
+            raise TimeoutError("lifecycle state store lock deadline exceeded")
+        conn = self._conn
+        prior_busy_timeout: int | None = None
+        primary_error: BaseException | None = None
+        try:
+            if conn is None:
+                raise RuntimeError("lifecycle state store is closed")
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("lifecycle state read deadline exceeded")
+            effective_busy_timeout_ms = busy_timeout_ms
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            if effective_busy_timeout_ms is not None:
+                prior_busy_timeout = int(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                )
+                conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+                )
+            yield conn
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("lifecycle state read deadline exceeded")
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                if conn is not None and prior_busy_timeout is not None:
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={prior_busy_timeout}")
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                        logger.warning(
+                            "LCM could not restore SQLite busy_timeout after a "
+                            "failed lifecycle read",
+                            exc_info=True,
+                        )
+            finally:
+                self._lock.release()
+
+    @contextmanager
+    def _bounded_write_connection(
+        self,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        """Run one lifecycle mutation atomically within an absolute deadline."""
+        clock = deadline_clock or time.monotonic
+
+        def remaining_seconds() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, float(deadline) - float(clock()))
+
+        def check_deadline() -> None:
+            remaining = remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("lifecycle state write deadline exceeded")
+
+        remaining = remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("lifecycle state write deadline exceeded")
+        effective_lock_timeout = lock_timeout_seconds
+        if remaining is not None:
+            effective_lock_timeout = (
+                remaining
+                if effective_lock_timeout is None
+                else min(max(0.0, float(effective_lock_timeout)), remaining)
+            )
+        if effective_lock_timeout is None:
+            acquired = bool(self._lock.acquire())
+        else:
+            acquired = bool(
+                self._lock.acquire(timeout=max(0.0, effective_lock_timeout))
+            )
+        if not acquired:
+            raise TimeoutError("lifecycle state store lock deadline exceeded")
+
+        conn = self._conn
+        prior_busy_timeout: int | None = None
+        primary_error: BaseException | None = None
+        try:
+            if conn is None:
+                raise RuntimeError("lifecycle state store is closed")
+            check_deadline()
+            effective_busy_timeout_ms = busy_timeout_ms
+            remaining = remaining_seconds()
+            if remaining is not None:
+                remaining_ms = max(0, int(remaining * 1000))
+                effective_busy_timeout_ms = (
+                    remaining_ms
+                    if effective_busy_timeout_ms is None
+                    else min(max(0, int(effective_busy_timeout_ms)), remaining_ms)
+                )
+            if effective_busy_timeout_ms is not None:
+                prior_busy_timeout = int(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                )
+                conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int(effective_busy_timeout_ms))}"
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            check_deadline()
+            conn.commit()
+        except BaseException as exc:
+            primary_error = exc
+            try:
+                if conn is not None and conn.in_transaction:
+                    conn.rollback()
+            except BaseException:
+                # A failed rollback leaves transaction state unknowable. Close
+                # the shared connection so no later lifecycle call can commit
+                # or reuse a partially-applied mutation.
+                logger.warning(
+                    "LCM could not roll back a failed lifecycle write; closing "
+                    "the lifecycle connection",
+                    exc_info=True,
+                )
+                try:
+                    if conn is not None:
+                        conn.close()
+                except BaseException:
+                    logger.warning(
+                        "LCM could not close the poisoned lifecycle connection",
+                        exc_info=True,
+                    )
+                if self._conn is conn:
+                    self._conn = None
+            raise
+        finally:
+            try:
+                if conn is not None and prior_busy_timeout is not None:
+                    try:
+                        conn.execute(f"PRAGMA busy_timeout={prior_busy_timeout}")
+                    except BaseException:
+                        if primary_error is None:
+                            raise
+                        logger.warning(
+                            "LCM could not restore SQLite busy_timeout after a "
+                            "failed lifecycle write",
+                            exc_info=True,
+                        )
+            finally:
+                self._lock.release()
+
+    def get_by_conversation(
+        self,
+        conversation_id: str | None,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> LifecycleState | None:
         if not conversation_id:
             return None
-        row = self._conn.execute(
-            "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
-            (conversation_id,),
-        ).fetchone()
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
+                "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
         return self._row_to_state(row)
 
-    def get_by_session(self, session_id: str | None) -> LifecycleState | None:
+    def get_by_session(
+        self,
+        session_id: str | None,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> LifecycleState | None:
         if not session_id:
             return None
-        row = self._conn.execute(
-            """
-            SELECT *
-            FROM lcm_lifecycle_state
-            WHERE current_session_id = ? OR last_finalized_session_id = ?
-            ORDER BY CASE WHEN current_session_id = ? THEN 0 ELSE 1 END, updated_at DESC
-            LIMIT 1
-            """,
-            (session_id, session_id, session_id),
-        ).fetchone()
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM lcm_lifecycle_state
+                WHERE current_session_id = ? OR last_finalized_session_id = ?
+                ORDER BY CASE WHEN current_session_id = ? THEN 0 ELSE 1 END, updated_at DESC
+                LIMIT 1
+                """,
+                (session_id, session_id, session_id),
+            ).fetchone()
         return self._row_to_state(row)
 
     @_synchronized
@@ -178,12 +402,25 @@ class LifecycleStateStore:
         if existing is not None:
             if existing.current_session_id == session_id:
                 return existing
+            # Hermes may finalize and immediately rebind the same durable
+            # session at an ordinary API/tool turn boundary.  Finalization
+            # deliberately clears ``current_session_id``, but that must not
+            # erase a valid compaction frontier when the identical session is
+            # rebound to the identical conversation.  A genuinely different
+            # session still starts at frontier zero below.
+            same_finalized_session = bool(
+                existing.current_session_id is None
+                and existing.last_finalized_session_id == session_id
+            )
             current_frontier = (
-                existing.current_frontier_store_id if existing.current_session_id == session_id else 0
+                existing.last_finalized_frontier_store_id
+                if same_finalized_session
+                else 0
             )
-            current_bound_at = (
-                existing.current_bound_at if existing.current_session_id == session_id else now
-            )
+            # Keep a fresh bind timestamp as the stale-caller CAS.  The
+            # background publication fence treats the semantic epoch
+            # separately (session id + reset epoch + explicit fence state).
+            current_bound_at = now
             last_finalized_session_id = existing.last_finalized_session_id
             last_finalized_frontier = existing.last_finalized_frontier_store_id
             debt_kind = existing.debt_kind
@@ -205,58 +442,105 @@ class LifecycleStateStore:
             )
             last_reset_at = existing.last_reset_at
 
-        self._conn.execute(
-            """
-            INSERT INTO lcm_lifecycle_state(
-                conversation_id,
-                current_session_id,
-                last_finalized_session_id,
-                current_frontier_store_id,
-                last_finalized_frontier_store_id,
-                debt_kind,
-                debt_size_estimate,
-                current_bound_at,
-                last_finalized_at,
-                debt_updated_at,
-                last_maintenance_attempt_at,
-                last_rollover_at,
-                last_reset_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(conversation_id) DO UPDATE SET
-                current_session_id = excluded.current_session_id,
-                last_finalized_session_id = excluded.last_finalized_session_id,
-                current_frontier_store_id = excluded.current_frontier_store_id,
-                last_finalized_frontier_store_id = excluded.last_finalized_frontier_store_id,
-                debt_kind = excluded.debt_kind,
-                debt_size_estimate = excluded.debt_size_estimate,
-                current_bound_at = excluded.current_bound_at,
-                last_finalized_at = excluded.last_finalized_at,
-                debt_updated_at = excluded.debt_updated_at,
-                last_maintenance_attempt_at = excluded.last_maintenance_attempt_at,
-                last_rollover_at = excluded.last_rollover_at,
-                last_reset_at = excluded.last_reset_at,
-                updated_at = excluded.updated_at
-            """,
-            (
-                conversation_id,
-                session_id,
-                last_finalized_session_id,
-                current_frontier,
-                last_finalized_frontier,
-                debt_kind,
-                debt_size_estimate,
-                current_bound_at,
-                last_finalized_at,
-                debt_updated_at,
-                last_maintenance_attempt_at,
-                last_rollover_at,
-                last_reset_at,
-                now,
-            ),
-        )
+        if existing is None:
+            # The insert is itself the compare-and-swap for a missing row.  A
+            # sibling that creates the conversation after our read wins; this
+            # stale bind must not overwrite its newer lifecycle state.
+            self._conn.execute(
+                """
+                INSERT INTO lcm_lifecycle_state(
+                    conversation_id,
+                    current_session_id,
+                    last_finalized_session_id,
+                    current_frontier_store_id,
+                    last_finalized_frontier_store_id,
+                    debt_kind,
+                    debt_size_estimate,
+                    current_bound_at,
+                    last_finalized_at,
+                    debt_updated_at,
+                    last_maintenance_attempt_at,
+                    last_rollover_at,
+                    last_reset_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO NOTHING
+                """,
+                (
+                    conversation_id,
+                    session_id,
+                    last_finalized_session_id,
+                    current_frontier,
+                    last_finalized_frontier,
+                    debt_kind,
+                    debt_size_estimate,
+                    current_bound_at,
+                    last_finalized_at,
+                    debt_updated_at,
+                    last_maintenance_attempt_at,
+                    last_rollover_at,
+                    last_reset_at,
+                    now,
+                ),
+            )
+        else:
+            # Bind only if the lifecycle fields used to derive this transition
+            # still match the snapshot.  Retrying against a newer row would let
+            # a stale process deliberately replace a sibling's newer bind, so a
+            # failed CAS returns the winner's state below instead.
+            self._conn.execute(
+                """
+                UPDATE lcm_lifecycle_state
+                SET current_session_id = ?,
+                    current_frontier_store_id = ?,
+                    current_bound_at = ?,
+                    last_rollover_at = ?,
+                    updated_at = ?
+                WHERE conversation_id = ?
+                  AND current_session_id IS ?
+                  AND last_finalized_session_id IS ?
+                  AND current_frontier_store_id = ?
+                  AND last_finalized_frontier_store_id = ?
+                  AND current_bound_at IS ?
+                  AND last_rollover_at IS ?
+                """,
+                (
+                    session_id,
+                    current_frontier,
+                    current_bound_at,
+                    last_rollover_at,
+                    now,
+                    conversation_id,
+                    existing.current_session_id,
+                    existing.last_finalized_session_id,
+                    existing.current_frontier_store_id,
+                    existing.last_finalized_frontier_store_id,
+                    existing.current_bound_at,
+                    existing.last_rollover_at,
+                ),
+            )
         self._conn.commit()
         state = self.get_by_conversation(conversation_id)
+        if state is None:
+            # A cleanup process deleted the row between the snapshot and CAS.
+            # Recreate only a fresh binding; never resurrect stale finalized or
+            # maintenance metadata from the deleted snapshot.
+            recovery_now = time.time()
+            self._conn.execute(
+                """
+                INSERT INTO lcm_lifecycle_state(
+                    conversation_id,
+                    current_session_id,
+                    current_frontier_store_id,
+                    current_bound_at,
+                    updated_at
+                ) VALUES (?, ?, 0, ?, ?)
+                ON CONFLICT(conversation_id) DO NOTHING
+                """,
+                (conversation_id, session_id, recovery_now, recovery_now),
+            )
+            self._conn.commit()
+            state = self.get_by_conversation(conversation_id)
         assert state is not None
         return state
 
@@ -271,33 +555,58 @@ class LifecycleStateStore:
         if state is None:
             return None
         now = time.time()
-        current_session_id = state.current_session_id
-        current_frontier = state.current_frontier_store_id
-        if current_session_id == session_id:
-            current_session_id = None
-            current_frontier = 0
-        finalized_frontier = max(
-            int(frontier_store_id or 0),
-            state.last_finalized_frontier_store_id,
-        )
+        # A same-id session can be finalized and rebound while this caller is
+        # paused.  The bind timestamp is the epoch token that distinguishes the
+        # snapshot's session incarnation from that newer bind.
+        snapshot_owns_session = state.current_session_id == session_id
+        snapshot_bound_at = state.current_bound_at
         self._conn.execute(
             """
             UPDATE lcm_lifecycle_state
-            SET current_session_id = ?,
+            SET current_session_id = CASE
+                    WHEN ?
+                     AND current_session_id = ?
+                     AND current_bound_at IS ?
+                    THEN NULL
+                    ELSE current_session_id
+                END,
                 last_finalized_session_id = ?,
-                current_frontier_store_id = ?,
-                last_finalized_frontier_store_id = ?,
-                debt_kind = debt_kind,
-                debt_size_estimate = debt_size_estimate,
+                current_frontier_store_id = CASE
+                    WHEN ?
+                     AND current_session_id = ?
+                     AND current_bound_at IS ?
+                    THEN 0
+                    ELSE current_frontier_store_id
+                END,
+                last_finalized_frontier_store_id = MAX(
+                    last_finalized_frontier_store_id,
+                    ?,
+                    ?,
+                    CASE
+                        WHEN ?
+                         AND current_session_id = ?
+                         AND current_bound_at IS ?
+                        THEN current_frontier_store_id
+                        ELSE 0
+                    END
+                ),
                 last_finalized_at = ?,
                 updated_at = ?
             WHERE conversation_id = ?
             """,
             (
-                current_session_id,
+                snapshot_owns_session,
                 session_id,
-                current_frontier,
-                finalized_frontier,
+                snapshot_bound_at,
+                session_id,
+                snapshot_owns_session,
+                session_id,
+                snapshot_bound_at,
+                int(frontier_store_id or 0),
+                state.current_frontier_store_id if snapshot_owns_session else 0,
+                snapshot_owns_session,
+                session_id,
+                snapshot_bound_at,
                 now,
                 now,
                 state.conversation_id,
@@ -315,58 +624,144 @@ class LifecycleStateStore:
         new_session_id: str,
         finalized_frontier_store_id: int = 0,
     ) -> LifecycleState:
-        state = self.get_by_conversation(conversation_id)
-        if (
-            state is not None
-            and state.current_session_id == new_session_id
-            and state.last_finalized_session_id == old_session_id
-        ):
-            return state
-
-        now = time.time()
-        last_finalized_frontier = max(
-            int(finalized_frontier_store_id or 0),
-            state.last_finalized_frontier_store_id if state else 0,
-        )
-        self._conn.execute(
-            """
-            INSERT INTO lcm_lifecycle_state(
-                conversation_id,
-                current_session_id,
-                last_finalized_session_id,
-                current_frontier_store_id,
-                last_finalized_frontier_store_id,
-                current_bound_at,
-                last_finalized_at,
-                last_rollover_at,
-                last_reset_at,
-                updated_at
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(conversation_id) DO UPDATE SET
-                current_session_id = excluded.current_session_id,
-                last_finalized_session_id = excluded.last_finalized_session_id,
-                current_frontier_store_id = 0,
-                last_finalized_frontier_store_id = excluded.last_finalized_frontier_store_id,
-                current_bound_at = excluded.current_bound_at,
-                last_finalized_at = excluded.last_finalized_at,
-                last_rollover_at = excluded.last_rollover_at,
-                last_reset_at = excluded.last_reset_at,
-                updated_at = excluded.updated_at
-            """,
-            (
-                conversation_id,
-                new_session_id,
-                old_session_id,
-                last_finalized_frontier,
-                now,
-                now,
-                now,
-                now,
-                now,
-            ),
-        )
-        self._conn.commit()
-        updated = self.get_by_conversation(conversation_id)
+        # Keep the caller's pre-transaction observation as the compare token.
+        # The write transaction re-reads the row after BEGIN IMMEDIATE, so a
+        # sibling process that completed a newer rollover wins rather than
+        # being overwritten by this stale caller.
+        snapshot = self.get_by_conversation(conversation_id)
+        updated: LifecycleState | None = None
+        with self._bounded_write_connection() as conn:
+            current = self._row_to_state(
+                conn.execute(
+                    "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+            )
+            lifecycle_epoch_changed = bool(
+                snapshot is not None
+                and current is not None
+                and (
+                    current.current_session_id != snapshot.current_session_id
+                    or current.current_bound_at != snapshot.current_bound_at
+                    or current.last_rollover_at != snapshot.last_rollover_at
+                    or current.last_reset_at != snapshot.last_reset_at
+                )
+            )
+            sibling_created_row = snapshot is None and current is not None
+            stale_session = bool(
+                current is not None
+                and current.current_session_id not in {
+                    None,
+                    old_session_id,
+                    new_session_id,
+                }
+            )
+            stale_finalized_session = bool(
+                current is not None
+                and current.current_session_id is None
+                and current.last_finalized_session_id not in {
+                    None,
+                    old_session_id,
+                }
+            )
+            if (
+                lifecycle_epoch_changed
+                or sibling_created_row
+                or stale_session
+                or stale_finalized_session
+            ):
+                updated = current
+            elif (
+                current is not None
+                and current.current_session_id == new_session_id
+                and current.last_finalized_session_id == old_session_id
+            ):
+                updated = current
+            else:
+                now = time.time()
+                last_finalized_frontier = max(
+                    int(finalized_frontier_store_id or 0),
+                    current.last_finalized_frontier_store_id if current else 0,
+                    current.current_frontier_store_id if current else 0,
+                )
+                if current is None:
+                    conn.execute(
+                        """
+                        INSERT INTO lcm_lifecycle_state(
+                            conversation_id,
+                            current_session_id,
+                            last_finalized_session_id,
+                            current_frontier_store_id,
+                            last_finalized_frontier_store_id,
+                            current_bound_at,
+                            last_finalized_at,
+                            last_rollover_at,
+                            last_reset_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(conversation_id) DO NOTHING
+                        """,
+                        (
+                            conversation_id,
+                            new_session_id,
+                            old_session_id,
+                            last_finalized_frontier,
+                            now,
+                            now,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE lcm_lifecycle_state
+                        SET current_session_id = ?,
+                            last_finalized_session_id = ?,
+                            current_frontier_store_id = 0,
+                            last_finalized_frontier_store_id = ?,
+                            current_bound_at = ?,
+                            last_finalized_at = ?,
+                            last_rollover_at = ?,
+                            last_reset_at = ?,
+                            updated_at = ?
+                        WHERE conversation_id = ?
+                          AND current_session_id IS ?
+                          AND last_finalized_session_id IS ?
+                          AND current_frontier_store_id = ?
+                          AND last_finalized_frontier_store_id = ?
+                          AND current_bound_at IS ?
+                          AND last_rollover_at IS ?
+                          AND last_reset_at IS ?
+                          AND updated_at = ?
+                        """,
+                        (
+                            new_session_id,
+                            old_session_id,
+                            last_finalized_frontier,
+                            now,
+                            now,
+                            now,
+                            current.last_reset_at,
+                            now,
+                            conversation_id,
+                            current.current_session_id,
+                            current.last_finalized_session_id,
+                            current.current_frontier_store_id,
+                            current.last_finalized_frontier_store_id,
+                            current.current_bound_at,
+                            current.last_rollover_at,
+                            current.last_reset_at,
+                            current.updated_at,
+                        ),
+                    )
+                updated = self._row_to_state(
+                    conn.execute(
+                        "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                        (conversation_id,),
+                    ).fetchone()
+                )
         assert updated is not None
         return updated
 
@@ -599,74 +994,134 @@ class LifecycleStateStore:
             "categories": categories,
         }
 
-    @_synchronized
     def record_debt(
         self,
         conversation_id: str | None,
         *,
         kind: str,
         size_estimate: int,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> LifecycleState | None:
         if not conversation_id:
             return None
-        state = self.get_by_conversation(conversation_id)
-        if state is None:
-            return None
-        now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET debt_kind = ?,
-                debt_size_estimate = ?,
-                debt_updated_at = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (kind, max(0, int(size_estimate or 0)), now, now, conversation_id),
-        )
-        self._conn.commit()
-        return self.get_by_conversation(conversation_id)
+        row: sqlite3.Row | None = None
+        with self._bounded_write_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            if conn.execute(
+                "SELECT 1 FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone() is None:
+                return None
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE lcm_lifecycle_state
+                SET debt_kind = ?,
+                    debt_size_estimate = ?,
+                    debt_updated_at = ?,
+                    updated_at = ?
+                WHERE conversation_id = ?
+                """,
+                (
+                    kind,
+                    max(0, int(size_estimate or 0)),
+                    now,
+                    now,
+                    conversation_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return self._row_to_state(row)
 
-    def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
+    def clear_debt(
+        self,
+        conversation_id: str | None,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> LifecycleState | None:
         if not conversation_id:
             return None
-        state = self.get_by_conversation(conversation_id)
-        if state is None:
-            return None
-        now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET debt_kind = NULL,
-                debt_size_estimate = 0,
-                debt_updated_at = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (now, now, conversation_id),
-        )
-        self._conn.commit()
-        return self.get_by_conversation(conversation_id)
+        row: sqlite3.Row | None = None
+        with self._bounded_write_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            if conn.execute(
+                "SELECT 1 FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone() is None:
+                return None
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE lcm_lifecycle_state
+                SET debt_kind = NULL,
+                    debt_size_estimate = 0,
+                    debt_updated_at = ?,
+                    updated_at = ?
+                WHERE conversation_id = ?
+                """,
+                (now, now, conversation_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return self._row_to_state(row)
 
-    @_synchronized
-    def record_maintenance_attempt(self, conversation_id: str | None) -> LifecycleState | None:
+    def record_maintenance_attempt(
+        self,
+        conversation_id: str | None,
+        *,
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> LifecycleState | None:
         if not conversation_id:
             return None
-        state = self.get_by_conversation(conversation_id)
-        if state is None:
-            return None
-        now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET last_maintenance_attempt_at = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (now, now, conversation_id),
-        )
-        self._conn.commit()
-        return self.get_by_conversation(conversation_id)
+        row: sqlite3.Row | None = None
+        with self._bounded_write_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            if conn.execute(
+                "SELECT 1 FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone() is None:
+                return None
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE lcm_lifecycle_state
+                SET last_maintenance_attempt_at = ?,
+                    updated_at = ?
+                WHERE conversation_id = ?
+                """,
+                (now, now, conversation_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+        return self._row_to_state(row)
 
     @_synchronized
     def record_reset(self, conversation_id: str | None) -> LifecycleState | None:
