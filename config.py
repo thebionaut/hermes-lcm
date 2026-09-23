@@ -219,6 +219,7 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
 
 _SUPPORTED_LCM_CONFIG_YAML_KEYS = {
     "context_threshold",
+    "background_compaction_prepare_ratio",
     "active_replay_preview_enabled",
     "active_replay_preview_session_allowlist",
 }
@@ -271,6 +272,25 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
     except Exception:
         return default, "default"
     return default, "default"
+
+
+def _hermes_background_compaction_prepare_ratio_with_source(
+    default: float,
+) -> tuple[float, str]:
+    cfg = _load_hermes_config_yaml()
+    try:
+        lcm_section = cfg.get("lcm") or {}
+        if not isinstance(lcm_section, dict):
+            return default, "default"
+        value = lcm_section.get("background_compaction_prepare_ratio")
+        if value is None:
+            return default, "default"
+        return (
+            float(value),
+            "config_yaml:lcm.background_compaction_prepare_ratio",
+        )
+    except (TypeError, ValueError, OverflowError):
+        return default, "default"
 
 
 def _hermes_active_replay_preview_policy() -> tuple[bool, list[str], str]:
@@ -1194,11 +1214,28 @@ class LCMConfig:
             )
         _record("summary_timeout_ms", source, warning)
 
+        prepare_ratio_default, prepare_ratio_source = (
+            _hermes_background_compaction_prepare_ratio_with_source(
+                c.background_compaction_prepare_ratio
+            )
+        )
         for spec in ENV_FIELD_SPECS:
             if spec.name not in _BACKGROUND_COMPACTION_ENV_FIELDS:
                 continue
             parser = _PARSER_WITH_SOURCE_BY_TYPE[spec.py_type]
-            value, source, warning = parser(spec.env_key, getattr(c, spec.name))
+            if spec.name == "background_compaction_prepare_ratio":
+                if prepare_ratio_source.startswith("config_yaml:"):
+                    value = prepare_ratio_default
+                    source = prepare_ratio_source
+                    warning = None
+                else:
+                    value, source, warning = parser(
+                        spec.env_key,
+                        prepare_ratio_default,
+                        default_source=prepare_ratio_source,
+                    )
+            else:
+                value, source, warning = parser(spec.env_key, getattr(c, spec.name))
             setattr(c, spec.name, value)
             _record(spec.name, source, warning)
 

@@ -313,6 +313,26 @@ def test_preview_allowlist_and_policy_version_load_from_environment(monkeypatch)
     )
 
 
+def test_background_prepare_ratio_loads_from_config_yaml(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "lcm:\n  background_compaction_prepare_ratio: 0.75\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("LCM_BACKGROUND_COMPACTION_PREPARE_RATIO", "0.55")
+
+    config = LCMConfig.from_env()
+
+    assert config.background_compaction_prepare_ratio == 0.75
+    assert (
+        config.config_sources["background_compaction_prepare_ratio"]
+        == "config_yaml:lcm.background_compaction_prepare_ratio"
+    )
+    assert config.ignored_config_yaml_lcm_keys == []
+
+
 def test_preview_allowlist_loads_from_config_yaml_and_fails_closed(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
