@@ -333,6 +333,75 @@ def test_background_prepare_ratio_loads_from_config_yaml(tmp_path, monkeypatch):
     assert config.ignored_config_yaml_lcm_keys == []
 
 
+def test_preview_matcher_supports_exact_and_date_prefix_and_fails_closed(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes-home-prefix"
+    hermes_home.mkdir()
+    date_prefix = "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_"
+    (hermes_home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "lcm:",
+                "  active_replay_preview_enabled: true",
+                "  active_replay_preview_session_allowlist:",
+                "    - exact-session",
+                "  active_replay_preview_session_prefix_allowlist:",
+                f"    - '{date_prefix}'",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_ACTIVE_REPLAY_PREVIEW_ENABLED", raising=False)
+    monkeypatch.delenv(
+        "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_ALLOWLIST", raising=False
+    )
+    monkeypatch.delenv(
+        "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_PREFIX_ALLOWLIST", raising=False
+    )
+
+    config = LCMConfig.from_env()
+    engine = LCMEngine(config, hermes_home=str(hermes_home))
+    try:
+        engine.on_session_start(
+            "exact-session", conversation_id="exact", context_length=200_000
+        )
+        assert engine._active_replay_preview_policy().enabled is True
+        engine.on_session_start(
+            "20260923_120000_abcdef",
+            conversation_id="dated",
+            context_length=200_000,
+        )
+        assert engine._active_replay_preview_policy().enabled is True
+        engine.on_session_start(
+            "api_1790134213_7b0e41c3",
+            conversation_id="api",
+            context_length=200_000,
+        )
+        assert engine._active_replay_preview_policy().enabled is False
+    finally:
+        engine.shutdown()
+
+    (hermes_home / "config.yaml").write_text("lcm: [\n", encoding="utf-8")
+    fail_closed = LCMConfig.from_env()
+    denied = LCMEngine(fail_closed, hermes_home=str(hermes_home))
+    try:
+        denied.on_session_start(
+            "exact-session", conversation_id="denied", context_length=200_000
+        )
+        assert denied._active_replay_preview_policy().enabled is False
+        denied.on_session_start(
+            "20260923_120000_abcdef",
+            conversation_id="denied-dated",
+            context_length=200_000,
+        )
+        assert denied._active_replay_preview_policy().enabled is False
+    finally:
+        denied.shutdown()
+
+
 def test_preview_allowlist_loads_from_config_yaml_and_fails_closed(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()

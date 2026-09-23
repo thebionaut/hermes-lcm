@@ -171,6 +171,7 @@ from .working_set import (
 from .active_replay_preview import (
     ActiveReplayPreviewPolicy,
     project_externalized_tool_results,
+    session_matches_preview_allowlist,
 )
 
 logger = logging.getLogger(__name__)
@@ -1183,9 +1184,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if existing is not None:
             return existing
         allowlist = set(self._config.active_replay_preview_session_allowlist)
+        prefix_allowlist = tuple(
+            self._config.active_replay_preview_session_prefix_allowlist
+        )
+        allowlisted = (
+            not allowlist and not prefix_allowlist
+        ) or session_matches_preview_allowlist(
+            session_id,
+            exact_sessions=allowlist,
+            prefix_patterns=prefix_allowlist,
+        )
         policy = ActiveReplayPreviewPolicy(
             enabled=bool(self._config.active_replay_preview_enabled)
-            and (not allowlist or session_id in allowlist),
+            and allowlisted,
             version=str(
                 self._config.active_replay_preview_policy_version
                 or "externalized-tool-preview-v1"

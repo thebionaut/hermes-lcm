@@ -222,6 +222,7 @@ _SUPPORTED_LCM_CONFIG_YAML_KEYS = {
     "background_compaction_prepare_ratio",
     "active_replay_preview_enabled",
     "active_replay_preview_session_allowlist",
+    "active_replay_preview_session_prefix_allowlist",
 }
 
 
@@ -293,13 +294,14 @@ def _hermes_background_compaction_prepare_ratio_with_source(
         return default, "default"
 
 
-def _hermes_active_replay_preview_policy() -> tuple[bool, list[str], str]:
-    """Load an exact-session preview canary from config.yaml, failing closed."""
+def _hermes_active_replay_preview_policy(
+) -> tuple[bool, list[str], list[str], str]:
+    """Load exact and prefix preview canaries from config.yaml, failing closed."""
     cfg = _load_hermes_config_yaml()
     try:
         lcm_section = cfg.get("lcm") or {}
         if not isinstance(lcm_section, dict):
-            return False, [], "default"
+            return False, [], [], "default"
         enabled = lcm_section.get("active_replay_preview_enabled") is True
         raw_allowlist = lcm_section.get("active_replay_preview_session_allowlist")
         if isinstance(raw_allowlist, str):
@@ -314,12 +316,27 @@ def _hermes_active_replay_preview_policy() -> tuple[bool, list[str], str]:
             )
         else:
             allowlist = []
+        raw_prefix_allowlist = lcm_section.get(
+            "active_replay_preview_session_prefix_allowlist"
+        )
+        if isinstance(raw_prefix_allowlist, str):
+            prefix_allowlist = _parse_pattern_list(raw_prefix_allowlist)
+        elif isinstance(raw_prefix_allowlist, (list, tuple)):
+            prefix_allowlist = list(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in raw_prefix_allowlist
+                    if str(value).strip()
+                )
+            )
+        else:
+            prefix_allowlist = []
         source = "config_yaml:lcm.active_replay_preview"
-        if not enabled or not allowlist:
-            return False, allowlist, source
-        return True, allowlist, source
+        if not enabled or not (allowlist or prefix_allowlist):
+            return False, allowlist, prefix_allowlist, source
+        return True, allowlist, prefix_allowlist, source
     except Exception:
-        return False, [], "default"
+        return False, [], [], "default"
 
 
 def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
@@ -711,6 +728,11 @@ class LCMConfig:
     # Empty means all newly bound sessions once the master flag is enabled;
     # otherwise only exact session IDs in this list can enter a canary.
     active_replay_preview_session_allowlist: list[str] = field(default_factory=list)
+    # Anchored shell-style prefix patterns. The configured date-stamped class
+    # uses eight digit character classes followed by an underscore.
+    active_replay_preview_session_prefix_allowlist: list[str] = field(
+        default_factory=list
+    )
     active_replay_preview_policy_version: str = "externalized-tool-preview-v1"
     active_replay_preview_min_tokens: int = 2_000
     active_replay_preview_head_tokens: int = 256
@@ -1104,6 +1126,16 @@ class LCMConfig:
                 if str(value).strip()
             )
         )
+        preview_prefix_allowlist = self.active_replay_preview_session_prefix_allowlist
+        if isinstance(preview_prefix_allowlist, str):
+            preview_prefix_allowlist = _parse_pattern_list(preview_prefix_allowlist)
+        self.active_replay_preview_session_prefix_allowlist = list(
+            dict.fromkeys(
+                str(value).strip()
+                for value in (preview_prefix_allowlist or [])
+                if str(value).strip()
+            )
+        )
 
         try:
             expected_calls = int(self.compaction_payback_expected_calls)
@@ -1136,15 +1168,29 @@ class LCMConfig:
                 config_source_warnings.append(warning)
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
-        preview_enabled, preview_allowlist, preview_source = (
-            _hermes_active_replay_preview_policy()
-        )
+        (
+            preview_enabled,
+            preview_allowlist,
+            preview_prefix_allowlist,
+            preview_source,
+        ) = _hermes_active_replay_preview_policy()
         if "LCM_ACTIVE_REPLAY_PREVIEW_ENABLED" not in os.environ:
             c.active_replay_preview_enabled = preview_enabled
             _record("active_replay_preview_enabled", preview_source)
         if "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_ALLOWLIST" not in os.environ:
             c.active_replay_preview_session_allowlist = preview_allowlist
             _record("active_replay_preview_session_allowlist", preview_source)
+        if (
+            "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_PREFIX_ALLOWLIST"
+            not in os.environ
+        ):
+            c.active_replay_preview_session_prefix_allowlist = (
+                preview_prefix_allowlist
+            )
+            _record(
+                "active_replay_preview_session_prefix_allowlist",
+                preview_source,
+            )
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
@@ -1251,6 +1297,13 @@ class LCMConfig:
         if raw_preview_allowlist is not None:
             c.active_replay_preview_session_allowlist = _parse_pattern_list(
                 raw_preview_allowlist
+            )
+        raw_preview_prefix_allowlist = os.environ.get(
+            "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_PREFIX_ALLOWLIST"
+        )
+        if raw_preview_prefix_allowlist is not None:
+            c.active_replay_preview_session_prefix_allowlist = _parse_pattern_list(
+                raw_preview_prefix_allowlist
             )
         c._normalize_reconcile_budget()
         c._normalize_background_compaction()

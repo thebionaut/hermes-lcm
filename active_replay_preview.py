@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 import hashlib
 from typing import Any, Collection, Mapping, Sequence
 
@@ -41,6 +42,23 @@ class ActiveReplayPreviewDecision:
     projected_tokens: int = 0
     tokens_saved: int = 0
     refs: tuple[str, ...] = ()
+
+
+def session_matches_preview_allowlist(
+    session_id: str,
+    *,
+    exact_sessions: Collection[str] = (),
+    prefix_patterns: Collection[str] = (),
+) -> bool:
+    """Match an exact ID or an anchored shell-style prefix pattern."""
+    value = str(session_id or "")
+    if value in {str(item) for item in exact_sessions}:
+        return True
+    return any(
+        fnmatchcase(value, f"{str(pattern)}*")
+        for pattern in prefix_patterns
+        if str(pattern)
+    )
 
 
 def _textual_content(content: Any) -> str | None:
@@ -314,4 +332,5 @@ __all__ = [
     "ActiveReplayPreviewPolicy",
     "PREVIEW_PREFIX",
     "project_externalized_tool_results",
+    "session_matches_preview_allowlist",
 ]
