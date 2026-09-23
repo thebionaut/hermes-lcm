@@ -353,6 +353,29 @@ def _provider_permit_owned_by_process(
     )
 
 
+_LOCAL_DIAGNOSTIC_EXCEPTION_TYPES = (
+    TypeError,
+    AttributeError,
+    KeyError,
+    IndexError,
+    NameError,
+    ValueError,
+)
+_LOCAL_ERROR_CREDENTIAL_LABEL = re.compile(
+    r"(?i)\b(?:api[_-]?key|token|secret|password|authorization|bearer)\b"
+    r"(?:\s*[:=]\s*|\s+)?[^\s,;]*"
+)
+_LOCAL_ERROR_OPAQUE_RUN = re.compile(r"[A-Za-z0-9+/=]{20,}")
+_LOCAL_ERROR_EXCERPT_CHARS = 200
+
+
+def _local_error_excerpt(error: BaseException) -> str:
+    text = " ".join(str(error).split())
+    text = _LOCAL_ERROR_CREDENTIAL_LABEL.sub("<redacted>", text)
+    text = _LOCAL_ERROR_OPAQUE_RUN.sub("<redacted>", text)
+    return text[:_LOCAL_ERROR_EXCERPT_CHARS]
+
+
 def _sanitize_error(error: BaseException | str | None) -> str:
     if isinstance(error, BaseException):
         type_name = re.sub(
@@ -377,10 +400,15 @@ def _sanitize_error(error: BaseException | str | None) -> str:
         status_hint = ""
         if isinstance(status, int) and 100 <= status <= 999:
             status_hint = f":http_{status}"
-        # Provider exception bodies can contain credentials, prompts, or
-        # response payloads. Persist only an allowlisted category, never the
-        # arbitrary exception message.
-        return f"{type_name}:{category}{status_hint}"[:_MAX_ERROR_CHARS]
+        # Keep the established Type:category prefix stable. Only local defect
+        # classes receive a bounded, credential-scrubbed diagnostic excerpt;
+        # provider-origin exception bodies retain the historical short form.
+        prefix = f"{type_name}:{category}{status_hint}"
+        if isinstance(error, _LOCAL_DIAGNOSTIC_EXCEPTION_TYPES):
+            excerpt = _local_error_excerpt(error)
+            if excerpt:
+                return f"{prefix}:{excerpt}"[:_MAX_ERROR_CHARS]
+        return prefix[:_MAX_ERROR_CHARS]
     text = str(error or "")
     text = re.sub(
         r"(?i)\b(api[-_ ]?key|access[-_ ]?token|authorization|bearer|password|secret|token)\b\s*[:=]\s*[^\s,;]+",
