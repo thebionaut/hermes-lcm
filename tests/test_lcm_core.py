@@ -4398,7 +4398,7 @@ class TestEscalation:
     def test_truncate_long(self):
         result = _deterministic_truncate("A" * 10000, 100)
         assert len(result) < 10000
-        assert "deterministic truncation" in result
+        assert "active recall incomplete" in result
 
     def test_truncate_short(self):
         assert _deterministic_truncate("hello", 1000) == "hello"

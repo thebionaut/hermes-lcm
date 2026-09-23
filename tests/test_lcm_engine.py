@@ -21068,11 +21068,10 @@ class TestAssemblyGuardrails:
             {"role": "assistant", "content": "b" * 40},
         ]
 
-        result = instance.compress(messages, current_tokens=90)
+        with pytest.raises(RuntimeError, match="cannot fit the durable archive locator"):
+            instance.compress(messages, current_tokens=90)
 
-        assert result == [messages[0], messages[-1]]
         assert instance.compression_count == 1
-        assert instance._ingest_cursor == len(result)
         assert not instance.get_status()["overflow_recovery_failed"]
 
     def test_forced_overflow_recovery_reserves_provider_overhead(self, tmp_path, monkeypatch):
@@ -21105,10 +21104,10 @@ class TestAssemblyGuardrails:
             {"role": "assistant", "content": "b" * 40},
         ]
 
-        result = instance.compress(messages, current_tokens=100)
+        with pytest.raises(RuntimeError, match="cannot fit the durable archive locator"):
+            instance.compress(messages, current_tokens=100)
 
-        assert result == [messages[0], messages[-1]]
-        assert lcm_engine_module.count_messages_tokens(result) < 70
+        assert not instance.get_status()["overflow_recovery_failed"]
 
     def test_forced_overflow_recovery_does_not_duplicate_existing_summary_message(self, tmp_path, monkeypatch):
         import importlib
@@ -21194,10 +21193,10 @@ class TestAssemblyGuardrails:
             {"role": "user", "content": "b" * 80},
         ]
 
-        result = instance.compress(messages, current_tokens=110)
+        with pytest.raises(RuntimeError, match="cannot fit the durable archive locator"):
+            instance.compress(messages, current_tokens=110)
 
-        assert result == [messages[0], messages[-1]]
-        assert instance.get_status()["overflow_recovery_failed"]
+        assert not instance.get_status()["overflow_recovery_failed"]
 
     def test_overflow_recovery_failure_flag_resets_after_successful_compression(self, tmp_path, monkeypatch):
         import importlib
@@ -21235,8 +21234,9 @@ class TestAssemblyGuardrails:
             {"role": "assistant", "content": "a" * 20},
             {"role": "user", "content": "b" * 80},
         ]
-        instance.compress(failed_messages, current_tokens=110)
-        assert instance.get_status()["overflow_recovery_failed"]
+        with pytest.raises(RuntimeError, match="cannot fit the durable archive locator"):
+            instance.compress(failed_messages, current_tokens=110)
+        assert not instance.get_status()["overflow_recovery_failed"]
 
         success_messages = [
             {"role": "system", "content": "s" * 10},
@@ -22078,8 +22078,8 @@ class TestAssemblyToolPairGuardrail:
             )
             assert stub_found, f"Missing stub for tool_call_id {cid}"
 
-    def test_overflow_recovery_fallback_removes_orphan_tool_result(self, tmp_path):
-        """Overflow recovery fallback must not return a bare orphan tool result."""
+    def test_overflow_recovery_fails_closed_for_unarchived_orphan_tool_result(self, tmp_path):
+        """Unarchived raw is never evicted merely to repair an orphan tool result."""
         config = LCMConfig(
             fresh_tail_count=10,
             database_path=str(tmp_path / "lcm_overflow_orphan.db"),
@@ -22095,20 +22095,17 @@ class TestAssemblyToolPairGuardrail:
             {"role": "tool", "tool_call_id": "call_orphan", "content": "orphan tool result"},
         ]
 
-        result = instance._assemble_overflow_recovery_context(
-            sys_msg,
-            tail_messages,
-            assembly_cap_override=1,
-        )
+        with pytest.raises(
+            RuntimeError, match="overflow recovery refused to evict an unarchived raw tail"
+        ):
+            instance._assemble_overflow_recovery_context(
+                sys_msg,
+                tail_messages,
+                assembly_cap_override=1,
+            )
 
-        orphan_ids = [
-            m.get("tool_call_id") for m in result
-            if m.get("role") == "tool" and m.get("tool_call_id") == "call_orphan"
-        ]
-        assert len(orphan_ids) == 0, f"Overflow fallback leaked orphan tool result: {orphan_ids}"
-
-    def test_overflow_recovery_fallback_inserts_stub_for_missing_tool_result(self, tmp_path):
-        """Overflow recovery fallback must sanitize an assistant tool_call-only tail."""
+    def test_overflow_recovery_fails_closed_for_unarchived_missing_tool_result(self, tmp_path):
+        """Unarchived tool-call state remains visible instead of being synthesized away."""
         config = LCMConfig(
             fresh_tail_count=10,
             database_path=str(tmp_path / "lcm_overflow_stub.db"),
@@ -22126,17 +22123,14 @@ class TestAssemblyToolPairGuardrail:
             },
         ]
 
-        result = instance._assemble_overflow_recovery_context(
-            sys_msg,
-            tail_messages,
-            assembly_cap_override=1,
-        )
-
-        stub_ids = [
-            m.get("tool_call_id") for m in result
-            if m.get("role") == "tool" and m.get("tool_call_id") == "call_missing"
-        ]
-        assert len(stub_ids) >= 1, f"Overflow fallback missing stub tool result: {stub_ids}"
+        with pytest.raises(
+            RuntimeError, match="overflow recovery refused to evict an unarchived raw tail"
+        ):
+            instance._assemble_overflow_recovery_context(
+                sys_msg,
+                tail_messages,
+                assembly_cap_override=1,
+            )
 
     def test_sanitize_tool_pairs_is_idempotent(self, tmp_path):
         """Applying the helper twice must not change the result again."""

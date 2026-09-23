@@ -152,7 +152,37 @@ def model_switch_summary_policy(engine, *, custom_providers, deadline, cancel_ev
         budget = resolve_context_budget(**budget_kwargs)
         if not budget.metadata_known:
             raise ValueError('configured compression context limit is unverified')
-        limits.append(budget.safe_input_tokens)
+        instructions = _preparation_instructions(config)
+        safe_input = max(0, int(budget.safe_input_tokens))
+        context_window = max(0, int(budget.context_window))
+
+        def route_fits(source_tokens: int) -> bool:
+            requested = min(12_000, max(2_000, int(source_tokens * 0.20)))
+            reserved_output = requested * 2
+            framing = count_tokens(
+                _build_l1_prompt(
+                    "", requested, 0, custom_instructions=instructions
+                )
+            )
+            return source_tokens + framing <= min(
+                safe_input,
+                max(0, context_window - reserved_output),
+            )
+
+        low, high = 0, min(safe_input, context_window)
+        while low <= high:
+            probe = (low + high) // 2
+            if route_fits(probe):
+                low = probe + 1
+            else:
+                high = probe - 1
+        route_usable_source = high
+        if route_usable_source <= 0:
+            raise ValueError(
+                'configured compression route has no usable source budget '
+                'after output and prompt reserves'
+            )
+        limits.append(route_usable_source)
         routes[route] = (client, provider, model, base, mode)
 
     def admit_request(prompt, output, route):
@@ -169,17 +199,23 @@ def model_switch_summary_policy(engine, *, custom_providers, deadline, cancel_ev
 
     def admit_chunk(messages):
         text = serialize(messages)
-        # The host preparer never requests more than 12K summary tokens. Check
-        # both escalation prompts at that upper bound before packing a chunk.
-        l2 = int(12000 * config.l2_budget_ratio)
+        source_tokens = count_tokens(text)
+        requested = min(12_000, max(2_000, int(source_tokens * 0.20)))
+        l2 = int(requested * config.l2_budget_ratio)
         instructions = _preparation_instructions(config)
-        prompts = ((_build_l1_prompt(text, 12000, 0, custom_instructions=instructions), 24000),
+        prompts = ((_build_l1_prompt(text, requested, 0, custom_instructions=instructions), requested * 2),
                    (_build_l2_prompt(text, l2, custom_instructions=instructions), l2 * 2))
         return all(admit_request(prompt, output, route)
                    for route in routes for prompt, output in prompts)
 
-    return SimpleNamespace(source_limit=min(limits), admit_request=admit_request,
-                           preferred_chunk_tokens=config.leaf_chunk_tokens,
+    usable_source_limit = min(limits)
+    return SimpleNamespace(
+        source_limit=usable_source_limit,
+        admit_request=admit_request,
+        preferred_chunk_tokens=min(
+            int(config.leaf_chunk_tokens),
+            usable_source_limit,
+        ),
                            admit_chunk=admit_chunk,
                            prepare_sources=lambda prefix, tail: prepare_model_switch_sources(
                                engine, prefix, tail, deadline=deadline),

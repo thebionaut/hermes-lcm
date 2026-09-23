@@ -186,11 +186,47 @@ def test_summary_policy_resolves_runtime_and_checks_complete_prompts(engine, mon
     monkeypatch.setattr(model_metadata, 'estimate_request_tokens_rough', lambda *a, **kw: 1000)
     policy = preparation.model_switch_summary_policy(
         engine, custom_providers=[], deadline=time.monotonic() + 30, cancel_event=threading.Event())
-    assert policy.source_limit == 80000
+    assert 0 < policy.source_limit < 76000
+    assert policy.preferred_chunk_tokens == engine._config.leaf_chunk_tokens
     assert policy.admit_chunk([{'role': 'user', 'content': 'original details'}])
     assert len(calls) == 4
     assert all('original details' in row[2][0]['content'] for row in calls)
-    assert {row[3] for row in calls} == {24000, int(12000 * engine._config.l2_budget_ratio) * 2}
+    assert {row[3] for row in calls} == {4_000, 2_000}
+
+
+def test_small_summarizer_reduces_only_its_chunk_budget(engine, monkeypatch):
+    from agent import auxiliary_client as auxiliary, context_admission
+
+    client = SimpleNamespace(base_url='https://configured.invalid/v1')
+    engine.context_length = 1_000_000
+    monkeypatch.setattr(auxiliary, '_resolve_task_provider_model',
+                        lambda task, **kw: ('test-provider', kw.get('model'), None, None, None))
+    monkeypatch.setattr(auxiliary, '_get_cached_client',
+                        lambda provider, model, **kw: (client, model))
+    monkeypatch.setattr(auxiliary, '_effective_provider_for_client',
+                        lambda client, provider: provider)
+    monkeypatch.setattr(auxiliary, '_fallback_provider_from_label', lambda provider: provider)
+    monkeypatch.setattr(auxiliary, '_get_task_extra_body', lambda task: {})
+    monkeypatch.setattr(auxiliary, '_build_call_kwargs',
+                        lambda provider, model, messages, **kw: {
+                            'model': model, 'messages': messages,
+                            'max_tokens': kw['max_tokens']})
+
+    def budget(**kwargs):
+        if kwargs['model'] == 'fallback/model':
+            return SimpleNamespace(metadata_known=True, safe_input_tokens=10_000,
+                                   context_window=12_000)
+        return SimpleNamespace(metadata_known=True, safe_input_tokens=800_000,
+                               context_window=1_000_000)
+
+    monkeypatch.setattr(context_admission, 'resolve_context_budget', budget)
+    policy = preparation.model_switch_summary_policy(
+        engine, custom_providers=[], deadline=time.monotonic() + 30,
+        cancel_event=threading.Event())
+
+    assert 0 < policy.source_limit < 8_000
+    assert policy.preferred_chunk_tokens == policy.source_limit
+    assert engine.context_length == 1_000_000
 
 
 def test_summary_policy_pins_context_capability_for_each_route_without_prompt_mutation(
@@ -243,7 +279,7 @@ def test_summary_policy_pins_context_capability_for_each_route_without_prompt_mu
         }], registry_version=37,
         deadline=time.monotonic() + 30, cancel_event=threading.Event())
 
-    assert policy.source_limit == 80000
+    assert 0 < policy.source_limit < 76000
     assert policy.admit_request('physical prompt', 100, 'primary/model')
     assert [row[2] for row in resolved] == [
         'primary/model', 'fallback/model', 'primary/model']

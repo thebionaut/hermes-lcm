@@ -415,6 +415,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
+    # Explicit host capability: LCM validates and sizes every summarizer request
+    # against its selected auxiliary route. The host may therefore keep the main
+    # model's context threshold independent from a smaller summarizer's window.
+    # Core must check this opt-in, never infer it from a non-ContextCompressor type.
+    owns_summary_request_budget = True
+
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
@@ -10446,6 +10452,69 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         return max(1, min(caps))
 
+    def _overflow_retained_raw_reference(
+        self,
+        tail_messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> Dict[str, Any] | None:
+        """Return a bounded reference only when every raw tail row is durable.
+
+        Overflow assembly may hide raw rows from the provider-visible request,
+        but it must never imply that an unpersisted region is covered. Synthetic
+        context projections are already derived from canonical DAG state and are
+        therefore excluded from this raw-row proof.
+        """
+        raw_messages = [
+            message
+            for message in tail_messages
+            if not (
+                message.get("display_kind") == "context_projection"
+                or self._looks_like_active_summary_blob(
+                    normalize_content_value(message.get("content")) or ""
+                )
+            )
+        ]
+        if not raw_messages:
+            return None
+        id_map = self._get_store_id_map_for_messages(
+            raw_messages,
+            deadline=deadline,
+        )
+        from .historical_projection import source_ids
+
+        durable_ids: list[int] = []
+        for message in raw_messages:
+            mapped = source_ids(id_map, message)
+            if not mapped:
+                return None
+            durable_ids.extend(int(store_id) for store_id in mapped)
+        durable_ids = sorted(dict.fromkeys(durable_ids))
+        if not durable_ids:
+            return None
+        session_id = str(self._session_id or "")
+        content = (
+            "[LCM active recall incomplete; raw archive retained outside active context] "
+            f"session={session_id} archived_range={durable_ids[0]}..{durable_ids[-1]} "
+            f"mapped_rows={len(durable_ids)}. This is an archive locator, not a "
+            "summary or claim of semantic preservation; inspect raw rows explicitly."
+        )
+        return {
+            "role": "user",
+            "content": content,
+            "display_kind": "context_projection",
+            "display_metadata": {
+                "engine": "lcm",
+                "projection": "retained_raw_reference",
+                "session_id": session_id,
+                "first_store_id": durable_ids[0],
+                "last_store_id": durable_ids[-1],
+                "mapped_rows": len(durable_ids),
+                "active_recall_incomplete": True,
+                "semantic_coverage": False,
+            },
+        }
+
     # -- Internal: helpers -------------------------------------------------
 
     def _assemble_overflow_recovery_context(
@@ -10461,6 +10530,64 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context reconstruction",
             "overflow recovery entry",
         )
+        retained_reference: Dict[str, Any] | None = None
+        effective_cap = assembly_cap_override
+        requires_budget_eviction = False
+        if effective_cap is not None and tail_messages:
+            projected_tail = self._call_foreground_projection(
+                self._stub_large_tool_results_for_active_replay,
+                tail_messages,
+                deadline=deadline,
+                stage="overflow coverage projection probe",
+            )
+            projected_tail = list(projected_tail or tail_messages)
+            projected_tokens = count_messages_tokens(projected_tail)
+            if system_msg is not None:
+                projected_tokens += count_message_tokens(system_msg)
+            requires_budget_eviction = projected_tokens > int(effective_cap)
+        if requires_budget_eviction:
+            retained_reference = self._overflow_retained_raw_reference(
+                tail_messages,
+                deadline=deadline,
+            )
+            if retained_reference is None:
+                raise RuntimeError(
+                    "overflow recovery refused to evict an unarchived raw tail"
+                )
+            reference_tokens = count_message_tokens(retained_reference)
+            effective_cap = int(effective_cap or 0) - reference_tokens
+            if effective_cap <= 0:
+                raise RuntimeError(
+                    "overflow recovery cap cannot fit the durable archive locator"
+                )
+
+        def attach_retained_reference(
+            candidate: List[Dict[str, Any]],
+        ) -> List[Dict[str, Any]]:
+            if retained_reference is None:
+                return candidate
+            projected = list(candidate)
+            insert_at = (
+                1
+                if projected and projected[0].get("role") == "system"
+                else 0
+            )
+            projected.insert(insert_at, retained_reference)
+            cleaned = self._call_foreground_projection(
+                self._sanitize_active_context_messages,
+                projected,
+                deadline=deadline,
+                stage="overflow retained-raw reference cleanup",
+            )
+            result = list(cleaned or projected)
+            if assembly_cap_override is not None and count_messages_tokens(result) > int(
+                assembly_cap_override
+            ):
+                raise RuntimeError(
+                    "overflow recovery exceeded its hard assembly cap"
+                )
+            return result
+
         if tail_messages:
             first = tail_messages[0]
             content = first.get("content") or ""
@@ -10470,7 +10597,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     self._assemble_context,
                     system_msg,
                     tail_messages[1:],
-                    assembly_cap_override=assembly_cap_override,
+                    assembly_cap_override=effective_cap,
                     include_lcm_note=False,
                     deadline=deadline,
                 )
@@ -10483,13 +10610,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     (msg.get("content") or "") == content
                     for msg in (candidate[1:] if system_msg is not None else candidate)
                 ):
-                    return candidate
+                    return attach_retained_reference(candidate)
 
         candidate = self._call_with_foreground_deadline(
             self._assemble_context,
             system_msg,
             tail_messages,
-            assembly_cap_override=assembly_cap_override,
+            assembly_cap_override=effective_cap,
             include_lcm_note=False,
             deadline=deadline,
         )
@@ -10500,6 +10627,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         minimum_candidate_len = 1 if system_msg is not None else 0
         if len(candidate) == minimum_candidate_len and tail_messages:
+            if retained_reference is not None:
+                # The bounded locator is the only provider-visible replacement
+                # for evicted durable raw. Never re-add an unbounded raw row.
+                return attach_retained_reference(candidate)
             fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
             fallback = self._call_foreground_projection(
                 self._sanitize_active_context_messages,
@@ -10512,8 +10643,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "context reconstruction",
                 "overflow recovery fallback",
             )
-            return fallback
-        return candidate
+            return attach_retained_reference(list(fallback or []))
+        return attach_retained_reference(candidate)
 
     @staticmethod
     def _looks_like_active_summary_blob(content: str) -> bool:
