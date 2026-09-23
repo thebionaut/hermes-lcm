@@ -217,7 +217,11 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {
+    "context_threshold",
+    "active_replay_preview_enabled",
+    "active_replay_preview_session_allowlist",
+}
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -267,6 +271,35 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
     except Exception:
         return default, "default"
     return default, "default"
+
+
+def _hermes_active_replay_preview_policy() -> tuple[bool, list[str], str]:
+    """Load an exact-session preview canary from config.yaml, failing closed."""
+    cfg = _load_hermes_config_yaml()
+    try:
+        lcm_section = cfg.get("lcm") or {}
+        if not isinstance(lcm_section, dict):
+            return False, [], "default"
+        enabled = lcm_section.get("active_replay_preview_enabled") is True
+        raw_allowlist = lcm_section.get("active_replay_preview_session_allowlist")
+        if isinstance(raw_allowlist, str):
+            allowlist = _parse_pattern_list(raw_allowlist)
+        elif isinstance(raw_allowlist, (list, tuple)):
+            allowlist = list(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in raw_allowlist
+                    if str(value).strip()
+                )
+            )
+        else:
+            allowlist = []
+        source = "config_yaml:lcm.active_replay_preview"
+        if not enabled or not allowlist:
+            return False, allowlist, source
+        return True, allowlist, source
+    except Exception:
+        return False, [], "default"
 
 
 def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
@@ -1083,6 +1116,15 @@ class LCMConfig:
                 config_source_warnings.append(warning)
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        preview_enabled, preview_allowlist, preview_source = (
+            _hermes_active_replay_preview_policy()
+        )
+        if "LCM_ACTIVE_REPLAY_PREVIEW_ENABLED" not in os.environ:
+            c.active_replay_preview_enabled = preview_enabled
+            _record("active_replay_preview_enabled", preview_source)
+        if "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_ALLOWLIST" not in os.environ:
+            c.active_replay_preview_session_allowlist = preview_allowlist
+            _record("active_replay_preview_session_allowlist", preview_source)
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.

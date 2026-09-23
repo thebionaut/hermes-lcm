@@ -313,6 +313,49 @@ def test_preview_allowlist_and_policy_version_load_from_environment(monkeypatch)
     )
 
 
+def test_preview_allowlist_loads_from_config_yaml_and_fails_closed(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        """
+lcm:
+  active_replay_preview_enabled: true
+  active_replay_preview_session_allowlist:
+    - build-session
+    - long-session
+    - build-session
+""".strip()
+        + "\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_ACTIVE_REPLAY_PREVIEW_ENABLED", raising=False)
+    monkeypatch.delenv(
+        "LCM_ACTIVE_REPLAY_PREVIEW_SESSION_ALLOWLIST", raising=False
+    )
+
+    config = LCMConfig.from_env()
+
+    assert config.active_replay_preview_enabled is True
+    assert config.active_replay_preview_session_allowlist == [
+        "build-session",
+        "long-session",
+    ]
+    assert config.ignored_config_yaml_lcm_keys == []
+
+    (hermes_home / "config.yaml").write_text(
+        """
+lcm:
+  active_replay_preview_enabled: true
+  active_replay_preview_session_allowlist: []
+""".strip()
+        + "\n"
+    )
+
+    fail_closed = LCMConfig.from_env()
+    assert fail_closed.active_replay_preview_enabled is False
+    assert fail_closed.active_replay_preview_session_allowlist == []
+
+
 def test_preview_does_not_cancel_raw_backlog_job_or_change_captured_source(tmp_path):
     content = _payload()
     config = _config(
