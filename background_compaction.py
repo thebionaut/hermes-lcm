@@ -8360,7 +8360,12 @@ class BackgroundCompactionStore:
             else []
         )
         attempts = [dict(item) for item in raw_attempts if isinstance(item, Mapping)]
-        if attempts and terminal_reason:
+        guard_only_terminal = bool(
+            attempts
+            and terminal_reason in {"provider_circuit_open", "provider_spend_guard"}
+            and all(str(item.get("outcome") or "") == "skipped" for item in attempts)
+        )
+        if attempts and terminal_reason and not guard_only_terminal:
             # The runner's terminal observation wins over an incomplete trace
             # snapshot or a provider success that arrived after the absolute
             # deadline / durable lease loss.  Reclassifying the final logical
