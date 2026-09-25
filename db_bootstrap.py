@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Iterable, Sequence
 
+from .host_admission import acquire_background_admission
+
 logger = logging.getLogger(__name__)
 
 
@@ -2501,6 +2503,8 @@ BACKGROUND_INTEGRITY_ENV = "LCM_FTS_INTEGRITY_BACKGROUND"
 # treated as a crashed scan, so a later bind re-dispatches instead of wedging
 # forever behind a stamp no live thread will ever clear.
 INTEGRITY_SCAN_STALE_SECONDS = 15 * 60.0
+# Bound cross-process claim acquisition while retaining retirement admission.
+INTEGRITY_SCAN_CLAIM_TIMEOUT_MS = 50
 
 # Guards the in-process registry and the one-scan-at-a-time decision below.
 _integrity_scan_lock = threading.Lock()
@@ -2701,48 +2705,77 @@ def _dispatch_background_integrity_scan(
     db_path = _database_path_for_connection(conn)
     if not db_path or db_path == ":memory:":
         return False
-    current = time.time() if now is None else now
-    key = (db_path, spec.table_name)
-    with _integrity_scan_lock:
-        existing = _integrity_scan_threads.get(key)
-        if existing is not None and existing.is_alive():
-            return True
-        started = _load_scan_started_at(conn, spec)
-        if started is not None and (current - started) < INTEGRITY_SCAN_STALE_SECONDS:
-            # A recent scan (this or another process) owns this table; let it
-            # stamp the marker. The bind returns fast without a duplicate scan.
-            return True
-        # Durably claim the scan cross-process BEFORE starting the thread. The
-        # spawned thread stamps ``scan_started_at`` on its own connection, but
-        # ``thread.start()`` returns before that stamp is committed — a second
-        # process racing ``ensure_external_content_fts`` in that window would read
-        # no stamp and dispatch a duplicate deep scan (F6). Writing the stamp here
-        # under BEGIN IMMEDIATE closes that window; best-effort (a transient lock
-        # just falls back to the thread's own stamp).
-        claim_timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
-        try:
-            claim_conn = sqlite3.connect(
-                db_path, timeout=claim_timeout, check_same_thread=False
-            )
-            try:
-                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                claim_conn.execute("BEGIN IMMEDIATE")
-                _record_scan_started(claim_conn, spec, now=current)
-                claim_conn.commit()
-            finally:
-                claim_conn.close()
-        except sqlite3.DatabaseError:
-            pass
-
-        thread = threading.Thread(
-            target=_run_background_integrity_scan,
-            args=(db_path, spec, current),
-            name=f"lcm-fts-integrity-{spec.table_name}",
-            daemon=True,
-        )
-        _integrity_scan_threads[key] = thread
-        thread.start()
+    admission = acquire_background_admission()
+    if admission is None:
+        # Deferred, not synchronous fallback. A later bind retries after cancel
+        # or expiry; committed retirement never starts another background scan.
         return True
+    launched = False
+    try:
+        current = time.time() if now is None else now
+        key = (db_path, spec.table_name)
+        with _integrity_scan_lock:
+            existing = _integrity_scan_threads.get(key)
+            if existing is not None and existing.is_alive():
+                return True
+            started = _load_scan_started_at(conn, spec)
+            if started is not None and (current - started) < INTEGRITY_SCAN_STALE_SECONDS:
+                # A recent scan (this or another process) owns this table; let it
+                # stamp the marker. The bind returns fast without a duplicate scan.
+                return True
+            # Durably claim the scan cross-process BEFORE starting the thread. The
+            # spawned thread stamps ``scan_started_at`` on its own connection, but
+            # ``thread.start()`` returns before that stamp is committed — a second
+            # process racing ``ensure_external_content_fts`` in that window would read
+            # no stamp and dispatch a duplicate deep scan (F6). Writing the stamp here
+            # under BEGIN IMMEDIATE, with a second read inside that transaction,
+            # closes the check/use window between independent processes.
+            claim_timeout = INTEGRITY_SCAN_CLAIM_TIMEOUT_MS / 1000.0
+            try:
+                claim_conn = sqlite3.connect(
+                    db_path, timeout=claim_timeout, check_same_thread=False
+                )
+                try:
+                    claim_conn.execute(f"PRAGMA busy_timeout={INTEGRITY_SCAN_CLAIM_TIMEOUT_MS}")
+                    claim_conn.execute("BEGIN IMMEDIATE")
+                    started = _load_scan_started_at(claim_conn, spec)
+                    if started is not None and (current - started) < INTEGRITY_SCAN_STALE_SECONDS:
+                        return True
+                    _record_scan_started(claim_conn, spec, now=current)
+                    claim_conn.commit()
+                finally:
+                    claim_conn.close()
+            except sqlite3.DatabaseError:
+                # Do not launch an unclaimed scan or block startup with a fallback
+                # deep check. No checked/failed marker changes; a later bind retries.
+                return True
+
+            thread = threading.Thread(
+                target=_run_admitted_integrity_scan,
+                args=(admission, db_path, spec, current),
+                name=f"lcm-fts-integrity-{spec.table_name}",
+                daemon=True,
+            )
+            _integrity_scan_threads[key] = thread
+            try:
+                thread.start()
+            except BaseException:
+                _integrity_scan_threads.pop(key, None)
+                # The cross-process stamp has its normal stale-claim recovery.
+                # Do not run a synchronous scan or hide a thread startup failure.
+                raise
+            launched = True
+            return True
+    finally:
+        if not launched:
+            admission.release()
+
+
+def _run_admitted_integrity_scan(admission, db_path, spec, started_at):
+    try:
+        _run_background_integrity_scan(db_path, spec, started_at)
+    finally:
+        admission.release()
 
 
 def join_background_integrity_scans(timeout: float | None = None) -> None:

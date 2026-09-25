@@ -31,6 +31,7 @@ from .db_bootstrap import (
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
+from .host_admission import acquire_background_admission
 from .fresh_tail import resolve_fresh_tail_boundary
 from .summary_serialization import filter_summary_messages, serialize_summary_messages
 from .tokens import count_message_tokens, count_tokens
@@ -10189,17 +10190,42 @@ class _BackgroundRuntime:
     def _run(self) -> None:
         owner = f"process-{os.getpid()}-worker-{threading.get_ident()}"
         seen_generation = 0
+        while True:
+            with self._condition:
+                if self._stopping:
+                    return
+            admission = acquire_background_admission()
+            delay = 1.0
+            if admission is not None:
+                try:
+                    delay = self._run_admitted_cycle(owner)
+                finally:
+                    # Include store.close()/WAL cleanup before declaring idle.
+                    admission.release()
+                if delay is None:
+                    return
+            with self._condition:
+                if self._stopping:
+                    return
+                if self._wake_generation != seen_generation:
+                    seen_generation = self._wake_generation
+                    continue
+                self._condition.wait(timeout=delay)
+                seen_generation = self._wake_generation
+
+    def _run_admitted_cycle(self, owner: str) -> float | None:
+        """Drain available jobs; close the store before waiting without a lease."""
         try:
             store = BackgroundCompactionStore(self.db_path, config=self.config)
         except BaseException:
             logger.exception("LCM background worker could not open its private store")
-            return
+            return None
         try:
             store.recover_expired_leases()
             while True:
                 with self._condition:
                     if self._stopping:
-                        return
+                        return None
                 try:
                     job = store.run_next_job(
                         owner=owner,
@@ -10226,15 +10252,7 @@ class _BackgroundRuntime:
                     job = None
                 if job is not None and job.state == "prepared":
                     continue
-                delay = store._next_maintenance_delay()
-                with self._condition:
-                    if self._stopping:
-                        return
-                    if self._wake_generation != seen_generation:
-                        seen_generation = self._wake_generation
-                        continue
-                    self._condition.wait(timeout=delay)
-                    seen_generation = self._wake_generation
+                return store._next_maintenance_delay()
         finally:
             store.close()
 
