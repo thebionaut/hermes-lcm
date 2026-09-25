@@ -792,6 +792,95 @@ class MessageStore:
                     earliest[identity] = int(stored["store_id"])
         return earliest
 
+    def latest_canonical_store_ids_for_messages(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+    ) -> List[int | None]:
+        """Locate each host message's stored rows; return the latest one.
+
+        A host message is matched by role + tool_call_id + host timestamp
+        (content may have been rewritten by the host or by ingest protection;
+        every stored variant with that key is a distinct canonical row). The
+        latest non-duplicate row of the key is returned so a caller retiring
+        the message only does so once every stored variant is covered.
+        Messages without a host timestamp match stored rows without one by
+        exact role + content, walking forward in caller order. ``None`` marks
+        a message with no stored row.
+        """
+        keys: list[tuple[str, str, float] | None] = []
+        observed_values: list[float] = []
+        for msg in messages:
+            observed_at = _normalize_observed_at(msg.get("timestamp"))
+            if observed_at is None:
+                keys.append(None)
+                continue
+            observed_values.append(observed_at)
+            keys.append((
+                str(msg.get("role") or "unknown"),
+                str(msg.get("tool_call_id") or ""),
+                round(observed_at, 6),
+            ))
+        latest: Dict[tuple[str, str, float], int] = {}
+        results: List[int | None] = []
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+        ) as conn:
+            observed = sorted(set(observed_values))
+            seen_identities: set[tuple[Any, ...]] = set()
+            for start in range(0, len(observed), 400):
+                chunk = observed[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                       WHERE session_id = ? AND observed_at IN ({placeholders})
+                       ORDER BY store_id""",
+                    (session_id, *chunk),
+                ).fetchall()
+                for row in rows:
+                    stored = self._row_to_dict(row)
+                    identity = message_dedupe_identity(stored, stored_row=True)
+                    if identity is None or identity in seen_identities:
+                        continue
+                    seen_identities.add(identity)
+                    key = (
+                        str(stored.get("role") or "unknown"),
+                        str(stored.get("tool_call_id") or ""),
+                        round(float(stored["observed_at"]), 6),
+                    )
+                    latest[key] = max(latest.get(key, 0), int(stored["store_id"]))
+            previous = 0
+            for msg, key in zip(messages, keys):
+                if key is not None:
+                    found = latest.get(key)
+                else:
+                    candidates = [
+                        int(item[0])
+                        for item in conn.execute(
+                            """SELECT store_id FROM messages
+                               WHERE session_id = ? AND role = ? AND observed_at IS NULL
+                                 AND content = ?
+                               ORDER BY store_id""",
+                            (
+                                session_id,
+                                str(msg.get("role") or "unknown"),
+                                _normalize_content_value(msg.get("content")),
+                            ),
+                        ).fetchall()
+                    ]
+                    later = [item for item in candidates if item >= previous]
+                    found = later[0] if later else (candidates[-1] if candidates else None)
+                results.append(found)
+                if found is not None:
+                    previous = max(previous, found)
+        return results
+
     def duplicate_store_id_aliases(
         self,
         session_id: str,

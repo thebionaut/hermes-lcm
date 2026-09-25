@@ -3348,6 +3348,94 @@ class BackgroundCompactionStore:
             return None
         return tuple(dict(message) for message in messages)
 
+    def capture_foreground_interval_snapshot(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        expected_frontier_store_id: int,
+        captured_watermark_store_id: int,
+        expected_source_store_ids: Sequence[int],
+        lock_timeout_seconds: float | None = None,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        busy_timeout_ms: int | None = None,
+    ) -> tuple[tuple[dict[str, Any], ...], dict[int, int], dict[int, float]] | None:
+        """Capture the whole durable interval a caller chunk lies within.
+
+        Used when the caller's active chunk does not map 1:1 onto the durable
+        interval (older builds stored duplicate copies; hosts rewrite or drop
+        turns). Returns ``(interval rows, {duplicate store_id: earliest
+        store_id})`` only when every caller id lies inside the interval or at or
+        below the frontier (directly or through its earliest identical row).
+        The caller must then summarize the durable rows, never the caller view.
+        """
+        from .store import message_dedupe_identity
+
+        frontier = int(expected_frontier_store_id or 0)
+        watermark = int(captured_watermark_store_id or 0)
+        expected_ids = tuple(int(item) for item in expected_source_store_ids)
+        if not expected_ids or watermark <= frontier:
+            return None
+        with self._bounded_read_connection(
+            lock_timeout_seconds=lock_timeout_seconds,
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            busy_timeout_ms=busy_timeout_ms,
+        ) as conn:
+            messages = self._load_source_range(
+                conn,
+                session_id=str(session_id),
+                conversation_id=str(conversation_id),
+                frontier=frontier,
+                watermark=watermark,
+            )
+            identity_rows = conn.execute(
+                """
+                SELECT store_id, role, content, tool_call_id, tool_calls, observed_at
+                FROM messages
+                WHERE session_id=? AND store_id<=? AND observed_at IN (
+                    SELECT observed_at FROM messages
+                    WHERE session_id=? AND store_id>? AND store_id<=?
+                      AND observed_at IS NOT NULL
+                )
+                ORDER BY store_id
+                """,
+                (str(session_id), watermark, str(session_id), frontier, watermark),
+            ).fetchall()
+        if not messages:
+            return None
+        earliest: dict[tuple[Any, ...], int] = {}
+        aliases: dict[int, int] = {}
+        observed_by_id: dict[int, float] = {}
+        for store_id, role, content, tool_call_id, tool_calls, observed_at in identity_rows:
+            if observed_at is not None:
+                observed_by_id[int(store_id)] = float(observed_at)
+            identity = message_dedupe_identity(
+                {
+                    "role": role,
+                    "content": content,
+                    "tool_call_id": tool_call_id,
+                    "tool_calls": tool_calls,
+                    "observed_at": observed_at,
+                },
+                stored_row=True,
+            )
+            if identity is None:
+                continue
+            kept = earliest.setdefault(identity, int(store_id))
+            if kept != int(store_id):
+                aliases[int(store_id)] = kept
+        interval_ids = {int(message["store_id"]) for message in messages}
+        for store_id in expected_ids:
+            if store_id <= frontier or store_id in interval_ids:
+                continue
+            canonical = aliases.get(store_id, store_id)
+            if canonical <= frontier or canonical in interval_ids:
+                continue
+            return None
+        return tuple(dict(message) for message in messages), aliases, observed_by_id
+
     def foreground_source_identity_hash(
         self,
         snapshot: Sequence[Mapping[str, Any]],

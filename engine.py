@@ -1930,6 +1930,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     "durable replay conversion",
                 )
             message = self._store.to_openai_msg(row)
+            if row.get("observed_at") is not None:
+                # Keep the host timestamp: it is the replay identity that
+                # later foreground lineage (interval summaries, ingest dedupe)
+                # uses to locate this message's stored rows.
+                message["timestamp"] = row.get("observed_at")
             message["_lcm_replay_store_id"] = int(row.get("store_id") or 0)
             replay.append(message)
         projected = self._call_foreground_projection(

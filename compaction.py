@@ -33,6 +33,10 @@ from .sanitize import _contains_sensitive_redaction
 from .sqlite_util import _is_sqlite_locked_error
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
+# Content of the tool-result stub inserted by the engine's tool-pair guardrail
+# (engine._sanitize_active_context_messages).
+_MISSING_TOOL_RESULT_STUB = "[Result from earlier conversation — see context summary above]"
+
 logger = logging.getLogger(__name__)
 
 _AUTOMATIC_FOREGROUND_MAX_PASSES = 1
@@ -1045,6 +1049,275 @@ class CompactionMixin:
             logger.debug(
                 "LCM active replay metadata write deferred by SQLite contention"
             )
+
+    def _foreground_chunk_source_ids(
+        self,
+        chunk: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> list[tuple[int, ...]] | None:
+        """Durable ids per caller message, or ``None`` if any message is unmapped.
+
+        Replay-identity lineage (host timestamp) first; the positional
+        reconcile mapping covers rows stored without a host timestamp.
+        """
+        from .historical_projection import source_ids
+
+        try:
+            located = self._store.latest_canonical_store_ids_for_messages(
+                self._session_id,
+                chunk,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+                lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                "foreground source snapshot",
+                "interval lineage read exceeded the shared deadline",
+            ) from exc
+        id_map = None
+        mapped: list[tuple[int, ...]] = []
+        for message, store_id in zip(chunk, located):
+            if store_id is not None:
+                mapped.append((int(store_id),))
+                continue
+            if (
+                message.get("role") == "tool"
+                and message.get("content") == _MISSING_TOOL_RESULT_STUB
+            ):
+                # Synthetic pairing stub from the tool-pair guardrail: carries
+                # no source content, so it needs no durable lineage.
+                mapped.append(())
+                continue
+            if id_map is None:
+                id_map = self._call_with_foreground_deadline(
+                    self._get_store_id_map_for_messages,
+                    chunk,
+                    deadline=deadline,
+                )
+            ids = tuple(int(item) for item in source_ids(id_map, message))
+            if not ids:
+                return None
+            mapped.append(ids)
+        return mapped
+
+    def _capture_foreground_interval(
+        self,
+        chunk: List[Dict[str, Any]],
+        prospective_store_ids: List[int],
+        *,
+        visible_messages: List[Dict[str, Any]] | None = None,
+        deadline: float | None = None,
+    ) -> tuple[tuple[dict[str, Any], ...], dict[int, int]] | None:
+        """Bind a non-1:1 caller chunk to the durable interval it lies within.
+
+        Beyond exact duplicates, an interval row outside the chunk is accepted
+        only when the caller's visible view (chunk plus fresh tail) shows the
+        same message: a tool result for a visible tool_call_id, a row with the
+        same role, tool_call_id and host timestamp, or one with the same role,
+        content and tool calls (hosts re-stamp timestamps on rewrites). Any
+        other row the caller cannot see (for example a concurrent sibling's
+        raw) refuses: it must never be retired behind the caller's back.
+        """
+        capture = getattr(
+            self._background_compaction,
+            "capture_foreground_interval_snapshot",
+            None,
+        )
+        if not callable(capture) or not prospective_store_ids:
+            return None
+        # Every caller message must have durable lineage: an unmapped message
+        # removed from the active view would be neither summarized nor kept.
+        mapped = self._foreground_chunk_source_ids(chunk, deadline=deadline)
+        if mapped is None:
+            return None
+        prospective_store_ids = sorted(
+            {int(item) for ids in mapped for item in ids}
+        )
+        try:
+            captured = capture(
+                conversation_id=self._conversation_id,
+                session_id=self._session_id,
+                expected_frontier_store_id=self._last_compacted_store_id,
+                captured_watermark_store_id=max(prospective_store_ids),
+                expected_source_store_ids=prospective_store_ids,
+                lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                "foreground source snapshot",
+                "interval snapshot lock wait exceeded the shared deadline",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            raise ForegroundDeadlineExceeded(
+                "foreground source snapshot",
+                "SQLite contention prevented a bounded interval snapshot",
+            ) from exc
+        if captured is None:
+            return None
+        snapshot, aliases, observed_by_id = captured
+        from .message_content import normalize_content_value
+        from .store import _canonical_identity_digest
+
+        def content_key(message: Mapping[str, Any]) -> tuple[str, str, str]:
+            return (
+                str(message.get("role") or ""),
+                _canonical_identity_digest(
+                    normalize_content_value(message.get("content")) or ""
+                ),
+                _canonical_identity_digest(message.get("tool_calls")),
+            )
+
+        timed_keys: set[tuple[str, str, float]] = set()
+        content_keys: set[tuple[str, str, str]] = set()
+        tool_result_ids: set[str] = set()
+        for message in list(chunk) + list(visible_messages or []):
+            if message.get("role") == "tool" and message.get("tool_call_id"):
+                tool_result_ids.add(str(message.get("tool_call_id")))
+            timestamp = message.get("timestamp")
+            role = str(message.get("role") or "")
+            if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool):
+                timed_keys.add((role, str(message.get("tool_call_id") or ""), round(float(timestamp), 6)))
+            content_keys.add(content_key(message))
+        mapped_ids = {int(item) for ids in mapped for item in ids}
+        for row in snapshot:
+            store_id = int(row.get("store_id") or 0)
+            if store_id in aliases or store_id in mapped_ids:
+                continue
+            role = str(row.get("role") or "")
+            if role == "tool" and str(row.get("tool_call_id") or "") in tool_result_ids:
+                # Another stored version of a result the caller shows (hosts
+                # clear old tool output in place; the guardrail stubs it).
+                continue
+            observed_at = observed_by_id.get(store_id)
+            if observed_at is not None and (
+                role,
+                str(row.get("tool_call_id") or ""),
+                round(observed_at, 6),
+            ) in timed_keys:
+                continue
+            if content_key(row) in content_keys:
+                continue
+            logger.info(
+                "LCM foreground interval refused: row %s is not visible to the caller "
+                "(session=%s)",
+                store_id,
+                self._session_id,
+            )
+            return None
+        return snapshot, aliases
+
+    def _interval_summary_input(
+        self,
+        snapshot: Sequence[Mapping[str, Any]],
+        aliases: Mapping[int, int],
+        *,
+        visible_messages: List[Dict[str, Any]] | None = None,
+    ) -> tuple[list[Dict[str, Any]], list[int]]:
+        """Summarizer input from durable interval rows.
+
+        Exact duplicate copies are skipped (their earliest row is summarized or
+        already covered), as are ignore-pattern rows and the assistant/tool
+        replies that depend on them, mirroring the caller-view filtering. A tool
+        result the caller still shows in a shorter form (hosts clear old tool
+        output in place) is summarized in that form; the full raw stays stored.
+        """
+        visible_tool_content = {
+            str(message.get("tool_call_id")): message.get("content")
+            for message in (visible_messages or [])
+            if message.get("role") == "tool"
+            and message.get("tool_call_id")
+            and message.get("content") != _MISSING_TOOL_RESULT_STUB
+        }
+        messages: list[Dict[str, Any]] = []
+        store_ids: list[int] = []
+        drop_dependent_reply = False
+        for row in snapshot:
+            store_id = int(row.get("store_id") or 0)
+            if store_id in aliases:
+                continue
+            role = str(row.get("role") or "")
+            message: Dict[str, Any] = {"role": role, "content": row.get("content") or ""}
+            if role == "tool" and str(row.get("tool_call_id") or "") in visible_tool_content:
+                visible_content = visible_tool_content[str(row.get("tool_call_id"))] or ""
+                if len(str(visible_content)) < len(str(message["content"])):
+                    message["content"] = visible_content
+            if row.get("tool_calls"):
+                message["tool_calls"] = row.get("tool_calls")
+            if row.get("tool_call_id"):
+                message["tool_call_id"] = row.get("tool_call_id")
+            if row.get("tool_name"):
+                message["name"] = row.get("tool_name")
+            if (
+                self._matches_ignore_message_patterns(dict(row), stored_row=True)
+                or self._is_replayed_context_scaffold_message(message)
+            ):
+                drop_dependent_reply = True
+                continue
+            if role in {"user", "system"}:
+                drop_dependent_reply = False
+            elif drop_dependent_reply and role in {"assistant", "tool"}:
+                continue
+            messages.append(message)
+            store_ids.append(store_id)
+        return messages, store_ids
+
+    def _interval_consumed_prefix(
+        self,
+        chunk: List[Dict[str, Any]],
+        snapshot: Sequence[Mapping[str, Any]],
+        aliases: Mapping[int, int],
+        summary_input: List[Dict[str, Any]],
+        summary_store_ids: List[int],
+        compacted_chunk: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> tuple[list[int], int, int] | None:
+        """Cut the interval at the last summarized row and map it to a caller prefix.
+
+        Returns ``(consumed interval ids, caller messages retired, source
+        tokens)``. Only a contiguous summarized prefix of the interval input is
+        accepted, and only caller messages whose (canonical) rows all lie at or
+        below the cut leave the active view.
+        """
+        snapshot_ids = [int(row.get("store_id") or 0) for row in snapshot]
+        if not snapshot_ids:
+            return None
+        compacted_ids = {id(message) for message in compacted_chunk}
+        positions = [
+            index
+            for index, message in enumerate(summary_input)
+            if id(message) in compacted_ids
+        ]
+        if not summary_input:
+            cut = snapshot_ids[-1]
+            consumed_input: list[Dict[str, Any]] = []
+        else:
+            if not positions or positions != list(range(len(positions))):
+                return None
+            consumed_input = summary_input[: positions[-1] + 1]
+            if positions[-1] == len(summary_input) - 1:
+                cut = snapshot_ids[-1]
+            else:
+                cut = int(summary_store_ids[positions[-1]])
+        consumed = [store_id for store_id in snapshot_ids if store_id <= cut]
+        mapped = self._foreground_chunk_source_ids(chunk, deadline=deadline)
+        if mapped is None:
+            return None
+        retired = 0
+        for ids in mapped:
+            if all(int(aliases.get(item, item)) <= cut for item in ids):
+                retired += 1
+            else:
+                break
+        if retired == 0 or not consumed:
+            return None
+        return consumed, retired, count_messages_tokens(consumed_input)
 
     def _distinct_durable_probe_rows(
         self,
@@ -2220,6 +2493,9 @@ class CompactionMixin:
 
             selected_raw_chunk = to_compact
             foreground_source_snapshot = None
+            interval_mode = False
+            interval_aliases: dict[int, int] = {}
+            interval_summary_store_ids: list[int] = []
             if background_feature_enabled:
                 self._foreground_deadline_checkpoint(
                     foreground_deadline,
@@ -2271,11 +2547,23 @@ class CompactionMixin:
                     "foreground source snapshot",
                 )
                 if foreground_source_snapshot is None:
-                    # A sibling ingest or mutation changed the durable interval
-                    # represented by the caller's active messages. Never ask a
-                    # provider to summarize one view and retire another.
-                    noop_reason = "foreground durable source interval changed"
-                    break
+                    # The caller chunk does not map 1:1 onto the durable
+                    # interval (stored duplicates, host-rewritten or dropped
+                    # turns). Summarize the durable interval itself when every
+                    # caller row provably lies inside it (or is already
+                    # covered); otherwise never summarize one view and retire
+                    # another.
+                    interval_capture = self._capture_foreground_interval(
+                        selected_raw_chunk,
+                        prospective_store_ids,
+                        visible_messages=working_messages,
+                        deadline=foreground_deadline,
+                    )
+                    if interval_capture is None:
+                        noop_reason = "foreground durable source interval changed"
+                        break
+                    foreground_source_snapshot, interval_aliases = interval_capture
+                    interval_mode = True
                 # Bind the caller view to the durable snapshot. If any source
                 # row changed between the first active-to-store mapping and
                 # the snapshot read, the same active messages no longer map to
@@ -2305,9 +2593,18 @@ class CompactionMixin:
                 if foreground_session_fence_generation is None:
                     noop_reason = "background publication session is reset or rebound"
                     break
-            summary_input_chunk = [
-                message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
-            ]
+            if interval_mode:
+                summary_input_chunk, interval_summary_store_ids = (
+                    self._interval_summary_input(
+                        foreground_source_snapshot or (),
+                        interval_aliases,
+                        visible_messages=working_messages,
+                    )
+                )
+            else:
+                summary_input_chunk = [
+                    message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
+                ]
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk
                 source_tokens = count_messages_tokens(selected_raw_chunk)
@@ -2386,69 +2683,27 @@ class CompactionMixin:
                         )
                         break
                     raise
-            compacted_summary_ids = {id(message) for message in compacted_chunk}
-            compacted_positions = [
-                idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
-            ]
-            last_compacted_raw_pos = max(compacted_positions) if compacted_positions else len(compacted_chunk) - 1
-            last_consumed_raw_pos = last_compacted_raw_pos
-            while (
-                last_consumed_raw_pos + 1 < len(selected_raw_chunk)
-                and id(selected_raw_chunk[last_consumed_raw_pos + 1]) in dependent_reply_message_ids
-            ):
-                last_consumed_raw_pos += 1
-            source_lookup_chunk = selected_raw_chunk[: last_consumed_raw_pos + 1]
-            selected_raw_len = len(source_lookup_chunk)
-            remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
-            source_tokens = count_messages_tokens(source_lookup_chunk)
-            self._foreground_deadline_checkpoint(
-                foreground_deadline,
-                "lineage mapping",
-            )
-
-            source_lineage_chunk = [
-                message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
-            ]
-            summary_source_store_ids = self._call_with_foreground_deadline(
-                self._get_store_ids_for_messages,
-                source_lineage_chunk,
-                deadline=foreground_deadline,
-            )
-            summary_source_store_ids = sorted(dict.fromkeys(summary_source_store_ids))
-            consumed_store_ids = self._call_with_foreground_deadline(
-                self._get_store_ids_for_messages,
-                source_lookup_chunk,
-                deadline=foreground_deadline,
-            )
-            consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
-            if background_feature_enabled:
-                snapshot_ids = [
-                    int(message.get("store_id") or 0)
-                    for message in (foreground_source_snapshot or ())
-                ]
-                expected_consumed_ids = snapshot_ids[: len(source_lookup_chunk)]
-                if (
-                    len(consumed_store_ids) != len(source_lookup_chunk)
-                    or consumed_store_ids != expected_consumed_ids
-                ):
-                    # Never remove N caller messages after publishing lineage
-                    # for a shorter mapped prefix. A concurrent source change
-                    # is a bounded no-op; durable raw remains authoritative.
-                    noop_reason = "foreground consumed source mapping changed"
+            if interval_mode:
+                interval_consumed = self._interval_consumed_prefix(
+                    selected_raw_chunk,
+                    foreground_source_snapshot or (),
+                    interval_aliases,
+                    summary_input_chunk,
+                    interval_summary_store_ids,
+                    compacted_chunk,
+                    deadline=foreground_deadline,
+                )
+                if interval_consumed is None:
+                    noop_reason = "foreground interval summary consumed no caller prefix"
                     break
-            # Foreground emergency publication advances the durable frontier
-            # across every mapped raw row in ``source_lookup_chunk``.  Its
-            # canonical DAG node must carry that exact lineage and matching
-            # time bounds even when provider policy filtered a dependent row.
-            # Retain the legacy subset in disabled mode because the synchronous
-            # tool-result GC below expects source IDs aligned to compacted input.
-            source_store_ids = (
-                consumed_store_ids
-                if background_feature_enabled
-                else summary_source_store_ids
-            )
-            foreground_source_identity_hash = ""
-            if background_feature_enabled:
+                (
+                    consumed_store_ids,
+                    selected_raw_len,
+                    source_tokens,
+                ) = interval_consumed
+                source_lookup_chunk = selected_raw_chunk[:selected_raw_len]
+                remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
+                summary_source_store_ids = list(consumed_store_ids)
                 foreground_source_identity_hash = str(
                     self._background_compaction.foreground_source_identity_hash(
                         foreground_source_snapshot or (),
@@ -2459,6 +2714,90 @@ class CompactionMixin:
                 if not foreground_source_identity_hash:
                     noop_reason = "foreground durable source identity is unavailable"
                     break
+                source_store_ids = consumed_store_ids
+                logger.info(
+                    "LCM foreground leaf summarizes the durable interval: session=%s "
+                    "rows=%d summary_input=%d caller_messages=%d duplicates=%d",
+                    self._session_id,
+                    len(consumed_store_ids),
+                    len(summary_input_chunk),
+                    selected_raw_len,
+                    len(interval_aliases),
+                )
+            if not interval_mode:
+                compacted_summary_ids = {id(message) for message in compacted_chunk}
+                compacted_positions = [
+                    idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
+                ]
+                last_compacted_raw_pos = max(compacted_positions) if compacted_positions else len(compacted_chunk) - 1
+                last_consumed_raw_pos = last_compacted_raw_pos
+                while (
+                    last_consumed_raw_pos + 1 < len(selected_raw_chunk)
+                    and id(selected_raw_chunk[last_consumed_raw_pos + 1]) in dependent_reply_message_ids
+                ):
+                    last_consumed_raw_pos += 1
+                source_lookup_chunk = selected_raw_chunk[: last_consumed_raw_pos + 1]
+                selected_raw_len = len(source_lookup_chunk)
+                remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
+                source_tokens = count_messages_tokens(source_lookup_chunk)
+                self._foreground_deadline_checkpoint(
+                    foreground_deadline,
+                    "lineage mapping",
+                )
+
+                source_lineage_chunk = [
+                    message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
+                ]
+                summary_source_store_ids = self._call_with_foreground_deadline(
+                    self._get_store_ids_for_messages,
+                    source_lineage_chunk,
+                    deadline=foreground_deadline,
+                )
+                summary_source_store_ids = sorted(dict.fromkeys(summary_source_store_ids))
+                consumed_store_ids = self._call_with_foreground_deadline(
+                    self._get_store_ids_for_messages,
+                    source_lookup_chunk,
+                    deadline=foreground_deadline,
+                )
+                consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
+                if background_feature_enabled:
+                    snapshot_ids = [
+                        int(message.get("store_id") or 0)
+                        for message in (foreground_source_snapshot or ())
+                    ]
+                    expected_consumed_ids = snapshot_ids[: len(source_lookup_chunk)]
+                    if (
+                        len(consumed_store_ids) != len(source_lookup_chunk)
+                        or consumed_store_ids != expected_consumed_ids
+                    ):
+                        # Never remove N caller messages after publishing lineage
+                        # for a shorter mapped prefix. A concurrent source change
+                        # is a bounded no-op; durable raw remains authoritative.
+                        noop_reason = "foreground consumed source mapping changed"
+                        break
+                # Foreground emergency publication advances the durable frontier
+                # across every mapped raw row in ``source_lookup_chunk``.  Its
+                # canonical DAG node must carry that exact lineage and matching
+                # time bounds even when provider policy filtered a dependent row.
+                # Retain the legacy subset in disabled mode because the synchronous
+                # tool-result GC below expects source IDs aligned to compacted input.
+                source_store_ids = (
+                    consumed_store_ids
+                    if background_feature_enabled
+                    else summary_source_store_ids
+                )
+                foreground_source_identity_hash = ""
+                if background_feature_enabled:
+                    foreground_source_identity_hash = str(
+                        self._background_compaction.foreground_source_identity_hash(
+                            foreground_source_snapshot or (),
+                            consumed_store_ids,
+                        )
+                        or ""
+                    )
+                    if not foreground_source_identity_hash:
+                        noop_reason = "foreground durable source identity is unavailable"
+                        break
             self._foreground_deadline_checkpoint(
                 foreground_deadline,
                 "lineage mapping",
