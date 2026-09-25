@@ -6,7 +6,6 @@ Other import/runtime failures must propagate; they cannot silently admit work.
 from __future__ import annotations
 
 import threading
-import _thread
 from typing import Any
 
 
@@ -40,7 +39,7 @@ class BackgroundAdmissionClosed(RuntimeError):
     """The host is retiring and cannot start another background operation."""
 
 
-def start_background_thread(*, target, name: str, args=(), low_level: bool = False):
+def start_background_thread(*, target, name: str, args=(), low_level=None):
     """Reserve before dispatch and retain admission after caller timeouts."""
     admission = acquire_background_admission()
     if admission is None:
@@ -53,8 +52,8 @@ def start_background_thread(*, target, name: str, args=(), low_level: bool = Fal
             admission.release()
 
     try:
-        if low_level:
-            return _thread.start_new_thread(invoke, ())
+        if low_level is not None:
+            return low_level(invoke, ())
         worker = threading.Thread(target=invoke, name=name, daemon=True)
         worker.start()
         return worker

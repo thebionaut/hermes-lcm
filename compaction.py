@@ -1540,7 +1540,7 @@ class CompactionMixin:
                 completed.set()
 
         try:
-            worker = start_background_thread(
+            start_background_thread(
                 target=invoke,
                 name="lcm-foreground-deadline-call",
             )

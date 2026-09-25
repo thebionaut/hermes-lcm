@@ -3725,7 +3725,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                                 )
 
                     try:
-                        provider_thread = start_background_thread(
+                        start_background_thread(
                             target=call_provider,
                             name="lcm-foreground-summary-deadline",
                         )
@@ -7247,7 +7247,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 completed.set()
 
         try:
-            worker = start_background_thread(
+            start_background_thread(
                 target=invoke,
                 name="lcm-foreground-projection",
             )
@@ -8380,7 +8380,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._extraction_persistence_idle.set()
 
         try:
-            worker = start_background_thread(
+            start_background_thread(
                 target=persist,
                 name="lcm-extraction-persistence",
             )
@@ -8769,7 +8769,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._assertion_extraction_sources_scheduled += len(snapshots)
         self._assertion_extraction_idle.clear()
         try:
-            worker = start_background_thread(
+            start_background_thread(
                 target=self._run_assertion_extraction_batch,
                 args=(
                     str(self._store.db_path),

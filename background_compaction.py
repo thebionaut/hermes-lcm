@@ -9075,7 +9075,7 @@ class BackgroundCompactionStore:
             if not heartbeat_before_provider(activate_provider=True):
                 return self.get_job(claimed.job_id)
             try:
-                provider_thread = start_background_thread(
+                start_background_thread(
                     target=summarize_one,
                     name=f"lcm-bg-provider-{claimed.job_id[:8]}-{chunk.ordinal}",
                 )
@@ -9563,7 +9563,7 @@ class BackgroundCompactionStore:
                     start_background_thread(
                         target=guard,
                         name=f"lcm-bg-permit-guardian-{str(job_id)[:8]}",
-                        low_level=True,
+                        low_level=_thread.start_new_thread,
                     )
                 except BaseException as fallback_exc:
                     logger.error(
