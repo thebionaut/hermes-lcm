@@ -1046,6 +1046,27 @@ class CompactionMixin:
                 "LCM active replay metadata write deferred by SQLite contention"
             )
 
+    def _distinct_durable_probe_rows(
+        self,
+        durable_probe: List[Dict[str, Any]],
+        *,
+        replay_limit: int,
+        deadline: float | None = None,
+    ) -> int:
+        """Count archive rows after the frontier, ignoring stored duplicates.
+
+        Older builds re-inserted already-stored messages, so the raw row count
+        can exceed ``replay_limit`` for a session whose real archive is small.
+        """
+        if len(durable_probe) <= replay_limit:
+            return len(durable_probe)
+        rows = self._all_durable_messages_after(
+            self._last_compacted_store_id,
+            deadline=deadline,
+        )
+        aliases = self._durable_replay_duplicate_aliases(rows, deadline=deadline)
+        return len(rows) - len(aliases)
+
     def _ingest_messages_with_foreground_deadline(
         self,
         messages: List[Dict[str, Any]],
@@ -1453,7 +1474,19 @@ class CompactionMixin:
             )
             safe_input = int(getattr(self, "_admission_safe_input_tokens", 0) or 0)
             hard_admission_pressure = safe_input > 0 and background_observed_tokens > safe_input
-            if hard_admission_pressure or same_session_deadline or len(durable_probe) > replay_limit:
+            archive_rows = self._distinct_durable_probe_rows(
+                durable_probe,
+                replay_limit=replay_limit,
+                deadline=foreground_deadline,
+            )
+            # The active-view recovery only helps when it can bound the view.
+            # Without an assembly cap it re-emits the live transcript unchanged
+            # and skips summarization, so the host refuses it as non-shrinking.
+            if recovery_assembly_cap is not None and (
+                hard_admission_pressure
+                or same_session_deadline
+                or archive_rows > replay_limit
+            ):
                 leading_count = self._leading_anchor_count(working_messages)
                 compressed = self._assemble_overflow_recovery_context(
                     working_messages[0] if leading_count else None,
@@ -1471,7 +1504,7 @@ class CompactionMixin:
                 self._persist_active_placeholder_metadata(result, deadline=foreground_deadline)
                 logger.warning(
                     "LCM emergency active-view recovery: live=%d archive_probe=%d cap=%s status=%s; raw history retained",
-                    len(working_messages), len(durable_probe), recovery_assembly_cap,
+                    len(working_messages), archive_rows, recovery_assembly_cap,
                     self._last_compression_status,
                 )
                 return result
@@ -2644,6 +2677,11 @@ class CompactionMixin:
                 deadline=foreground_deadline,
             )
             if force_overflow and len(messages) >= 1:
+                logger.info(
+                    "LCM forced overflow found no summarizable leaf: session=%s reason=%s",
+                    self._session_id,
+                    noop_reason,
+                )
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 compressed = self._call_with_foreground_deadline(
                     self._assemble_overflow_recovery_context,
