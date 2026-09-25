@@ -22,6 +22,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
+from .host_admission import start_background_thread
+
 from .config import LCMConfig
 from .tokens import count_tokens
 
@@ -297,11 +299,10 @@ def _run_blocking_with_deadline(
             # accumulate an unbounded number of live local encoders.
             worker_slots.release()
 
-    worker = threading.Thread(
-        target=run, name=f"lcm-{provider.lower()}-embedding", daemon=True
-    )
     try:
-        worker.start()
+        worker = start_background_thread(
+            target=run, name=f"lcm-{provider.lower()}-embedding"
+        )
     except BaseException:
         worker_slots.release()
         raise

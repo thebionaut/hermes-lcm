@@ -40,7 +40,7 @@ class BackgroundAdmissionClosed(RuntimeError):
     """The host is retiring and cannot start another background operation."""
 
 
-def start_background_thread(*, target, name: str, low_level: bool = False):
+def start_background_thread(*, target, name: str, args=(), low_level: bool = False):
     """Reserve before dispatch and retain admission after caller timeouts."""
     admission = acquire_background_admission()
     if admission is None:
@@ -48,7 +48,7 @@ def start_background_thread(*, target, name: str, low_level: bool = False):
 
     def invoke():
         try:
-            target()
+            target(*args)
         finally:
             admission.release()
 

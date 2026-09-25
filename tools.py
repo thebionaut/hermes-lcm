@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
+from .host_admission import start_background_thread
+
 from .externalize import (
     _inspect_top_level_json_string_fields_before_content as _externalized_top_level_fields_before_content,
     extract_externalized_ref,
@@ -3392,9 +3394,8 @@ def _run_within_deadline(
         finally:
             slots.release()
 
-    worker = threading.Thread(target=invoke, name=name, daemon=True)
     try:
-        worker.start()
+        worker = start_background_thread(target=invoke, name=name)
     except BaseException:
         slots.release()
         raise

@@ -25,6 +25,8 @@ import time
 from collections.abc import Mapping
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+from .host_admission import start_background_thread
+
 from .background_compaction import ForegroundProviderPermitUnavailable
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
@@ -1537,13 +1539,11 @@ class CompactionMixin:
                 hard_call_slot.release()
                 completed.set()
 
-        worker = threading.Thread(
-            target=invoke,
-            name="lcm-foreground-deadline-call",
-            daemon=True,
-        )
         try:
-            worker.start()
+            worker = start_background_thread(
+                target=invoke,
+                name="lcm-foreground-deadline-call",
+            )
         except BaseException:
             hard_call_slot.release()
             raise

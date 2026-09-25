@@ -21,6 +21,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
 
+from .host_admission import acquire_background_admission, start_background_thread
+
 from .codex_routing import (
     _codex_oauth_context_cap,
     _is_codex_gpt55_route,
@@ -210,6 +212,7 @@ class _RollupMaintenanceScheduler:
         self._owned_keys: dict[object, set[tuple[str, str]]] = {}
         self._key_owners: dict[tuple[str, str], set[object]] = {}
         self._worker: threading.Thread | None = None
+        self._admissions = {}
 
     def _track_owner_locked(
         self,
@@ -229,6 +232,9 @@ class _RollupMaintenanceScheduler:
             or self._follow_up_key == key
         ):
             return
+        admission = self._admissions.pop(key, None)
+        if admission is not None:
+            admission.release()
         for owner in self._key_owners.pop(key, set()):
             owned = self._owned_keys.get(owner)
             if owned is None:
@@ -270,14 +276,25 @@ class _RollupMaintenanceScheduler:
                     key[1],
                 )
                 return False
-            if self._worker is None or not self._worker.is_alive():
-                worker = threading.Thread(
-                    target=self._run,
-                    name="lcm-rollup-maintenance",
-                    daemon=True,
-                )
-                worker.start()
-                self._worker = worker
+            new_admission = key not in self._admissions
+            if new_admission:
+                admission = acquire_background_admission()
+                if admission is None:
+                    return False
+                self._admissions[key] = admission
+            try:
+                if self._worker is None or not self._worker.is_alive():
+                    worker = threading.Thread(
+                        target=self._run,
+                        name="lcm-rollup-maintenance",
+                        daemon=True,
+                    )
+                    worker.start()
+                    self._worker = worker
+            except BaseException:
+                if new_admission:
+                    self._admissions.pop(key).release()
+                raise
             self._jobs.append((key, job))
             self._queued_keys.add(key)
             self._track_owner_locked(key, owner)
@@ -3707,13 +3724,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                                     foreground_attempt_state
                                 )
 
-                    provider_thread = threading.Thread(
-                        target=call_provider,
-                        name="lcm-foreground-summary-deadline",
-                        daemon=True,
-                    )
                     try:
-                        provider_thread.start()
+                        provider_thread = start_background_thread(
+                            target=call_provider,
+                            name="lcm-foreground-summary-deadline",
+                        )
                     except BaseException:
                         hard_call_slot.release()
                         if require_durable_provider_permit:
@@ -7231,13 +7246,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 slot.release()
                 completed.set()
 
-        worker = threading.Thread(
-            target=invoke,
-            name="lcm-foreground-projection",
-            daemon=True,
-        )
         try:
-            worker.start()
+            worker = start_background_thread(
+                target=invoke,
+                name="lcm-foreground-projection",
+            )
         except BaseException:
             process_slot.release()
             slot.release()
@@ -8366,13 +8379,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._extraction_persistence_slot.release()
                 self._extraction_persistence_idle.set()
 
-        worker = threading.Thread(
-            target=persist,
-            name="lcm-extraction-persistence",
-            daemon=True,
-        )
         try:
-            worker.start()
+            worker = start_background_thread(
+                target=persist,
+                name="lcm-extraction-persistence",
+            )
         except BaseException as exc:
             self._extraction_persistence_slot.release()
             self._extraction_persistence_idle.set()
@@ -8757,23 +8768,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._assertion_extraction_batches_scheduled += 1
             self._assertion_extraction_sources_scheduled += len(snapshots)
         self._assertion_extraction_idle.clear()
-        worker = threading.Thread(
-            target=self._run_assertion_extraction_batch,
-            args=(
-                str(self._store.db_path),
-                tuple(snapshots),
-                model,
-                timeout_seconds,
-                schema_ready_token,
-                deadline,
-                self._foreground_now,
-                cancel_event,
-            ),
-            name="lcm-assertion-extraction",
-            daemon=True,
-        )
         try:
-            worker.start()
+            worker = start_background_thread(
+                target=self._run_assertion_extraction_batch,
+                args=(
+                    str(self._store.db_path),
+                    tuple(snapshots),
+                    model,
+                    timeout_seconds,
+                    schema_ready_token,
+                    deadline,
+                    self._foreground_now,
+                    cancel_event,
+                ),
+                name="lcm-assertion-extraction",
+            )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"[:300]
             with self._assertion_extraction_metrics_lock:

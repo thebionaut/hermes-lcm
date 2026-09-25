@@ -8,6 +8,7 @@ import threading
 from functools import lru_cache
 from typing import Any, Dict, List
 
+from .host_admission import BackgroundAdmissionClosed, start_background_thread
 from .message_content import normalize_content_value
 
 logger = logging.getLogger(__name__)
@@ -79,10 +80,12 @@ def _get_encoder():
         if _encoder_ready:
             return _encoder
         if _encoder_thread is None:
-            _encoder_thread = threading.Thread(
-                target=_encoder_loader, name="lcm-tiktoken-load", daemon=True
-            )
-            _encoder_thread.start()
+            try:
+                _encoder_thread = start_background_thread(
+                    target=_encoder_loader, name="lcm-tiktoken-load"
+                )
+            except BackgroundAdmissionClosed:
+                return None
             first = True
     if first:
         _encoder_thread.join(timeout=_ENCODER_FIRST_WAIT_S)
