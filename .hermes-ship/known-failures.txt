@@ -1,0 +1,2 @@
+# Pre-existing failures (also fail on 3f62d85); ship gate deselects these.
+tests/test_background_compaction_host_admission.py::test_global_host_pin_aligns_codex56_cap_with_fixed_reserve
