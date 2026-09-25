@@ -9,6 +9,7 @@ row identity (`store_id`) for DAG/source lookup.
 """
 
 
+import hashlib
 import json
 import logging
 import math
@@ -117,6 +118,53 @@ def _normalize_observed_at(value: Any) -> float | None:
     except (OSError, OverflowError, ValueError):
         return None
     return observed_at
+
+
+def _canonical_identity_digest(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            pass
+    try:
+        text = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def message_dedupe_identity(
+    msg: Dict[str, Any],
+    *,
+    stored_row: bool = False,
+) -> tuple[Any, ...] | None:
+    """Return the durable identity of one host message, or ``None``.
+
+    The host message timestamp (``observed_at``) survives restarts, active
+    prefix rewrites and re-ingests unchanged, so it anchors the identity. Rows
+    without a trustworthy host timestamp are never deduplicated: identical
+    text alone does not prove a replay. Tool results are keyed by their call
+    id because hosts rewrite old tool output in place (for example
+    "[Old tool output cleared ...]") while it remains the same message.
+    """
+    raw_observed = msg.get("observed_at") if stored_row else msg.get("timestamp")
+    observed_at = _normalize_observed_at(raw_observed)
+    if observed_at is None:
+        return None
+    role = str(msg.get("role") or "unknown")
+    tool_call_id = str(msg.get("tool_call_id") or "")
+    observed_key = round(observed_at, 6)
+    if role == "tool" and tool_call_id:
+        return ("tool", tool_call_id, observed_key)
+    return (
+        role,
+        tool_call_id,
+        observed_key,
+        _canonical_identity_digest(_normalize_content_value(msg.get("content")) or ""),
+        _canonical_identity_digest(msg.get("tool_calls")),
+    )
 
 
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
@@ -384,6 +432,12 @@ class MessageStore:
         self._conn.execute(
             "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
         )
+        # Replay-identity lookups (idempotent ingest, duplicate-safe replay)
+        # probe by host timestamp inside one session.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_session_observed "
+            "ON messages(session_id, observed_at)"
+        )
 
     @contextmanager
     def _bounded_connection_access(
@@ -602,8 +656,14 @@ class MessageStore:
                                 ] | None = None,
                                 metadata_json_list_additions: list[
                                     tuple[list[str], list[str], int]
-                                ] | None = None) -> List[int]:
+                                ] | None = None,
+                                dedupe_existing: bool = False) -> List[int]:
         """Persist messages that already passed ingest protection.
+
+        With ``dedupe_existing`` a message whose replay identity (see
+        ``message_dedupe_identity``) is already stored for the session maps to
+        the earliest existing row instead of inserting a copy, so re-ingesting
+        the same host history after a restart or prefix rewrite is idempotent.
 
         This is an internal fast path for callers that need the protected form
         before storage, for example to update active replay with raw-payload
@@ -632,8 +692,27 @@ class MessageStore:
             # deadline or SQLite failure and poisons the connection if rollback
             # itself fails. The last checkpoint remains inside the transaction.
             with self._explicit_transaction(conn, operation="raw append"):
-                for msg, est in zip(messages, token_estimates):
+                identities: List[tuple[Any, ...] | None] = [None] * len(messages)
+                existing_ids: Dict[tuple[Any, ...], int] = {}
+                if dedupe_existing:
+                    identities = [message_dedupe_identity(msg) for msg in messages]
+                    checkpoint("before identity lookup")
+                    existing_ids = self._earliest_store_ids_by_identity(
+                        conn,
+                        session_id,
+                        [
+                            msg.get("timestamp")
+                            for msg, identity in zip(messages, identities)
+                            if identity is not None
+                        ],
+                    )
+                reused = 0
+                for msg, est, identity in zip(messages, token_estimates, identities):
                     checkpoint("before row")
+                    if identity is not None and identity in existing_ids:
+                        ids.append(existing_ids[identity])
+                        reused += 1
+                        continue
                     tc = msg.get("tool_calls")
                     tc_json = json.dumps(tc) if tc else None
                     ts = time.time()
@@ -666,6 +745,15 @@ class MessageStore:
                         ),
                     )
                     ids.append(cur.lastrowid)
+                    if identity is not None:
+                        existing_ids[identity] = int(cur.lastrowid)
+                if reused:
+                    logger.info(
+                        "LCM ingest mapped %d already-stored message(s) to their "
+                        "existing rows instead of inserting duplicates: session=%s",
+                        reused,
+                        session_id,
+                    )
                 self._apply_metadata_json_mutations_on_connection(
                     conn,
                     metadata_json_updates=metadata_json_updates,
@@ -674,6 +762,77 @@ class MessageStore:
                 )
                 checkpoint("before commit")
         return ids
+
+    def _earliest_store_ids_by_identity(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        observed_values: List[Any],
+    ) -> Dict[tuple[Any, ...], int]:
+        """Map replay identities to the earliest stored row in ``session_id``."""
+        observed = sorted({
+            value
+            for value in (_normalize_observed_at(raw) for raw in observed_values)
+            if value is not None
+        })
+        earliest: Dict[tuple[Any, ...], int] = {}
+        for start in range(0, len(observed), 400):
+            chunk = observed[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE session_id = ? AND observed_at IN ({placeholders})
+                   ORDER BY store_id""",
+                (session_id, *chunk),
+            ).fetchall()
+            for row in rows:
+                stored = self._row_to_dict(row)
+                identity = message_dedupe_identity(stored, stored_row=True)
+                if identity is not None and identity not in earliest:
+                    earliest[identity] = int(stored["store_id"])
+        return earliest
+
+    def duplicate_store_id_aliases(
+        self,
+        session_id: str,
+        rows: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+    ) -> Dict[int, int]:
+        """Return ``{store_id: earliest_store_id}`` for stored duplicate rows.
+
+        Only rows from ``rows`` that repeat an earlier stored row of the same
+        session (same replay identity, lower store_id) appear in the result.
+        """
+        observed_values = [
+            row.get("observed_at")
+            for row in rows
+            if message_dedupe_identity(row, stored_row=True) is not None
+        ]
+        if not session_id or not observed_values:
+            return {}
+        with self._bounded_connection_access(
+            deadline=deadline,
+            deadline_clock=deadline_clock,
+            lock_timeout_seconds=lock_timeout_seconds,
+        ) as conn:
+            earliest = self._earliest_store_ids_by_identity(
+                conn,
+                session_id,
+                observed_values,
+            )
+        aliases: Dict[int, int] = {}
+        for row in rows:
+            identity = message_dedupe_identity(row, stored_row=True)
+            if identity is None:
+                continue
+            store_id = int(row.get("store_id") or 0)
+            kept = earliest.get(identity)
+            if kept is not None and kept < store_id:
+                aliases[store_id] = kept
+        return aliases
 
     @staticmethod
     def _apply_metadata_json_mutations_on_connection(

@@ -1835,6 +1835,50 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 break
         return rows
 
+    def _durable_replay_duplicate_aliases(
+        self,
+        durable_rows: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+    ) -> dict[int, int]:
+        """Map duplicate durable rows to the earliest row with their identity."""
+        lookup = getattr(self._store, "duplicate_store_id_aliases", None)
+        if not durable_rows or not self._session_id or not callable(lookup):
+            return {}
+        self._foreground_deadline_checkpoint(
+            deadline,
+            "context reconstruction",
+            "durable duplicate scan",
+        )
+        try:
+            aliases = lookup(
+                self._session_id,
+                durable_rows,
+                deadline=deadline,
+                deadline_clock=self._foreground_now,
+                lock_timeout_seconds=self._foreground_deadline_remaining(deadline),
+            )
+        except TimeoutError as exc:
+            raise ForegroundDeadlineExceeded(
+                "context reconstruction",
+                "durable duplicate scan exceeded the shared deadline",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            if _is_sqlite_locked_error(exc):
+                raise ForegroundDeadlineExceeded(
+                    "context reconstruction",
+                    "SQLite contention prevented the durable duplicate scan",
+                ) from exc
+            logger.warning("LCM durable duplicate scan failed", exc_info=True)
+            return {}
+        if aliases:
+            logger.info(
+                "LCM replay skipped %d duplicate stored message(s): session=%s",
+                len(aliases),
+                self._session_id,
+            )
+        return aliases
+
     def _project_durable_active_tail(
         self,
         store_id: int,
@@ -1863,6 +1907,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         durable_suffix_store_ids = {
             int(row.get("store_id") or 0) for row in durable_rows
         }
+        # Older builds could re-insert already-stored host messages after a
+        # restart or active prefix rewrite. Replay each message once, from its
+        # earliest row; a copy of a row at/below the frontier is already
+        # covered by the summary DAG and is dropped entirely.
+        duplicate_aliases = self._durable_replay_duplicate_aliases(
+            durable_rows,
+            deadline=deadline,
+        )
+        if duplicate_aliases:
+            durable_rows = [
+                row
+                for row in durable_rows
+                if int(row.get("store_id") or 0) not in duplicate_aliases
+            ]
         replay: List[Dict[str, Any]] = []
         for row_index, row in enumerate(durable_rows):
             if row_index % 32 == 0:
@@ -1927,6 +1985,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if message_store_id is None:
                 continue
             last_mapped_active_index = active_index
+            message_store_id = duplicate_aliases.get(
+                int(message_store_id),
+                int(message_store_id),
+            )
             if int(message_store_id) > int(store_id or 0):
                 exact_by_store_id[int(message_store_id)] = dict(message)
         merged: List[Dict[str, Any]] = []
@@ -5388,6 +5450,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             [count_message_tokens(msg) for msg in protected_messages],
             source=source,
             conversation_id=conversation_id,
+            dedupe_existing=True,
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
@@ -8105,6 +8168,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 conversation_id=self._conversation_id,
                 metadata_json_updates=metadata_json_updates,
                 metadata_json_list_additions=metadata_json_list_additions,
+                dedupe_existing=True,
             )
 
         remaining = self._foreground_deadline_remaining(deadline)
@@ -8123,6 +8187,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 busy_timeout_ms=max(0, int(remaining * 1000)),
                 metadata_json_updates=metadata_json_updates,
                 metadata_json_list_additions=metadata_json_list_additions,
+                dedupe_existing=True,
             )
         except TimeoutError as exc:
             raise ForegroundDeadlineExceeded(
