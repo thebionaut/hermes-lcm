@@ -181,3 +181,44 @@ def test_partial_interval_consumption_cuts_at_last_summarized_row(tmp_path, monk
         ) is None
     finally:
         engine.shutdown()
+
+
+def _hidden_row_setup(tmp_path, monkeypatch, hidden):
+    engine = LCMEngine(_config(tmp_path / "hidden.db"))
+    engine.on_session_start("s", conversation_id="c", context_length=372_000)
+    host = _host()
+    store = engine._store
+    store.append_batch("s", host[:2], conversation_id="c")
+    # A row the caller no longer shows, stored between rows it does show.
+    store.append_batch("s", [hidden], conversation_id="c")
+    store.append_batch("s", host[2:5], conversation_id="c")
+    provider_inputs: list[str] = []
+    monkeypatch.setattr(
+        "hermes_lcm.engine.summarize_with_escalation",
+        lambda **kwargs: provider_inputs.append(kwargs["text"])
+        or ("interval summary", 1),
+    )
+    return engine, host, provider_inputs
+
+
+def test_hidden_older_host_variant_below_caller_max_is_summarized(tmp_path, monkeypatch):
+    hidden = {"role": "user", "content": "dropped older turn", "timestamp": TS + 1.5}
+    engine, host, provider_inputs = _hidden_row_setup(tmp_path, monkeypatch, hidden)
+    try:
+        engine.compress(host, current_tokens=340_000)
+        assert len(provider_inputs) == 1
+        assert "dropped older turn" in provider_inputs[0]
+        assert engine._dag.get_session_node_count("s") == 1
+    finally:
+        engine.shutdown()
+
+
+def test_hidden_row_with_newer_host_timestamp_refuses(tmp_path, monkeypatch):
+    hidden = {"role": "user", "content": "from the future", "timestamp": TS + 999}
+    engine, host, provider_inputs = _hidden_row_setup(tmp_path, monkeypatch, hidden)
+    try:
+        engine.compress(host, current_tokens=340_000)
+        assert provider_inputs == []
+        assert engine._dag.get_session_node_count("s") == 0
+    finally:
+        engine.shutdown()

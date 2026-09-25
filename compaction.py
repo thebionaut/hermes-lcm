@@ -1055,6 +1055,7 @@ class CompactionMixin:
         chunk: List[Dict[str, Any]],
         *,
         deadline: float | None = None,
+        allow_unmapped: bool = False,
     ) -> list[tuple[int, ...]] | None:
         """Durable ids per caller message, or ``None`` if any message is unmapped.
 
@@ -1097,7 +1098,7 @@ class CompactionMixin:
                     deadline=deadline,
                 )
             ids = tuple(int(item) for item in source_ids(id_map, message))
-            if not ids:
+            if not ids and not allow_unmapped:
                 return None
             mapped.append(ids)
         return mapped
@@ -1185,6 +1186,30 @@ class CompactionMixin:
                 timed_keys.add((role, str(message.get("tool_call_id") or ""), round(float(timestamp), 6)))
             content_keys.add(content_key(message))
         mapped_ids = {int(item) for ids in mapped for item in ids}
+        visible_mapped = self._foreground_chunk_source_ids(
+            [
+                message
+                for message in (visible_messages or [])
+                if message.get("role") != "tool"
+                or message.get("content") != _MISSING_TOOL_RESULT_STUB
+            ],
+            deadline=deadline,
+            allow_unmapped=True,
+        )
+        caller_max_store_id = max(
+            [int(item) for ids in (visible_mapped or []) for item in ids]
+            + list(mapped_ids)
+            or [0]
+        )
+        caller_max_timestamp = max(
+            [
+                float(message.get("timestamp"))
+                for message in list(chunk) + list(visible_messages or [])
+                if isinstance(message.get("timestamp"), (int, float))
+                and not isinstance(message.get("timestamp"), bool)
+            ]
+            or [0.0]
+        )
         for row in snapshot:
             store_id = int(row.get("store_id") or 0)
             if store_id in aliases or store_id in mapped_ids:
@@ -1202,6 +1227,16 @@ class CompactionMixin:
             ) in timed_keys:
                 continue
             if content_key(row) in content_keys:
+                continue
+            if (
+                observed_at is not None
+                and store_id < caller_max_store_id
+                and observed_at <= caller_max_timestamp
+            ):
+                # Older host history the caller no longer shows (dropped,
+                # rewritten or re-stamped by the host): it carries the host's
+                # own timestamp and sits below rows the caller maps, so it is
+                # superseded history, not a concurrent raw append.
                 continue
             logger.info(
                 "LCM foreground interval refused: row %s is not visible to the caller "
