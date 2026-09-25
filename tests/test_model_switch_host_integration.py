@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_state import SessionDB
+
+pytest.importorskip('agent.model_switch_jobs', reason='host moved model-switch into its plugin')
 from agent.model_switch_jobs import ModelSwitchJobStore
 from agent.model_switch_lcm import run_lcm_preparation_job
 from hermes_lcm.config import LCMConfig

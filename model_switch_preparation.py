@@ -263,7 +263,10 @@ def prepare_model_switch_summary(engine, messages, token_budget, deadline,
             if admit_request(prompt, max_output, route) is not True:
                 raise ValueError('model switch summary exceeds an auxiliary route budget')
     checkpoint()
-    from agent.model_switch_auxiliary import preparation_request_admission
+    try:  # generic host seam (Hermes core after the model-switch plugin extraction)
+        from agent.auxiliary_request_admission import request_admission as preparation_request_admission
+    except ImportError:  # older hosts
+        from agent.model_switch_auxiliary import preparation_request_admission
 
     # Host auxiliary fallback policy may choose a route absent from the LCM
     # list above. Guard the concrete request at the shared provider boundary.
