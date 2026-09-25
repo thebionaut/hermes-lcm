@@ -31,7 +31,7 @@ from .db_bootstrap import (
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
-from .host_admission import acquire_background_admission
+from .host_admission import acquire_background_admission, start_background_thread
 from .fresh_tail import resolve_fresh_tail_boundary
 from .summary_serialization import filter_summary_messages, serialize_summary_messages
 from .tokens import count_message_tokens, count_tokens
@@ -9074,13 +9074,11 @@ class BackgroundCompactionStore:
 
             if not heartbeat_before_provider(activate_provider=True):
                 return self.get_job(claimed.job_id)
-            provider_thread = threading.Thread(
-                target=summarize_one,
-                name=f"lcm-bg-provider-{claimed.job_id[:8]}-{chunk.ordinal}",
-                daemon=True,
-            )
             try:
-                provider_thread.start()
+                provider_thread = start_background_thread(
+                    target=summarize_one,
+                    name=f"lcm-bg-provider-{claimed.job_id[:8]}-{chunk.ordinal}",
+                )
             except BaseException:
                 release_unused_permit()
                 raise
@@ -9549,12 +9547,10 @@ class BackgroundCompactionStore:
                 _notify_background_runtime(db_path)
 
         try:
-            guardian_thread = threading.Thread(
+            start_background_thread(
                 target=guard,
                 name=f"lcm-bg-permit-guardian-{str(job_id)[:8]}",
-                daemon=True,
             )
-            guardian_thread.start()
         except BaseException as exc:
             logger.error(
                 "LCM provider-permit guardian thread start failed; error=%s",
@@ -9564,7 +9560,11 @@ class BackgroundCompactionStore:
             def start_fallback_guardian() -> None:
                 """Start the retrying guardian without blocking its caller."""
                 try:
-                    _thread.start_new_thread(guard, ())
+                    start_background_thread(
+                        target=guard,
+                        name=f"lcm-bg-permit-guardian-{str(job_id)[:8]}",
+                        low_level=True,
+                    )
                 except BaseException as fallback_exc:
                     logger.error(
                         "LCM provider-permit fallback guardian start failed; error=%s",

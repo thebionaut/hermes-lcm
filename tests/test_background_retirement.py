@@ -160,3 +160,82 @@ def test_retirement_defers_scan_without_claim_or_synchronous_fallback(tmp_path, 
     finally:
         db_bootstrap.join_background_integrity_scans(timeout=3)
         conn.close()
+
+
+def test_timed_out_provider_retains_admission_after_runtime_stops(tmp_path, monkeypatch, gate):
+    from hermes_lcm import escalation
+    from hermes_lcm.dag import SummaryDAG
+    from test_background_runtime_cancellation_isolation import _config, _seed_conversation, _enqueue
+
+    db_path = tmp_path / "provider-retirement.db"
+    SummaryDAG(db_path).close()
+    ids = _seed_conversation(db_path, conversation="held", session="held", content="held provider")
+    config = _config(db_path)
+    writer = background.BackgroundCompactionStore(db_path, config=config)
+    _enqueue(writer, ids, conversation="held", session="held")
+    entered, finish = threading.Event(), threading.Event()
+
+    def summarize(**kwargs):
+        entered.set()
+        assert finish.wait(8)
+        return "preserved summary", 1
+
+    monkeypatch.setattr(escalation, "summarize_with_escalation", summarize)
+    runtime = background._BackgroundRuntime("provider-retirement", db_path, config)
+    try:
+        assert entered.wait(3)
+        runtime.request_stop()
+        assert runtime.wait_stopped(timeout=3)
+        # The bounded job has returned, but its provider and durable-permit
+        # cleanup guardian still exist and must block process retirement.
+        assert not finish.is_set()
+        assert gate.prepare()["ok"] is False
+        finish.set()
+        _until(lambda: gate.active_count() == 0)
+        assert gate.prepare()["ok"] is True
+    finally:
+        finish.set()
+        runtime.stop()
+        writer.close()
+
+
+def test_thread_start_failure_releases_admission(tmp_path, monkeypatch, gate):
+    from hermes_lcm.host_admission import start_background_thread
+
+    def fail(_thread):
+        raise RuntimeError("fixture thread start failure")
+
+    monkeypatch.setattr(threading.Thread, "start", fail)
+    with pytest.raises(RuntimeError, match="fixture"):
+        start_background_thread(target=lambda: None, name="unstarted-fixture")
+    assert gate.active_count() == 0
+    conn, spec = _fts_fixture(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="fixture"):
+            db_bootstrap._dispatch_background_integrity_scan(conn, spec)
+        assert gate.active_count() == 0
+        assert not any(key[0] == str(tmp_path / "scan.db") for key in db_bootstrap._integrity_scan_threads)
+    finally:
+        conn.close()
+
+
+def test_missing_legacy_host_is_compatible_but_broken_host_import_is_not(monkeypatch):
+    import builtins
+    from hermes_lcm.host_admission import acquire_background_admission
+
+    real_import = builtins.__import__
+    missing = "hermes_cli.backend_retirement"
+
+    def importing(name, *args, **kwargs):
+        if name == "hermes_cli.backend_retirement":
+            raise ModuleNotFoundError("fixture missing module", name=missing)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", importing)
+    permit = acquire_background_admission()
+    assert permit is not None
+    permit.release()
+    permit.release()
+    missing = "unrelated_missing_dependency"
+    with pytest.raises(ModuleNotFoundError):
+        acquire_background_admission()
