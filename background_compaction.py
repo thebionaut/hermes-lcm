@@ -5829,6 +5829,7 @@ class BackgroundCompactionStore:
         lock_timeout_seconds: float | None = None,
         write_deadline: float | None = None,
         deadline_clock: Callable[[], float] | None = None,
+        overlap_background: bool = False,
     ) -> ProviderPermit | None:
         """Atomically reserve provider capacity for one foreground emergency.
 
@@ -5836,6 +5837,15 @@ class BackgroundCompactionStore:
         serialized check-and-insert enforces both the process-wide provider cap
         and one active provider call per conversation without waiting for a
         competing lease.
+
+        ``overlap_background`` lets an emergency foreground call run beside a
+        *background preparation* lease of the same conversation (never beside
+        another foreground permit, and never above the global cap). A busy
+        backlog otherwise keeps the conversation lease occupied job after job,
+        so emergency compaction could never summarize. Publication stays safe:
+        both publishers go through the frontier/fence/source-identity CAS, the
+        loser reloads, and a winning foreground publication supersedes the
+        overlapping background job.
         """
         conversation = str(conversation_id or "").strip()
         lease_owner = str(owner or "").strip()
@@ -5919,9 +5929,10 @@ class BackgroundCompactionStore:
                 """
                 SELECT 1 FROM lcm_compaction_provider_leases
                 WHERE conversation_id=? AND lease_expires_at>?
+                  AND (? = 0 OR job_id LIKE 'foreground-%')
                 LIMIT 1
                 """,
-                (conversation, current),
+                (conversation, current, 1 if overlap_background else 0),
             ).fetchone()
             if conversation_busy is not None:
                 return None

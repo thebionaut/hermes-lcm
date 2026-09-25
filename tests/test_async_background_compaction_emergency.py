@@ -231,12 +231,17 @@ def test_emergency_provider_permit_excludes_same_conversation_across_stores(
         second.close()
 
 
-def test_emergency_does_not_overlap_active_background_provider(
+def test_emergency_overlaps_background_preparation_and_supersedes_it(
     tmp_path,
     monkeypatch,
 ):
-    """A background lease for the conversation forces local overflow recovery."""
-    db_path = tmp_path / "emergency-background-exclusion.db"
+    """A background lease must not starve emergency summarization.
+
+    A large backlog keeps the conversation's background lease occupied job
+    after job. The emergency foreground may run beside it (the global cap still
+    applies); its publication wins the CAS and supersedes the background job.
+    """
+    db_path = tmp_path / "emergency-background-overlap.db"
     config = _config(db_path)
     engine = LCMEngine(config)
     engine.on_session_start("s", conversation_id="c", context_length=372_000)
@@ -254,12 +259,16 @@ def test_emergency_does_not_overlap_active_background_provider(
         assert claimed is not None
         monkeypatch.setattr(
             "hermes_lcm.engine.summarize_with_escalation",
-            lambda **kwargs: provider_calls.append(kwargs) or ("must not run", 1),
+            lambda **kwargs: provider_calls.append(kwargs) or ("emergency summary", 1),
         )
         result = engine.compress(messages, current_tokens=340_000)
         assert result
-        assert provider_calls == []
-        assert engine._dag.get_session_node_count("s") == 0
+        assert len(provider_calls) == 1
+        assert engine._dag.get_session_node_count("s") == 1
+        job = engine._background_compaction.get_job(claimed.job_id)
+        assert job is not None and job.state == "superseded"
+        # The background call's lease is untouched; the foreground permit was
+        # released after publication.
         assert engine.get_background_compaction_status()[
             "active_provider_permits"
         ] == 1
@@ -270,6 +279,49 @@ def test_emergency_does_not_overlap_active_background_provider(
                 owner="background-process",
                 generation=claimed.lease_generation,
             )
+        engine.shutdown()
+
+
+def test_emergency_permit_stays_exclusive_among_foreground_and_capped(tmp_path):
+    """Overlap is only with background leases, never above the global cap."""
+    db_path = tmp_path / "emergency-foreground-exclusion.db"
+    engine = LCMEngine(_config(db_path))
+    engine.on_session_start("s", conversation_id="c", context_length=372_000)
+    helper = engine._background_compaction
+    try:
+        fence = engine._reconcile_background_publication_fence()
+        assert fence is not None
+        first = helper.acquire_emergency_provider_permit(
+            conversation_id="c",
+            owner="fg-1",
+            session_id="s",
+            expected_session_fence_generation=fence,
+            global_limit=2,
+            overlap_background=True,
+        )
+        assert first is not None
+        # A second foreground call for the same conversation is refused.
+        assert helper.acquire_emergency_provider_permit(
+            conversation_id="c",
+            owner="fg-2",
+            session_id="s",
+            expected_session_fence_generation=fence,
+            global_limit=2,
+            overlap_background=True,
+        ) is None
+        helper.release_provider_permit(
+            first.job_id, owner="fg-1", generation=first.lease_generation
+        )
+        # The global cap still counts every live lease.
+        assert helper.acquire_emergency_provider_permit(
+            conversation_id="c",
+            owner="fg-3",
+            session_id="s",
+            expected_session_fence_generation=fence,
+            global_limit=0,
+            overlap_background=True,
+        ) is None
+    finally:
         engine.shutdown()
 
 

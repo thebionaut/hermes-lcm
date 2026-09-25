@@ -3354,6 +3354,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "deadline_clock",
         ):
             acquire_kwargs["deadline_clock"] = self._foreground_now
+        if self._summary_callable_accepts_keyword(
+            helper.acquire_emergency_provider_permit,
+            "overlap_background",
+        ):
+            # A running background preparation must not starve the bounded
+            # emergency path; the publication CAS arbitrates the two results.
+            acquire_kwargs["overlap_background"] = True
         try:
             permit = helper.acquire_emergency_provider_permit(**acquire_kwargs)
         except sqlite3.OperationalError as exc:
