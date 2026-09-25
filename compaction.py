@@ -23,7 +23,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .background_compaction import ForegroundProviderPermitUnavailable
 from .dag import SummaryNode
