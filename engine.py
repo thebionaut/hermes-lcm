@@ -1996,6 +1996,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             if int(message_store_id) > int(store_id or 0):
                 exact_by_store_id[int(message_store_id)] = dict(message)
+        # Hosts clear old tool output in place ("[Old tool output cleared ...]")
+        # so those active results no longer map to their stored rows by
+        # content. Rebuilding from durable rows would silently restore the
+        # full output and grow the transcript; keep the caller's shorter form
+        # (the full raw stays in the store for recall).
+        caller_tool_results: dict[str, Dict[str, Any]] = {}
+        for message in active_tail:
+            if message.get("role") == "tool" and message.get("tool_call_id"):
+                caller_tool_results[str(message.get("tool_call_id"))] = message
         merged: List[Dict[str, Any]] = []
         represented_store_ids: set[int] = set()
         for projected_index, durable_message in enumerate(projected):
@@ -2010,6 +2019,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             represented_store_ids.add(durable_store_id)
             exact_message = exact_by_store_id.get(durable_store_id)
+            if exact_message is None and durable_message.get("role") == "tool":
+                caller_result = caller_tool_results.get(
+                    str(durable_message.get("tool_call_id") or "")
+                )
+                if caller_result is not None and count_message_tokens(
+                    caller_result
+                ) < count_message_tokens(durable_message):
+                    exact_message = caller_result
             merged.append(
                 dict(exact_message) if exact_message is not None else durable_message
             )

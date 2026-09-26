@@ -1002,8 +1002,30 @@ def _invoke_summary_llm_chain(
             reason=reason,
         )
         _set_terminal_reason(trace, reason)
-        if circuit_breaker is not None:
-            circuit_breaker.record_failure(candidate_model)
+        route_label = _safe_trace_label(candidate_model) or _DEFAULT_ROUTE_KEY
+        if reason == "non_compressing_output":
+            # The route answered; the text was just not shorter than its
+            # source (typical for tiny chunks). That is not provider ill
+            # health, so it must not open the circuit and starve every other
+            # summary (including emergency compaction) for the cooldown.
+            logger.warning(
+                "LCM summary route %s returned non-compressing output "
+                "(level=%d summary=%d source=%d tokens); trying the next route, "
+                "circuit unaffected",
+                route_label,
+                escalation_level,
+                int(attempt.get("summary_token_count") or 0),
+                int(source_token_count or 0),
+            )
+        else:
+            logger.warning(
+                "LCM summary route %s failed: reason=%s level=%d",
+                route_label,
+                reason or "provider_error",
+                escalation_level,
+            )
+            if circuit_breaker is not None:
+                circuit_breaker.record_failure(candidate_model)
     if skipped == len(chain):
         logger.warning("LCM summary fallback chain exhausted: all routes are temporarily open")
     return None
