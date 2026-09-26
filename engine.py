@@ -6572,6 +6572,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         deadline: float | None = None,
     ) -> bool:
+        if not self._compiled_ignore_message_patterns:
+            # Every branch below ends in _matches_ignore_message_patterns,
+            # which is False without patterns; skip the store lookups.
+            return False
         store_id = msg.get("store_id")
         content = normalize_content_value(msg.get("content")) or ""
         has_externalized_placeholder = self._content_has_externalized_placeholder_ref(content)

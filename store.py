@@ -1463,6 +1463,34 @@ class MessageStore:
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def session_row_version(
+        self,
+        session_id: str,
+        *,
+        deadline: float | None = None,
+        deadline_clock: Callable[[], float] | None = None,
+        lock_timeout_seconds: float | None = None,
+    ) -> tuple[int, int] | None:
+        """``(row count, max store_id)`` of a session, or ``None``.
+
+        Never waits for a busy store lock: ``None`` (including on contention)
+        just means "do not use a cached answer".
+        """
+        try:
+            with self._bounded_connection_access(
+                deadline=deadline,
+                deadline_clock=deadline_clock,
+                lock_timeout_seconds=0.0,
+            ) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(store_id), 0) FROM messages "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+        except Exception:
+            return None
+        return (int(row[0]), int(row[1]))
+
     def get_session_count(
         self,
         session_id: str,

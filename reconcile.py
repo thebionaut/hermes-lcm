@@ -1482,6 +1482,70 @@ class ReconcileMixin:
         deadline: float | None = None,
         excluded_source_prefixes: tuple[str, ...] = (),
     ) -> dict[int, int]:
+        """Memoized ``_compute_store_id_map_for_messages`` within one compress().
+
+        One compaction maps the same active list several times (publication,
+        cursor alignment, placeholder metadata, lineage, snapshot recheck).
+        The memo only exists while ``compress()`` runs; an entry is reused only
+        for the very same message objects (held by the entry, so ids cannot be
+        recycled), the same frontier/scope and an unchanged session row count
+        and max store_id. Callers get a fresh copy they may mutate.
+        """
+        memo = getattr(self, "_store_id_map_memo", None)
+        if memo is None or not self._session_id:
+            return self._compute_store_id_map_for_messages(
+                messages,
+                deadline=deadline,
+                excluded_source_prefixes=excluded_source_prefixes,
+            )
+        version_reader = getattr(self._store, "session_row_version", None)
+        version = (
+            version_reader(self._session_id, lock_timeout_seconds=0.0)
+            if callable(version_reader)
+            else None
+        )
+        if version is None:
+            return self._compute_store_id_map_for_messages(
+                messages,
+                deadline=deadline,
+                excluded_source_prefixes=excluded_source_prefixes,
+            )
+        key = (
+            str(self._session_id),
+            str(getattr(self, "_conversation_id", "") or ""),
+            int(self._last_compacted_store_id or 0),
+            tuple(excluded_source_prefixes),
+            version,
+            tuple(id(message) for message in messages),
+        )
+        entry = memo.get(key)
+        if entry is not None and len(entry[0]) == len(messages) and all(
+            cached is current for cached, current in zip(entry[0], messages)
+        ):
+            return self._copy_store_id_map(entry[1])
+        mapped = self._compute_store_id_map_for_messages(
+            messages,
+            deadline=deadline,
+            excluded_source_prefixes=excluded_source_prefixes,
+        )
+        memo[key] = (tuple(messages), self._copy_store_id_map(mapped))
+        return mapped
+
+    @staticmethod
+    def _copy_store_id_map(mapped: dict[int, int]) -> dict[int, int]:
+        copied = type(mapped)(mapped) if type(mapped) is not dict else dict(mapped)
+        groups = getattr(mapped, "source_groups", None)
+        if groups is not None:
+            copied.source_groups = dict(groups)
+        return copied
+
+    def _compute_store_id_map_for_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline: float | None = None,
+        excluded_source_prefixes: tuple[str, ...] = (),
+    ) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
         Matching starts strictly after ``_last_compacted_store_id`` so repeated

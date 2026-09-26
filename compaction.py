@@ -33,6 +33,52 @@ from .sanitize import _contains_sensitive_redaction
 from .sqlite_util import _is_sqlite_locked_error
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
+class _LazyStoreIdMap(dict):
+    """A store-id map computed on first read (same answers, lazily)."""
+
+    def __init__(self, compute):
+        super().__init__()
+        self._compute = compute
+        self._loaded = False
+
+    def _load(self) -> None:
+        if not self._loaded:
+            self._loaded = True
+            self.update(self._compute())
+
+    def get(self, key, default=None):
+        self._load()
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self._load()
+        return super().__getitem__(key)
+
+    def __contains__(self, key):
+        self._load()
+        return super().__contains__(key)
+
+    def __iter__(self):
+        self._load()
+        return super().__iter__()
+
+    def __len__(self):
+        self._load()
+        return super().__len__()
+
+    def items(self):
+        self._load()
+        return super().items()
+
+    def keys(self):
+        self._load()
+        return super().keys()
+
+    def values(self):
+        self._load()
+        return super().values()
+
+
 # Content of the tool-result stub inserted by the engine's tool-pair guardrail
 # (engine._sanitize_active_context_messages).
 _MISSING_TOOL_RESULT_STUB = "[Result from earlier conversation — see context summary above]"
@@ -1552,6 +1598,8 @@ class CompactionMixin:
                     foreground_deadline,
                     preflight_deadline,
                 )
+        previous_store_id_map_memo = getattr(self, "_store_id_map_memo", None)
+        self._store_id_map_memo = {}
         try:
             self._foreground_deadline_checkpoint(
                 foreground_deadline,
@@ -1595,6 +1643,7 @@ class CompactionMixin:
             self._last_compression_noop_reason = ""
             raise
         finally:
+            self._store_id_map_memo = previous_store_id_map_memo
             release_permit = getattr(
                 self,
                 "_release_foreground_emergency_provider_permit",
@@ -2375,10 +2424,13 @@ class CompactionMixin:
                     break
 
             if candidate_start < fresh_tail_start:
-                self._current_compress_store_ids_by_message_id = (
-                    self._call_with_foreground_deadline(
+                # Only ignore-pattern / generated-placeholder provenance reads
+                # this map; build it on first use (usually never).
+                mapping_source = working_messages[leading_anchor_count:]
+                self._current_compress_store_ids_by_message_id = _LazyStoreIdMap(
+                    lambda mapping_source=mapping_source: self._call_with_foreground_deadline(
                         self._get_store_id_map_for_messages,
-                        working_messages[leading_anchor_count:],
+                        mapping_source,
                         deadline=foreground_deadline,
                     )
                 )

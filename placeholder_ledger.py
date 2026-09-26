@@ -557,9 +557,12 @@ class PlaceholderLedgerMixin:
         }
 
     def _is_generated_ignored_dependent_reply(self, msg: Dict[str, Any], text: str) -> bool:
+        records = self._load_generated_ignored_dependent_reply_records()
+        if not records:
+            # Both matches below need a record; avoid store provenance work.
+            return False
         store_digest = self._ignored_dependent_reply_store_fingerprint(msg)
         content_digest = self._ignored_dependent_reply_content_fingerprint(msg, text)
-        records = self._load_generated_ignored_dependent_reply_records()
         if store_digest and any(record.get("store") == store_digest for record in records):
             return True
         if not content_digest:
