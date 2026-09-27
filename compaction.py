@@ -1573,7 +1573,63 @@ class CompactionMixin:
             raise result_box["error"]
         return result_box.get("value")
 
+    # Per-result stub thresholds (tokens) tried in order when a compaction result still does not fit.
+    _OVERFLOW_SHED_THRESHOLDS = (8_000, 4_000, 2_000, 1_000, 500)
+
+    def _overflow_shed_target(self) -> int:
+        threshold = int(getattr(self, "threshold_tokens", 0) or 0)
+        window = int(getattr(self, "context_length", 0) or 0)
+        candidates = [value for value in (threshold, int(window * 0.9)) if value > 0]
+        return min(candidates) if candidates else 0
+
+    def _shed_tool_payloads_to_fit(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Deterministic, provider-free last resort for a result that still does not fit.
+
+        Summarization can be unavailable (provider permit held, foreground wall reached, no
+        summarizable leaf). Rather than hand the host an unchanged over-window transcript that
+        ends the session with context_overflow, externalize old tool payloads (outside the
+        protected fresh tail) at progressively lower size thresholds until the context fits.
+        Lossless: every stubbed payload stays durably stored and expandable. Returns the input
+        object unchanged when nothing needs or can be shed."""
+        target = self._overflow_shed_target()
+        if target <= 0 or not messages:
+            return messages
+        try:
+            before = count_messages_tokens(messages)
+            if before <= target:
+                return messages
+            current = messages
+            for threshold in self._OVERFLOW_SHED_THRESHOLDS:
+                current = self._stub_large_tool_results_for_active_replay(current, threshold_tokens=threshold)
+                if count_messages_tokens(current) <= target:
+                    break
+            after = count_messages_tokens(current)
+        except Exception:
+            logger.warning("LCM overflow shed failed; returning the compaction result unchanged", exc_info=True)
+            return messages
+        if after >= before:
+            return messages
+        logger.warning(
+            "LCM overflow shed: externalized old tool payloads to fit the context: session=%s tokens %d -> %d (target %d)",
+            str(getattr(self, "_session_id", "") or ""), before, after, target,
+        )
+        self._last_compression_status = "compacted"
+        self._last_compression_noop_reason = ""
+        return current
+
     def compress(self, messages: List[Dict[str, Any]],
+                 current_tokens: int = None,
+                 focus_topic: Optional[str] = None,
+                 force: bool = False,
+                 deadline: float | None = None) -> List[Dict[str, Any]]:
+        """Run compaction; if the result still does not fit, shed old tool payloads deterministically."""
+        return self._shed_tool_payloads_to_fit(
+            self._compress_with_terminal_status(
+                messages, current_tokens=current_tokens, focus_topic=focus_topic, force=force, deadline=deadline,
+            )
+        )
+
+    def _compress_with_terminal_status(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
                  force: bool = False,

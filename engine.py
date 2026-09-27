@@ -9201,6 +9201,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         cancel_event: threading.Event | None = None,
         now: Callable[[], float] | None = None,
         ownership: ExternalizationOwnership | None = None,
+        threshold_tokens: int | None = None,
     ) -> Dict[str, Any] | None:
         clock = now or time.monotonic
         if (
@@ -9226,7 +9227,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         threshold = max(
             1,
             int(
-                getattr(
+                threshold_tokens
+                if threshold_tokens is not None
+                else getattr(
                     self._config,
                     "large_output_active_replay_stub_threshold_tokens",
                     25_000,
@@ -9270,6 +9273,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         cancel_event: threading.Event | None = None,
         now: Callable[[], float] | None = None,
         ownership: ExternalizationOwnership | None = None,
+        threshold_tokens: int | None = None,
     ) -> List[Dict[str, Any]]:
         """Replace eligible old tool payloads with durable refs for assembly.
 
@@ -9305,6 +9309,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 cancel_event=cancel_event,
                 now=now,
                 ownership=ownership,
+                threshold_tokens=threshold_tokens,
             )
             if replacement is None:
                 continue

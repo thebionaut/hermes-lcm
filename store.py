@@ -190,7 +190,7 @@ def message_replay_key(msg: Dict[str, Any]) -> tuple[Any, ...] | None:
     tool_call_id = str(msg.get("tool_call_id") or "")
     if role == "tool" and tool_call_id:
         content = _normalize_content_value(msg.get("content")) or ""
-        if content.strip() in _TOOL_RESULT_PLACEHOLDERS:
+        if content.strip() in _TOOL_RESULT_PLACEHOLDERS or content.startswith("[Externalized tool output:"):
             # A cleared copy is the same result as whatever that call returned.
             return ("tool-call-any", tool_call_id)
         return ("tool-call", tool_call_id, _canonical_identity_digest(content))
