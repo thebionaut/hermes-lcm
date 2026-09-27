@@ -167,6 +167,52 @@ def message_dedupe_identity(
     )
 
 
+_REPLAY_TEXT_MIN_CHARS = 200
+# Placeholders hosts write over an old tool result in place: the same message, not a new result.
+_TOOL_RESULT_PLACEHOLDERS = frozenset({
+    "[Old tool output cleared to save context space]",
+    "[Result from earlier conversation — see context summary above]",
+})
+
+
+def message_replay_key(msg: Dict[str, Any]) -> tuple[Any, ...] | None:
+    """Timestamp-independent replay identity of one message, or ``None``.
+
+    Hosts re-stamp messages when they rewrite the active transcript (a
+    compaction flush persists the assembled history with the flush time), so
+    the host timestamp alone cannot recognise a replayed copy. These keys are
+    unique by construction: a tool result by its call id, an assistant
+    tool-call turn by its call ids, and a long user/assistant text by its
+    exact content (identical long texts in one session are replays, not
+    coincidences). Short texts ("ok", "go") are never keyed this way.
+    """
+    role = str(msg.get("role") or "unknown")
+    tool_call_id = str(msg.get("tool_call_id") or "")
+    if role == "tool" and tool_call_id:
+        content = _normalize_content_value(msg.get("content")) or ""
+        if content.strip() in _TOOL_RESULT_PLACEHOLDERS:
+            # A cleared copy is the same result as whatever that call returned.
+            return ("tool-call-any", tool_call_id)
+        return ("tool-call", tool_call_id, _canonical_identity_digest(content))
+    tool_calls = msg.get("tool_calls")
+    if isinstance(tool_calls, str):
+        try:
+            tool_calls = json.loads(tool_calls)
+        except (TypeError, ValueError):
+            tool_calls = None
+    if role == "assistant" and isinstance(tool_calls, list) and tool_calls:
+        ids = [str(call.get("id") or "") if isinstance(call, dict) else "" for call in tool_calls]
+        if not ids or not all(ids):
+            return None
+        # Arguments are part of the identity: a retry may reuse a call id with changed arguments.
+        return ("assistant-calls", _canonical_identity_digest(tool_calls))
+    if role in ("user", "assistant"):
+        text = _normalize_content_value(msg.get("content")) or ""
+        if len(text) >= _REPLAY_TEXT_MIN_CHARS:
+            return ("text", role, _canonical_identity_digest(text))
+    return None
+
+
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
     normalized = _normalize_source_value(source) if source is not None else ""
     if not normalized:
@@ -693,9 +739,24 @@ class MessageStore:
             # itself fails. The last checkpoint remains inside the transaction.
             with self._explicit_transaction(conn, operation="raw append"):
                 identities: List[tuple[Any, ...] | None] = [None] * len(messages)
+                replay_keys: List[tuple[Any, ...] | None] = [None] * len(messages)
                 existing_ids: Dict[tuple[Any, ...], int] = {}
+                existing_by_key: Dict[tuple[Any, ...], int] = {}
+                existing_stamped_by_key: Dict[tuple[Any, ...], int] = {}
                 if dedupe_existing:
                     identities = [message_dedupe_identity(msg) for msg in messages]
+                    # Only host-stamped messages: a timestamp-less message is never deduplicated (a
+                    # retried turn without host timestamps is a new message, see message_dedupe_identity).
+                    replay_keys = [message_replay_key(msg) for msg in messages]
+                    existing_by_key = self._earliest_store_ids_by_replay_key(
+                        conn, session_id,
+                        [key for key, identity in zip(replay_keys, identities) if identity is not None])
+                    # An unstamped message only replays an earlier STAMPED row (hosts drop the timestamp
+                    # on some rewrites); unstamped look-alikes of each other stay distinct.
+                    existing_stamped_by_key = self._earliest_store_ids_by_replay_key(
+                        conn, session_id,
+                        [key for key, identity in zip(replay_keys, identities) if identity is None],
+                        stamped_only=True)
                     checkpoint("before identity lookup")
                     existing_ids = self._earliest_store_ids_by_identity(
                         conn,
@@ -707,10 +768,15 @@ class MessageStore:
                         ],
                     )
                 reused = 0
-                for msg, est, identity in zip(messages, token_estimates, identities):
+                for msg, est, identity, replay_key in zip(messages, token_estimates, identities, replay_keys):
                     checkpoint("before row")
                     if identity is not None and identity in existing_ids:
                         ids.append(existing_ids[identity])
+                        reused += 1
+                        continue
+                    known = existing_by_key if identity is not None else existing_stamped_by_key
+                    if replay_key is not None and replay_key in known:
+                        ids.append(known[replay_key])
                         reused += 1
                         continue
                     tc = msg.get("tool_calls")
@@ -747,6 +813,9 @@ class MessageStore:
                     ids.append(cur.lastrowid)
                     if identity is not None:
                         existing_ids[identity] = int(cur.lastrowid)
+                    if replay_key is not None and identity is not None:
+                        existing_by_key.setdefault(replay_key, int(cur.lastrowid))
+                        existing_stamped_by_key.setdefault(replay_key, int(cur.lastrowid))
                 if reused:
                     logger.info(
                         "LCM ingest mapped %d already-stored message(s) to their "
@@ -790,6 +859,59 @@ class MessageStore:
                 identity = message_dedupe_identity(stored, stored_row=True)
                 if identity is not None and identity not in earliest:
                     earliest[identity] = int(stored["store_id"])
+        return earliest
+
+    def _earliest_store_ids_by_replay_key(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        keys: List[tuple[Any, ...] | None],
+        *,
+        stamped_only: bool = False,
+    ) -> Dict[tuple[Any, ...], int]:
+        """Map :func:`message_replay_key` keys to the earliest stored row in ``session_id``
+        (``stamped_only``: only rows that carry a host timestamp)."""
+        stamp = " AND observed_at > 0" if stamped_only else ""
+        wanted = {key for key in keys if key is not None}
+        earliest: Dict[tuple[Any, ...], int] = {}
+        if not wanted or not session_id:
+            return earliest
+        tool_ids = sorted({key[1] for key in wanted if key[0] in ("tool-call", "tool-call-any")})
+        for start in range(0, len(tool_ids), 400):
+            chunk = tool_ids[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            for store_id, call_id, content in conn.execute(
+                f"""SELECT store_id, tool_call_id, content FROM messages
+                   WHERE session_id = ? AND role = 'tool' AND tool_call_id IN ({placeholders}){stamp}
+                   ORDER BY store_id""",
+                (session_id, *chunk),
+            ):
+                earliest.setdefault(("tool-call-any", str(call_id)), int(store_id))
+                key = message_replay_key({"role": "tool", "tool_call_id": call_id, "content": content})
+                if key is not None:
+                    earliest.setdefault(key, int(store_id))
+        if any(key[0] == "assistant-calls" for key in wanted):
+            for store_id, tool_calls in conn.execute(
+                f"""SELECT store_id, tool_calls FROM messages
+                   WHERE session_id = ? AND role = 'assistant' AND tool_calls IS NOT NULL{stamp}
+                   ORDER BY store_id""",
+                (session_id,),
+            ):
+                key = message_replay_key({"role": "assistant", "tool_calls": tool_calls})
+                if key in wanted:
+                    earliest.setdefault(key, int(store_id))
+        if any(key[0] == "text" for key in wanted):
+            for store_id, role, content in conn.execute(
+                f"""SELECT store_id, role, content FROM messages
+                   WHERE session_id = ? AND role IN ('user', 'assistant')
+                     AND (tool_calls IS NULL OR tool_calls = '' OR tool_calls = '[]')
+                     AND length(content) >= ?{stamp}
+                   ORDER BY store_id""",
+                (session_id, _REPLAY_TEXT_MIN_CHARS),
+            ):
+                key = message_replay_key({"role": role, "content": content})
+                if key in wanted:
+                    earliest.setdefault(key, int(store_id))
         return earliest
 
     def latest_canonical_store_ids_for_messages(
@@ -900,7 +1022,9 @@ class MessageStore:
             for row in rows
             if message_dedupe_identity(row, stored_row=True) is not None
         ]
-        if not session_id or not observed_values:
+        stamped = [message_dedupe_identity(row, stored_row=True) is not None for row in rows]
+        replay_keys = [message_replay_key(row) for row in rows]
+        if not session_id or (not observed_values and not any(replay_keys)):
             return {}
         with self._bounded_connection_access(
             deadline=deadline,
@@ -911,16 +1035,29 @@ class MessageStore:
                 conn,
                 session_id,
                 observed_values,
-            )
+            ) if observed_values else {}
+            earliest_by_key = self._earliest_store_ids_by_replay_key(
+                conn, session_id, [key for key, is_stamped in zip(replay_keys, stamped) if is_stamped])
+            # An unstamped row is only a replay of an earlier STAMPED row: unstamped look-alikes of each
+            # other stay distinct (a retried turn without host timestamps is a new message).
+            earliest_stamped_by_key = self._earliest_store_ids_by_replay_key(
+                conn, session_id, [key for key, is_stamped in zip(replay_keys, stamped) if not is_stamped],
+                stamped_only=True)
         aliases: Dict[int, int] = {}
-        for row in rows:
-            identity = message_dedupe_identity(row, stored_row=True)
-            if identity is None:
-                continue
+        for row, replay_key, is_stamped in zip(rows, replay_keys, stamped):
             store_id = int(row.get("store_id") or 0)
-            kept = earliest.get(identity)
-            if kept is not None and kept < store_id:
-                aliases[store_id] = kept
+            identity = message_dedupe_identity(row, stored_row=True)
+            candidates = [
+                kept
+                for kept in (
+                    earliest.get(identity) if identity is not None else None,
+                    (earliest_by_key if is_stamped else earliest_stamped_by_key).get(replay_key)
+                    if replay_key is not None else None,
+                )
+                if kept is not None and kept < store_id
+            ]
+            if candidates:
+                aliases[store_id] = min(candidates)
         return aliases
 
     @staticmethod
