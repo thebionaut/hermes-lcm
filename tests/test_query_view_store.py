@@ -715,3 +715,87 @@ def test_malformed_same_name_schema_fails_without_publishing_marker(tmp_path):
         assert marker is None
     finally:
         conn.close()
+
+
+def _corpus_state(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT generation, max_store_id FROM lcm_query_corpus_state WHERE singleton = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def _rewind_corpus_state(db_path, generation):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE lcm_query_corpus_state SET generation = ? WHERE singleton = 1", (generation,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_insert_survives_corpus_state_behind_its_event_log(view_db, tmp_path):
+    """Regression 2026-09-27: a recovered lcm.db kept an older corpus_state row (generation 1057366)
+    while the event log reached 1057372, so every message insert failed with
+    UNIQUE constraint failed: lcm_query_corpus_events.generation."""
+    messages, _views = view_db
+    for n in range(4):
+        _append(messages, f"note {n}")
+    db_path = tmp_path / "lcm.db"
+    _rewind_corpus_state(db_path, 1)
+
+    _append(messages, "after the rewind")  # must not raise IntegrityError
+
+    conn = sqlite3.connect(db_path)
+    try:
+        generations = [row[0] for row in conn.execute(
+            "SELECT generation FROM lcm_query_corpus_events ORDER BY generation")]
+    finally:
+        conn.close()
+    assert generations == sorted(set(generations))
+    assert _corpus_state(db_path)[0] == generations[-1]
+
+
+def test_reopen_reconciles_corpus_state_and_replaces_old_triggers(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    messages = MessageStore(db_path)
+    views = QueryViewStore(db_path)
+    try:
+        for n in range(3):
+            _append(messages, f"note {n}")
+    finally:
+        views.close()
+        messages.close()
+    conn = sqlite3.connect(db_path)
+    try:
+        # Simulate a database written by an older build: the plain "generation + 1" trigger body.
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'lcm_query_corpus_message_insert'").fetchone()[0]
+        conn.execute("DROP TRIGGER lcm_query_corpus_message_insert")
+        conn.execute(sql.replace(
+            "max(generation, coalesce((SELECT max(generation) FROM lcm_query_corpus_events), 0)) + 1",
+            "generation + 1"))
+        conn.execute("UPDATE lcm_query_corpus_state SET generation = 1, max_store_id = 1 WHERE singleton = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    messages = MessageStore(db_path)
+    views = QueryViewStore(db_path)
+    try:
+        generation, max_store_id = _corpus_state(db_path)
+        assert generation == 3 and max_store_id == 3
+        conn = sqlite3.connect(db_path)
+        try:
+            body = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'lcm_query_corpus_message_insert'").fetchone()[0]
+        finally:
+            conn.close()
+        assert "max(generation, coalesce(" in body
+        _append(messages, "after reopen")
+        assert _corpus_state(db_path)[0] == 4
+    finally:
+        views.close()
+        messages.close()

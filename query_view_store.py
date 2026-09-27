@@ -298,7 +298,45 @@ _REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
 }
 
 
+_CORPUS_TRIGGERS = (
+    "lcm_query_corpus_message_insert",
+    "lcm_query_corpus_message_update",
+    "lcm_query_corpus_message_delete",
+)
+# Marker of the self-healing trigger body: the next generation is taken past the newest event, so a
+# corpus_state row that fell behind its event log (a restored/recovered store) can never make every
+# message insert fail with "UNIQUE constraint failed: lcm_query_corpus_events.generation".
+_CORPUS_TRIGGER_MARKER = "coalesce((SELECT max(generation) FROM lcm_query_corpus_events), 0)"
+
+
+def _replace_stale_corpus_triggers(conn: sqlite3.Connection) -> None:
+    """Drop corpus triggers created by older builds so ``CREATE TRIGGER IF NOT EXISTS`` installs the current body."""
+    for name, sql in conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?, ?)", _CORPUS_TRIGGERS
+    ).fetchall():
+        if _CORPUS_TRIGGER_MARKER not in str(sql or ""):
+            conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+
+
+def _reconcile_corpus_state(conn: sqlite3.Connection) -> None:
+    """Bring ``lcm_query_corpus_state`` level with what it summarises (never backwards)."""
+    conn.execute(
+        """
+        UPDATE lcm_query_corpus_state
+           SET generation = max(generation, coalesce((SELECT max(generation) FROM lcm_query_corpus_events), 0)),
+               max_store_id = max(max_store_id, coalesce((SELECT max(store_id) FROM messages), 0))
+         WHERE singleton = 1
+           AND (generation < coalesce((SELECT max(generation) FROM lcm_query_corpus_events), 0)
+                OR max_store_id < coalesce((SELECT max(store_id) FROM messages), 0))
+        """
+    )
+
+
 def _ensure_query_view_schema(conn: sqlite3.Connection) -> None:
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lcm_query_corpus_events'"
+    ).fetchone():
+        _replace_stale_corpus_triggers(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS lcm_query_corpus_state (
@@ -383,7 +421,7 @@ def _ensure_query_view_schema(conn: sqlite3.Connection) -> None:
         AFTER INSERT ON messages
         BEGIN
             UPDATE lcm_query_corpus_state
-               SET generation = generation + 1,
+               SET generation = max(generation, coalesce((SELECT max(generation) FROM lcm_query_corpus_events), 0)) + 1,
                    max_store_id = max(max_store_id, NEW.store_id),
                    row_count = row_count + 1,
                    changed_at = CAST(strftime('%s','now') AS REAL)
@@ -402,7 +440,7 @@ def _ensure_query_view_schema(conn: sqlite3.Connection) -> None:
         ON messages
         BEGIN
             UPDATE lcm_query_corpus_state
-               SET generation = generation + 1,
+               SET generation = max(generation, coalesce((SELECT max(generation) FROM lcm_query_corpus_events), 0)) + 1,
                    max_store_id = max(max_store_id, NEW.store_id),
                    changed_at = CAST(strftime('%s','now') AS REAL)
              WHERE singleton = 1;
@@ -431,7 +469,7 @@ def _ensure_query_view_schema(conn: sqlite3.Connection) -> None:
         AFTER DELETE ON messages
         BEGIN
             UPDATE lcm_query_corpus_state
-               SET generation = generation + 1,
+               SET generation = max(generation, coalesce((SELECT max(generation) FROM lcm_query_corpus_events), 0)) + 1,
                    row_count = max(0, row_count - 1),
                    changed_at = CAST(strftime('%s','now') AS REAL)
              WHERE singleton = 1;
@@ -466,6 +504,7 @@ def _ensure_query_view_schema(conn: sqlite3.Connection) -> None:
         """,
         (time.time(),),
     )
+    _reconcile_corpus_state(conn)
 
 
 def _verify_query_view_schema(conn: sqlite3.Connection) -> list[str]:
