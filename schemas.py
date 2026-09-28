@@ -707,7 +707,9 @@ LCM_RETRIEVE = {
         "provider-neutral lcm_compute trace. The controller contains no model "
         "client; dispatched retrieval tools retain their own provider behavior "
         "and provenance. It never accepts benchmark metadata or persists final prose. It is "
-        "available only when LCM_ADAPTIVE_RETRIEVAL_ENABLED is true."
+        "available only when LCM_ADAPTIVE_RETRIEVAL_ENABLED is true or the current "
+        "session is explicitly allowlisted by LCM_SELECTIVE_RETRIEVAL_SESSION_IDS. "
+        "The narrow pilot does not persist query views."
     ),
     "parameters": {
         "type": "object",

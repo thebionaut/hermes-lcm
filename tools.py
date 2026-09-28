@@ -1504,7 +1504,8 @@ def lcm_retrieve(args: Dict[str, Any], **kwargs) -> str:
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
-    controller = getattr(engine, "_adaptive_retrieval", None)
+    from .selective_retrieval import controller_for
+    controller = controller_for(engine)
     if controller is None:
         return json.dumps({
             "status": "disabled",

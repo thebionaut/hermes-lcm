@@ -78,11 +78,11 @@ _TOOL_ARGUMENT_KEYS: dict[str, frozenset[str]] = {
     }),
     "lcm_load_session": frozenset({
         "session_id", "limit", "max_content_chars", "after_store_id", "roles",
-        "time_from", "time_to",
+        "time_from", "time_to", "include_exact_ref",
     }),
     "lcm_expand": frozenset({
         "node_id", "externalized_ref", "store_id", "max_tokens", "source_offset",
-        "source_limit", "content_offset",
+        "source_limit", "content_offset", "include_exact_ref",
     }),
 }
 
@@ -405,6 +405,8 @@ def _bounded_tool_args(tool: str, raw: Any) -> dict[str, Any]:
         )
     _validate_argument_keys(raw)
     args = dict(raw)
+    if "include_exact_ref" in args and not isinstance(args["include_exact_ref"], bool):
+        raise ValueError("include_exact_ref must be a boolean")
     _canonical_json(args, field_name="tool_args", max_chars=MAX_TOOL_ARGS_CHARS)
 
     def bounded_int(key: str, default: int, maximum: int) -> int:

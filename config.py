@@ -489,6 +489,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("active_replay_preview_tail_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_TAIL_TOKENS", int),
     _EnvFieldSpec("active_replay_preview_max_tokens", "LCM_ACTIVE_REPLAY_PREVIEW_MAX_TOKENS", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
+    _EnvFieldSpec("selective_retrieval_session_ids", "LCM_SELECTIVE_RETRIEVAL_SESSION_IDS", str),
     _EnvFieldSpec("extraction_enabled", "LCM_EXTRACTION_ENABLED", bool),
     _EnvFieldSpec("extraction_model", "LCM_EXTRACTION_MODEL", str),
     _EnvFieldSpec("extraction_output_path", "LCM_EXTRACTION_OUTPUT_PATH", str),
@@ -774,6 +775,8 @@ class LCMConfig:
     # binds the same-database query-view store needed for warm evidence reuse.
     # The controller itself never invokes a model or provider.
     adaptive_retrieval_enabled: bool = False
+    # Exact session IDs only. The pilot has no query views and is off by default.
+    selective_retrieval_session_ids: str = ""
     # Enables the separate structured exact-row extractor. Default off: merely
     # enabling the assertion store never performs a model/provider call.
     assertion_extraction_enabled: bool = False
