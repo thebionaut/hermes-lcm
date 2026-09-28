@@ -9546,11 +9546,24 @@ class BackgroundCompactionStore:
                     guardian.close()
                 _notify_background_runtime(db_path)
 
+        # Reserve once while the provider/caller still owns admission. Transfer
+        # that same reservation to fallback cleanup, never re-admit cleanup.
+        admission = acquire_background_admission()
+        if admission is None:
+            raise RuntimeError("LCM cleanup guardian lost its admitted parent")
+
+        def admitted_guard():
+            try:
+                guard()
+            finally:
+                admission.release()
+
         try:
-            start_background_thread(
-                target=guard,
+            threading.Thread(
+                target=admitted_guard,
                 name=f"lcm-bg-permit-guardian-{str(job_id)[:8]}",
-            )
+                daemon=True,
+            ).start()
         except BaseException as exc:
             logger.error(
                 "LCM provider-permit guardian thread start failed; error=%s",
@@ -9560,23 +9573,22 @@ class BackgroundCompactionStore:
             def start_fallback_guardian() -> None:
                 """Start the retrying guardian without blocking its caller."""
                 try:
-                    start_background_thread(
-                        target=guard,
-                        name=f"lcm-bg-permit-guardian-{str(job_id)[:8]}",
-                        low_level=_thread.start_new_thread,
-                    )
+                    _thread.start_new_thread(admitted_guard, ())
                 except BaseException as fallback_exc:
+                    admission.release()
                     logger.error(
                         "LCM provider-permit fallback guardian start failed; error=%s",
                         _sanitize_error(fallback_exc),
                     )
 
             if on_start_failure is not None:
-                on_start_failure(start_fallback_guardian)
-            elif completed.is_set():
-                # No live provider owns this permit, so cleanup can begin
-                # immediately, but its durable retry loop must still run away
-                # from the foreground/provider caller.
+                try:
+                    on_start_failure(start_fallback_guardian)
+                except BaseException:
+                    admission.release()
+                    raise
+            else:
+                # The fallback waits off-thread for completion when necessary.
                 start_fallback_guardian()
             return False
         return True

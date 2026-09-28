@@ -222,6 +222,41 @@ def test_thread_start_failure_releases_admission(tmp_path, monkeypatch, gate):
         conn.close()
 
 
+def test_guardian_fallback_transfers_original_admission(tmp_path, monkeypatch, gate):
+    owner = background.BackgroundCompactionStore(tmp_path / "guardian.db", config=LCMConfig())
+    completed = threading.Event()
+    completed.set()
+    callbacks, releases = [], []
+
+    class Guardian:
+        def __init__(self, *args, **kwargs):
+            pass
+        def release_provider_permit(self, *args, **kwargs):
+            releases.append(1)
+        def close(self):
+            pass
+
+    def fail_start(thread):
+        raise RuntimeError("primary guardian unavailable")
+
+    monkeypatch.setattr(background, "BackgroundCompactionStore", Guardian)
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    try:
+        assert not owner._start_provider_permit_guardian(
+            completed, job_id="job", owner="owner", generation=1,
+            on_start_failure=callbacks.append,
+        )
+        assert gate.active_count() == 1
+        assert gate.prepare()["ok"] is False
+        # Cleanup must not ask for fresh admission, even when dispatched later.
+        monkeypatch.setattr(gate, "acquire", lambda: pytest.fail("cleanup re-admitted"))
+        callbacks.pop()()
+        _until(lambda: gate.active_count() == 0)
+        assert releases == [1]
+    finally:
+        owner.close()
+
+
 def test_admission_concurrent_release_is_exactly_once(gate):
     from hermes_lcm.host_admission import acquire_background_admission
 
