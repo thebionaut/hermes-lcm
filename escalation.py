@@ -1202,8 +1202,9 @@ def summarize_with_escalation(
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
-    # Validate captured policy before any provider attempt. No ambient flag reads.
-    continuation_brief(continuation_contract)
+    # Reject unqualified v1 state semantics before any physical attempt.
+    from .continuation import safe_continuation_contract
+    continuation_contract = safe_continuation_contract(continuation_contract, text)
     _trace_attempt_list(trace)
     _set_terminal_reason(trace, "")
     if not isinstance(text, str) or not text.strip() or int(source_tokens or 0) <= 0:

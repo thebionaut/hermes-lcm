@@ -18,6 +18,19 @@ def selected_contract(config, session_id: str) -> str:
     ) else ""
 
 
+def safe_continuation_contract(version: str, source: str) -> str:
+    """Quarantine v1 until source-bound state validation is qualified.
+
+    Frozen provider outputs misclassify pending work and resurrect a cancelled
+    objective. Prompt rhetoric cannot validate those semantics. Fail closed to
+    the byte-identical ordinary prompt, BEFORE spending a provider attempt.
+    A requested pilot must not bypass this gate, even with an exact session ID.
+    """
+    if version not in ('', CONTRACT_VERSION):
+        raise ValueError('unsupported continuation contract')
+    return ''
+
+
 def continuation_brief(version: str, *, condensed: bool = False) -> str:
     if not version:
         return ""

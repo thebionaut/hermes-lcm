@@ -63,7 +63,7 @@ def test_contract_is_captured_through_l1_l2_and_fallback_without_archive_mutatio
     )
     assert source.startswith('[USER]: Correct BX-008 to 42.750 mL.')
     assert level == 3 and len(prompts) == 2
-    assert all('Prohibited actions' in prompt for prompt in prompts)
+    assert all('Prohibited actions' not in prompt for prompt in prompts)  # v1 quarantined
     assert 'active recall incomplete' in summary
     assert escalation.count_tokens(summary) <= 80
 

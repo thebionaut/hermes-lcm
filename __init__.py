@@ -170,6 +170,17 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
         and "context_engine" not in enabled_toolsets
     )
     config = getattr(active_engine, "_config", None)
+    if context_engine_enabled:
+        try:
+            from .selective_retrieval import automatic_recovery
+            recovery = automatic_recovery(active_engine, payload)
+            active_engine._last_selective_recovery_trace = {
+                key: value for key, value in recovery.items() if key != "context"
+            }
+            if recovery["context"]:
+                recall_policy += "\n\n" + recovery["context"]
+        except Exception as exc:
+            logger.warning("LCM automatic recovery skipped: %s", type(exc).__name__)
     mode = _effective_preanswer_mode(config)
     if mode == "off" or not context_engine_enabled:
         return {"context": recall_policy}
