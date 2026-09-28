@@ -165,14 +165,14 @@ def test_retirement_defers_scan_without_claim_or_synchronous_fallback(tmp_path, 
 def test_timed_out_provider_retains_admission_after_runtime_stops(tmp_path, monkeypatch, gate):
     from hermes_lcm import escalation
     from hermes_lcm.dag import SummaryDAG
-    from test_background_runtime_cancellation_isolation import _config, _seed_conversation, _enqueue
+    from hermes_lcm.tests.test_background_runtime_cancellation_isolation import _config, _seed_conversation, _enqueue
 
     db_path = tmp_path / "provider-retirement.db"
     SummaryDAG(db_path).close()
     ids = _seed_conversation(db_path, conversation="held", session="held", content="held provider")
     config = _config(db_path)
     writer = background.BackgroundCompactionStore(db_path, config=config)
-    _enqueue(writer, ids, conversation="held", session="held")
+    job = _enqueue(writer, ids, conversation="held", session="held")
     entered, finish = threading.Event(), threading.Event()
 
     def summarize(**kwargs):
@@ -192,6 +192,9 @@ def test_timed_out_provider_retains_admission_after_runtime_stops(tmp_path, monk
         assert gate.prepare()["ok"] is False
         finish.set()
         _until(lambda: gate.active_count() == 0)
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM lcm_compaction_provider_leases").fetchone()[0] == 0
+        assert writer.get_job(job.job_id).state == "retry"
         assert gate.prepare()["ok"] is True
     finally:
         finish.set()
@@ -217,6 +220,20 @@ def test_thread_start_failure_releases_admission(tmp_path, monkeypatch, gate):
         assert not any(key[0] == str(tmp_path / "scan.db") for key in db_bootstrap._integrity_scan_threads)
     finally:
         conn.close()
+
+
+def test_admission_concurrent_release_is_exactly_once(gate):
+    from hermes_lcm.host_admission import acquire_background_admission
+
+    admission = acquire_background_admission()
+    assert gate.active_count() == 1
+    workers = [threading.Thread(target=admission.release) for _ in range(16)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(2)
+        assert not worker.is_alive()
+    assert gate.active_count() == 0
 
 
 def test_missing_legacy_host_is_compatible_but_broken_host_import_is_not(monkeypatch):

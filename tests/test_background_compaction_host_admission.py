@@ -27,13 +27,13 @@ def test_global_host_pin_aligns_codex56_cap_with_fixed_reserve(tmp_path):
     engine = LCMEngine(_config(tmp_path / "codex56-global-pin.db"))
     try:
         engine.update_model(
-            model="gpt-5.6-sol",
+            model="gpt-5.6-sol-900k",
             provider="openai-codex",
             context_length=1_000_000,
         )
 
         # Stock Hermes admits 80% of the configured 1M window.  LCM must cap
-        # that raw override back to Codex OAuth's real 900K total window, then
+        # that raw override back to the explicitly selected 900K window, then
         # publish at the same 800K boundary under its fixed 100K reserve.
         assert engine.raw_context_length == 1_000_000
         assert engine.context_length == 900_000
