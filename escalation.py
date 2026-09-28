@@ -21,6 +21,7 @@ from typing import Any, Callable, Mapping, MutableMapping, Optional
 
 from . import tokens as _token_module
 from .model_routing import apply_lcm_model_route
+from .continuation import continuation_brief
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
@@ -1032,7 +1033,8 @@ def _invoke_summary_llm_chain(
 
 
 def _build_l1_prompt(text: str, token_budget: int, depth: int,
-                     focus_topic: str = "", custom_instructions: str = "") -> str:
+                     focus_topic: str = "", custom_instructions: str = "",
+                     continuation_contract: str = "") -> str:
     """Level 1: preserve details."""
     depth_guidance = {
         0: "Preserve decisions, rationale, constraints, active tasks, file paths, commands, and specific values.",
@@ -1042,6 +1044,7 @@ def _build_l1_prompt(text: str, token_budget: int, depth: int,
     guidance = depth_guidance.get(depth, depth_guidance[2])
 
     focus_guidance = _build_l1_focus_brief(focus_topic)
+    focus_guidance += continuation_brief(continuation_contract, condensed=depth > 0)
 
     custom_block = ""
     if custom_instructions:
@@ -1067,9 +1070,11 @@ CONTENT:
 
 
 def _build_l2_prompt(text: str, token_budget: int,
-                     focus_topic: str = "", custom_instructions: str = "") -> str:
+                     focus_topic: str = "", custom_instructions: str = "",
+                     continuation_contract: str = "") -> str:
     """Level 2: aggressive bullet points."""
     focus_guidance = _build_l2_focus_brief(focus_topic)
+    focus_guidance += continuation_brief(continuation_contract, condensed=True)
 
     custom_block = ""
     if custom_instructions:
@@ -1190,12 +1195,15 @@ def summarize_with_escalation(
     trace: MutableMapping[str, Any] | None = None,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    continuation_contract: str = "",
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
+    # Validate captured policy before any provider attempt. No ambient flag reads.
+    continuation_brief(continuation_contract)
     _trace_attempt_list(trace)
     _set_terminal_reason(trace, "")
     if not isinstance(text, str) or not text.strip() or int(source_tokens or 0) <= 0:
@@ -1227,7 +1235,8 @@ def summarize_with_escalation(
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(text, token_budget, depth,
                                  focus_topic=focus_topic,
-                                 custom_instructions=custom_instructions)
+                                 custom_instructions=custom_instructions,
+                                 continuation_contract=continuation_contract)
     l1_result = _invoke_summary_llm_chain(
         l1_prompt,
         token_budget * 2,
@@ -1261,7 +1270,8 @@ def summarize_with_escalation(
     l2_budget = int(token_budget * l2_budget_ratio)
     l2_prompt = _build_l2_prompt(text, l2_budget,
                                  focus_topic=focus_topic,
-                                 custom_instructions=custom_instructions)
+                                 custom_instructions=custom_instructions,
+                                 continuation_contract=continuation_contract)
     l2_result = _invoke_summary_llm_chain(
         l2_prompt,
         l2_budget * 2,
