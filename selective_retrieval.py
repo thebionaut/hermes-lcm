@@ -46,7 +46,7 @@ MAX_AUTO_HANDLES = 12
 MAX_AUTO_CHARS = 6000
 MAX_AUTO_SECONDS = 0.25
 _MARKER = re.compile(r'\[\w+ Summary \(d\d+, node (\d+)\)\]')
-_OMISSION = re.compile(r'(?im)(?:^(?:Omitted areas|Conflicts):\s*|^Source coverage:[^\n]*?incomplete:\s*)([^\n]+)')
+_OMISSION = re.compile(r'(?im)(?:^\*{0,2}(?:Omitted areas|Conflicts):\*{0,2}\s*|^\*{0,2}Source coverage:\*{0,2}[^\n]*?incomplete:\s*)([^\n]+)')
 _STOP = set('what which is the a an was were corrected correction missing omitted areas conflicts of for in to and my our it'.split())
 
 

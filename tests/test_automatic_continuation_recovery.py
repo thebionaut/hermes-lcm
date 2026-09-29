@@ -38,6 +38,24 @@ def test_hook_automatically_recovers_missing_middle(pilot):
     assert engine._adaptive_retrieval is None
 
 
+@pytest.mark.parametrize('summary', [
+    '**Source coverage:** beginning/middle/end; incomplete: BX-008 quantity correction.',
+    '**Omitted areas:** BX-008 quantity correction.',
+])
+def test_markdown_omission_recovers_source(pilot, summary):
+    engine, payload, raw = pilot
+    sid = engine._store.append('pilot', {'role': 'user', 'content': raw})
+    node = SummaryNode(session_id='pilot', depth=0, summary=summary,
+                       source_ids=[sid], source_type='messages', token_count=18)
+    nid = engine._dag.add_node(node)
+    payload['conversation_history'] = [
+        {'role': 'user', 'content': f'[Recent Summary (d0, node {nid})]\n{summary}'}
+    ]
+    result = automatic_recovery(engine, payload)
+    assert result['retrieved'] == 1
+    assert raw in result['context']
+
+
 def test_irrelevant_and_sufficient_trigger_no_reads(pilot, monkeypatch):
     engine, payload, raw = pilot
     monkeypatch.setattr(engine._store, 'get', lambda *a: pytest.fail('unexpected raw read'))
